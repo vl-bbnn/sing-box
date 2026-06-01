@@ -57,7 +57,7 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		return nil, E.New("service ", options.Service, " is not a wlt carrier service")
 	}
 	return &Outbound{
-		Adapter: outbound.NewAdapter(C.TypeWLT, tag, []string{N.NetworkTCP}, []string{options.Service}),
+		Adapter: outbound.NewAdapter(C.TypeWLT, tag, []string{N.NetworkTCP}, nil),
 		logger:  logger,
 		carrier: carrier,
 		route:   options.Route,
