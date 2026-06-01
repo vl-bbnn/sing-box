@@ -23,6 +23,8 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
 				"max_open_attempts": 16,
+				"max_pending_dials": 24,
+				"dial_queue_timeout": "1500ms",
 				"idle_timeout": "20s",
 				"buffer_size": 32768
 			}
@@ -43,8 +45,12 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	if len(options.Services) != 1 {
 		t.Fatalf("services=%d, want 1", len(options.Services))
 	}
-	if _, ok := options.Services[0].Options.(*option.WLTServiceOptions); !ok {
+	serviceOptions, ok := options.Services[0].Options.(*option.WLTServiceOptions)
+	if !ok {
 		t.Fatalf("service options type=%T, want *option.WLTServiceOptions", options.Services[0].Options)
+	}
+	if serviceOptions.MaxPendingDials != 24 {
+		t.Fatalf("max pending=%d, want 24", serviceOptions.MaxPendingDials)
 	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))
@@ -55,6 +61,43 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if got, want := outboundOptions.BuildNetwork(), []string{"tcp"}; len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("network=%v, want %v", got, want)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-turnable",
+				"transport": "turnable",
+				"turnable_config": "{}",
+				"max_pending_dials": -1
+			}
+		]
+	}`), &options)
+	if err == nil || !strings.Contains(err.Error(), "max_pending_dials") {
+		t.Fatalf("err=%v, want negative max_pending_dials rejection", err)
+	}
+}
+
+func TestOrdinaryConfigUnmarshalWithoutWLT(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"log": {"level": "info"},
+		"outbounds": [
+			{"type": "direct", "tag": "direct"}
+		],
+		"route": {"final": "direct"}
+	}`), &options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(options.Services) != 0 {
+		t.Fatalf("services=%d, want 0", len(options.Services))
 	}
 }
 
