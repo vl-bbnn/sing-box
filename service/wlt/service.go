@@ -59,6 +59,8 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		ConnectTimeout:   time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams: s.options.MaxActiveStreams,
 		MaxOpenAttempts:  s.options.MaxOpenAttempts,
+		MaxPendingDials:  s.options.MaxPendingDials,
+		DialQueueTimeout: time.Duration(s.options.DialQueueTimeout),
 		IdleTimeout:      time.Duration(s.options.IdleTimeout),
 		BufferSize:       s.options.BufferSize,
 		Logger: func(format string, args ...any) {
@@ -85,7 +87,7 @@ func (s *Service) Close() error {
 	stats := s.carrier.Stats()
 	err := s.carrier.Close()
 	s.carrier = nil
-	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " rejected=", stats.RejectedStreams, " failed=", stats.FailedStreams)
+	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " failed=", stats.FailedStreams)
 	return err
 }
 
@@ -108,7 +110,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
 				return
 			case <-ticker.C:
 				stats := carrier.Stats()
-				s.logger.Info("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " rejected=", stats.RejectedStreams, " failed=", stats.FailedStreams, " open_attempts=", stats.OpenAttempts)
+				s.logger.Info("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " failed=", stats.FailedStreams, " open_attempts=", stats.OpenAttempts)
 			}
 		}
 	}()
