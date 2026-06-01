@@ -28,6 +28,7 @@ const (
 	TypeDERP         = "derp"
 	TypeResolved     = "resolved"
 	TypeSSMAPI       = "ssm-api"
+	TypeWLT          = "wlt"
 	TypeCCM          = "ccm"
 	TypeOCM          = "ocm"
 	TypeOOMKiller    = "oom-killer"
@@ -88,6 +89,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "AnyTLS"
 	case TypeTailscale:
 		return "Tailscale"
+	case TypeWLT:
+		return "WLT"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:
