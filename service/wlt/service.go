@@ -21,10 +21,11 @@ func RegisterService(registry *boxService.Registry) {
 
 type Service struct {
 	boxService.Adapter
-	ctx     context.Context
-	logger  log.ContextLogger
-	options option.WLTServiceOptions
-	carrier *wltpkg.TurnableCarrier
+	ctx         context.Context
+	logger      log.ContextLogger
+	options     option.WLTServiceOptions
+	carrier     *wltpkg.TurnableCarrier
+	statsCancel context.CancelFunc
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
@@ -68,6 +69,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		return err
 	}
 	s.carrier = carrier
+	s.startStatsHeartbeat(carrier)
 	s.logger.Info("wlt service started elapsed=", time.Since(startedAt).String())
 	return nil
 }
@@ -76,13 +78,38 @@ func (s *Service) Close() error {
 	if s.carrier == nil {
 		return nil
 	}
+	if s.statsCancel != nil {
+		s.statsCancel()
+		s.statsCancel = nil
+	}
 	stats := s.carrier.Stats()
 	err := s.carrier.Close()
 	s.carrier = nil
-	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " rejected=", stats.RejectedStreams, " failed=", stats.FailedStreams)
+	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " rejected=", stats.RejectedStreams, " failed=", stats.FailedStreams)
 	return err
 }
 
 func (s *Service) Carrier() *wltpkg.TurnableCarrier {
 	return s.carrier
+}
+
+func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
+	if s.statsCancel != nil {
+		s.statsCancel()
+	}
+	statsCtx, cancel := context.WithCancel(s.ctx)
+	s.statsCancel = cancel
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statsCtx.Done():
+				return
+			case <-ticker.C:
+				stats := carrier.Stats()
+				s.logger.Info("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " rejected=", stats.RejectedStreams, " failed=", stats.FailedStreams, " open_attempts=", stats.OpenAttempts)
+			}
+		}
+	}()
 }
