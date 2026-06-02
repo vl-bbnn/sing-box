@@ -75,7 +75,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if carrier == nil {
 		return nil, E.New("wlt carrier is not started")
 	}
-	h.logger.InfoContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
+	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
 	stream, err := carrier.DialStream(ctx, h.route, destination.String())
 	if err != nil {
 		return nil, err
@@ -92,6 +92,6 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	h.logger.InfoContext(ctx, "rejected WLT packet connection to ", destination)
+	h.logger.DebugContext(ctx, "rejected WLT packet connection to ", destination)
 	return nil, E.New("wlt outbound does not support packet connections; use VLESS/XUDP over TCP")
 }
