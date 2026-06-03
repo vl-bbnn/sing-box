@@ -109,6 +109,18 @@ func (w *platformInterfaceWrapper) CreateDefaultInterfaceMonitor(logger logger.L
 	}
 }
 
+func (w *platformInterfaceWrapper) UsePlatformNeighborResolver() bool {
+	return false
+}
+
+func (w *platformInterfaceWrapper) StartNeighborMonitor(listener NeighborUpdateListener) error {
+	return nil
+}
+
+func (w *platformInterfaceWrapper) CloseNeighborMonitor(listener NeighborUpdateListener) error {
+	return nil
+}
+
 func (w *platformInterfaceWrapper) UsePlatformNetworkInterfaces() bool {
 	return true
 }
