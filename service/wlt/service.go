@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	wltpkg "2b2n.local/whitelist-transport/pkg/wlt"
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
+	wltpkg "github.com/sagernet/sing-box/common/wlt"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"

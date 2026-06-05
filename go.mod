@@ -90,7 +90,6 @@ require (
 )
 
 require (
-	2b2n.local/whitelist-transport v0.0.0
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
@@ -209,6 +208,4 @@ require (
 replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // lx:end awg
 
-replace 2b2n.local/whitelist-transport => ../whitelist-transport
-
-replace github.com/theairblow/turnable => ../whitelist-transport/third_party/turnable
+replace github.com/theairblow/turnable => ./third_party/turnable
