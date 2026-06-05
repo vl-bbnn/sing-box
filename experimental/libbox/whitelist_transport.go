@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"2b2n.local/whitelist-transport/pkg/wlt"
+	"github.com/sagernet/sing-box/common/wlt"
 )
 
 type WhitelistTransportOptions struct {
@@ -27,7 +27,7 @@ type WhitelistTransportOptions struct {
 
 type WhitelistTransportClient struct {
 	cancel context.CancelFunc
-	client *wlt.Client
+	client *wlt.TurnableListenerClient
 }
 
 func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTransportClient, error) {
@@ -38,20 +38,6 @@ func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTran
 	if transport == "" {
 		transport = "telemost"
 	}
-	socks := options.Socks
-	if socks == "" {
-		socks = "direct=127.0.0.1:11080,eu=127.0.0.1:11081,dns=127.0.0.1:11082"
-	} else if !strings.Contains(socks, "dns=") {
-		socks += ",dns=127.0.0.1:11082"
-	}
-	displayName := options.TelemostDisplayName
-	if displayName == "" {
-		displayName = "WLT Client"
-	}
-	connectTimeout := time.Duration(options.ConnectTimeoutMS) * time.Millisecond
-	if connectTimeout <= 0 {
-		connectTimeout = 10 * time.Second
-	}
 	startTimeout := time.Duration(options.StartTimeoutMS) * time.Millisecond
 	if startTimeout <= 0 {
 		startTimeout = 45 * time.Second
@@ -59,27 +45,20 @@ func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTran
 
 	ctx, cancel := context.WithCancel(context.Background())
 	timer := time.AfterFunc(startTimeout, cancel)
-	client, err := wlt.StartClient(ctx, wlt.ClientOptions{
-		Transport:      transport,
-		GatewayAddress: options.GatewayAddress,
-		SOCKS:          socks,
-		ConnectTimeout: connectTimeout,
-		Telemost: wlt.TelemostOptions{
-			JoinLink:    options.TelemostLink,
-			DisplayName: displayName,
-			VP8FPS:      int(options.TelemostVP8FPS),
-			VP8Batch:    int(options.TelemostVP8Batch),
-			PayloadSize: int(options.TelemostPayloadSize),
-		},
-		Turnable: wlt.TurnableOptions{
+	var client *wlt.TurnableListenerClient
+	var err error
+	if strings.EqualFold(transport, "turnable") {
+		client, err = wlt.StartTurnableListenerClient(ctx, wlt.TurnableListenerClientOptions{
 			Config:     options.TurnableConfig,
 			ConfigFile: options.TurnableConfigFile,
 			Listeners:  options.TurnableListeners,
-		},
-		Logger: func(format string, args ...any) {
-			fmt.Printf("wlt: "+format+"\n", args...)
-		},
-	})
+			Logger: func(format string, args ...any) {
+				fmt.Printf("wlt: "+format+"\n", args...)
+			},
+		})
+	} else {
+		err = fmt.Errorf("legacy whitelist transport %q is not supported by the embedded core WLT build", transport)
+	}
 	if !timer.Stop() && err == nil {
 		err = context.Canceled
 	}
