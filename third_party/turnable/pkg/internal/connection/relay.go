@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +95,12 @@ type relayServerSession struct {
 // ID returns the unique ID of this handler
 func (D *RelayHandler) ID() string {
 	return "relay"
+}
+
+func isBenignPlatformEnd(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return reason == "platform signaling ended" ||
+		strings.Contains(reason, "websocket: close 1000 (normal)")
 }
 
 // Start starts the server listener
@@ -789,6 +796,18 @@ primaryLoop:
 		case reason := <-callEndedCh:
 			if reason == "" {
 				reason = "platform signaling ended"
+			}
+			if isBenignPlatformEnd(reason) {
+				stats := D.Stats()
+				if stats.Peer.OnlinePeers > 0 && stats.Mux.PingTimeouts == 0 {
+					D.log.Warn(
+						"platform signaling ended after relay session connected; keeping active relay session",
+						"reason", reason,
+						"online_peers", stats.Peer.OnlinePeers,
+						"mux_ping_timeouts", stats.Mux.PingTimeouts,
+					)
+					return
+				}
 			}
 			fullReconnect("platform signaling ended: " + reason)
 		case <-sessionCtx.Done():
