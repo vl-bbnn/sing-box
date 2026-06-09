@@ -2,6 +2,7 @@ package wlt
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"reflect"
@@ -55,13 +56,57 @@ func TestTurnableCarrierDefaultsAreIPhoneBounded(t *testing.T) {
 	}
 }
 
+func TestTurnableCarrierRuntimeOptionsAreBounded(t *testing.T) {
+	previousOptions := turnableconfig.Options
+	defer func() {
+		turnableconfig.Options = previousOptions
+	}()
+
+	turnableconfig.Options.Transport.RelayBandwidthBytesPerSecond = 1234
+	options := withTurnableCarrierDefaults(TurnableCarrierOptions{})
+	transportOptions := applyTurnableCarrierRuntimeOptions(options)
+	if !reflect.DeepEqual(transportOptions, turnableconfig.TransportOptions{
+		TinyMuxFlowBuffer:            defaultTurnableTinyMuxFlowBuffer,
+		TinyMuxFlowSendBuffer:        defaultTurnableTinyMuxFlowSendBuffer,
+		TinyMuxControlBuffer:         defaultTurnableTinyMuxControlBuffer,
+		TinyMuxPingTimeoutMillis:     int(defaultTurnableTinyMuxPingTimeout / time.Millisecond),
+		PeerIncomingBuffer:           defaultTurnablePeerIncomingBuffer,
+		PeerWriteBuffer:              defaultTurnablePeerWriteBuffer,
+		SRTPPacketBuffer:             defaultTurnableSRTPPacketBuffer,
+		KCPWindowSize:                defaultTurnableKCPWindowSize,
+		KCPReadWriteBuffer:           defaultTurnableKCPReadWriteBuffer,
+		RelayBandwidthBytesPerSecond: 1234,
+	}) {
+		t.Fatalf("transport options=%+v", transportOptions)
+	}
+
+	transportOptions = applyTurnableCarrierRuntimeOptions(TurnableCarrierOptions{
+		BufferSize:                   64 * 1024,
+		TinyMuxRateBurstBytes:        512 * 1024,
+		TinyMuxPingTimeout:           25 * time.Second,
+		RelayBandwidthBytesPerSecond: 5 * 1024 * 1024,
+	})
+	if transportOptions.TinyMuxFlowBuffer != 256 ||
+		transportOptions.TinyMuxFlowSendBuffer != 64 ||
+		transportOptions.TinyMuxRateBurstBytes != 512*1024 ||
+		transportOptions.TinyMuxPingTimeoutMillis != 25000 ||
+		transportOptions.PeerIncomingBuffer != 256 ||
+		transportOptions.SRTPPacketBuffer != 512 ||
+		transportOptions.KCPWindowSize != 768 ||
+		transportOptions.KCPReadWriteBuffer != 1024*1024 ||
+		transportOptions.RelayBandwidthBytesPerSecond != 5*1024*1024 {
+		t.Fatalf("scaled transport options=%+v", transportOptions)
+	}
+}
+
 func TestTurnableCarrierDialStreamUsesRouteClassAndStats(t *testing.T) {
 	carrier := newTestTurnableCarrier(2, 2, 1, time.Second, time.Second)
 	var (
 		mu     sync.Mutex
 		dialed []string
 	)
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		mu.Lock()
 		dialed = append(dialed, routeID)
 		mu.Unlock()
@@ -92,7 +137,8 @@ func TestTurnableCarrierDialStreamUsesRouteClassAndStats(t *testing.T) {
 
 func TestTurnableCarrierQueuesOverActiveLimit(t *testing.T) {
 	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		left, right := net.Pipe()
 		_ = right.Close()
 		return left, nil
@@ -126,7 +172,8 @@ func TestTurnableCarrierQueuesOverActiveLimit(t *testing.T) {
 
 func TestTurnableCarrierRejectsActiveQueueTimeout(t *testing.T) {
 	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, 20*time.Millisecond)
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		left, right := net.Pipe()
 		_ = right.Close()
 		return left, nil
@@ -148,7 +195,8 @@ func TestTurnableCarrierRejectsActiveQueueTimeout(t *testing.T) {
 
 func TestTurnableCarrierRejectsOverPendingLimit(t *testing.T) {
 	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		left, right := net.Pipe()
 		_ = right.Close()
 		return left, nil
@@ -192,7 +240,8 @@ func TestTurnableCarrierQueuesOverOpenAttemptLimit(t *testing.T) {
 		mu    sync.Mutex
 		calls int
 	)
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		mu.Lock()
 		calls++
 		call := calls
@@ -241,7 +290,8 @@ func TestTurnableCarrierRejectsOverOpenAttemptLimit(t *testing.T) {
 	carrier := newTestTurnableCarrier(2, 1, 1, time.Second, 20*time.Millisecond)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		select {
 		case <-started:
 		default:
@@ -278,7 +328,8 @@ func TestTurnableCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
 	carrier := newTestTurnableCarrier(3, 1, 1, time.Second, time.Second)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
-	carrier.dialRoute = func(routeID string) (net.Conn, error) {
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
 		select {
 		case <-started:
 		default:
@@ -322,6 +373,49 @@ func TestTurnableCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
 		t.Fatal(second.err)
 	}
 	_ = second.conn.Close()
+}
+
+func TestTurnableCarrierDialStreamCancelsOpen(t *testing.T) {
+	carrier := newTestTurnableCarrier(1, 1, 1, 30*time.Millisecond, time.Second)
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = routeID
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	if _, err := carrier.DialStream(context.Background(), "eu", "slow.example:443"); err == nil {
+		t.Fatal("expected open timeout")
+	}
+	stats := carrier.Stats()
+	if stats.FailedStreams != 1 || stats.ActiveStreams != 0 || stats.OpenAttempts != 1 || stats.LastDialMillis <= 0 {
+		t.Fatalf("stats=%+v, want failed canceled open with released active slot", stats)
+	}
+}
+
+func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
+	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
+	var calls int
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
+		_ = routeID
+		calls++
+		if calls == 1 {
+			return nil, errors.New("full reconnect is in progress")
+		}
+		left, right := net.Pipe()
+		_ = right.Close()
+		return left, nil
+	}
+
+	conn, err := carrier.DialStream(context.Background(), "eu", "reconnect.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stats := carrier.Stats()
+	if calls != 2 || stats.OpenAttempts != 2 || stats.ReconnectRetries != 1 || stats.ReconnectWaitMillis <= 0 || stats.FailedStreams != 0 {
+		t.Fatalf("calls=%d stats=%+v, want one reconnect retry and successful open", calls, stats)
+	}
 }
 
 func TestTurnableCarrierIdleTimeoutClosesStaleTail(t *testing.T) {

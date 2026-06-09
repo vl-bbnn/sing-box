@@ -174,7 +174,7 @@ func (D *DTLSHandler) Connect(ctx context.Context, dest net.Addr, relay RelayInf
 
 	if forceTURN {
 		D.log.Debug("dtls connect using forced turn relay")
-		underlay, remoteAddr, err := connectViaTURN(relay, dest, "dtls", D.log)
+		underlay, remoteAddr, err := connectViaTURN(ctx, relay, dest, "dtls", D.log)
 		if err != nil {
 			return nil, err
 		}
@@ -204,7 +204,7 @@ func (D *DTLSHandler) Connect(ctx context.Context, dest net.Addr, relay RelayInf
 	}
 
 	D.log.Info("dtls direct connect failed, falling back to turn", "error", err)
-	turnUnderlay, turnRemote, turnErr := connectViaTURN(relay, dest, "dtls", D.log)
+	turnUnderlay, turnRemote, turnErr := connectViaTURN(ctx, relay, dest, "dtls", D.log)
 	if turnErr != nil {
 		return nil, errors.Join(err, turnErr)
 	}

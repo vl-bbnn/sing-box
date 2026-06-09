@@ -79,12 +79,18 @@ func (c *TurnableClient) Connect() error {
 // DialRoute opens a logical stream for routeID over the already connected
 // carrier. It does not create any local TCP/UDP listener.
 func (c *TurnableClient) DialRoute(routeID string) (net.Conn, error) {
+	return c.DialRouteContext(context.Background(), routeID)
+}
+
+// DialRouteContext opens a logical stream for routeID and aborts the pending
+// open when ctx is canceled.
+func (c *TurnableClient) DialRouteContext(ctx context.Context, routeID string) (net.Conn, error) {
 	if c.handler == nil || !c.running.Load() {
 		return nil, errors.New("not running")
 	}
 	for i, route := range c.Config.Routes {
 		if route.RouteID == routeID {
-			return c.OpenRoute(byte(i))
+			return c.OpenRouteContext(ctx, byte(i))
 		}
 	}
 	return nil, fmt.Errorf("unknown route: %s", routeID)
@@ -93,13 +99,27 @@ func (c *TurnableClient) DialRoute(routeID string) (net.Conn, error) {
 // OpenRoute opens a logical stream for routeIdx over the already connected
 // carrier. It does not create any local TCP/UDP listener.
 func (c *TurnableClient) OpenRoute(routeIdx byte) (net.Conn, error) {
+	return c.OpenRouteContext(context.Background(), routeIdx)
+}
+
+// OpenRouteContext opens a logical stream for routeIdx and aborts the pending
+// open when ctx is canceled.
+func (c *TurnableClient) OpenRouteContext(ctx context.Context, routeIdx byte) (net.Conn, error) {
 	if c.handler == nil || !c.running.Load() {
 		return nil, errors.New("not running")
 	}
 	if int(routeIdx) >= len(c.Config.Routes) {
 		return nil, fmt.Errorf("route index out of range: %d", routeIdx)
 	}
-	return c.handler.OpenChannel(routeIdx)
+	return c.handler.OpenChannel(ctx, routeIdx)
+}
+
+// Stats returns diagnostics-safe counters for the active connection handler.
+func (c *TurnableClient) Stats() config.RuntimeStats {
+	if c.handler == nil || !c.running.Load() {
+		return config.RuntimeStats{}
+	}
+	return c.handler.Stats()
 }
 
 // Start starts the Turnable client
@@ -190,7 +210,7 @@ func (c *TurnableClient) handleClient(local AcceptedClient, routeIdx byte) {
 		return
 	}
 
-	channel, err := c.handler.OpenChannel(routeIdx)
+	channel, err := c.handler.OpenChannel(c.ctx, routeIdx)
 	if err != nil {
 		if !errors.Is(err, connection.ErrReconnecting) {
 			c.log.Warn("failed to open channel for local client", "error", err)

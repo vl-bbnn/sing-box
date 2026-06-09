@@ -26,7 +26,18 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"max_pending_dials": 24,
 				"dial_queue_timeout": "1500ms",
 				"idle_timeout": "20s",
-				"buffer_size": 32768
+				"buffer_size": 32768,
+				"tiny_mux_flow_buffer": 512,
+				"tiny_mux_send_buffer": 128,
+				"tiny_mux_control_buffer": 256,
+				"mux_rate_burst": 524288,
+				"tiny_mux_ping_timeout": "25s",
+				"peer_incoming_buffer": 512,
+				"peer_write_buffer": 128,
+				"srtp_packet_buffer": 512,
+				"kcp_window": 1024,
+				"kcp_buffer": 2097152,
+				"relay_bandwidth_bytes_per_second": 5242880
 			}
 		],
 		"outbounds": [
@@ -51,6 +62,12 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.MaxPendingDials != 24 {
 		t.Fatalf("max pending=%d, want 24", serviceOptions.MaxPendingDials)
+	}
+	if serviceOptions.RelayBandwidthBytesPerSecond != 5242880 {
+		t.Fatalf("relay bandwidth=%d, want 5242880", serviceOptions.RelayBandwidthBytesPerSecond)
+	}
+	if serviceOptions.TinyMuxFlowBuffer != 512 || serviceOptions.KCPReadWriteBuffer != 2097152 {
+		t.Fatalf("debug transport options=%+v", serviceOptions)
 	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))
@@ -80,6 +97,44 @@ func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
 	}`), &options)
 	if err == nil || !strings.Contains(err.Error(), "max_pending_dials") {
 		t.Fatalf("err=%v, want negative max_pending_dials rejection", err)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativeRelayBandwidth(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-turnable",
+				"transport": "turnable",
+				"turnable_config": "{}",
+				"relay_bandwidth_bytes_per_second": -1
+			}
+		]
+	}`), &options)
+	if err == nil || !strings.Contains(err.Error(), "relay_bandwidth_bytes_per_second") {
+		t.Fatalf("err=%v, want negative relay_bandwidth_bytes_per_second rejection", err)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativeDebugTransportOption(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-turnable",
+				"transport": "turnable",
+				"turnable_config": "{}",
+				"kcp_buffer": -1
+			}
+		]
+	}`), &options)
+	if err == nil || !strings.Contains(err.Error(), "kcp_buffer") {
+		t.Fatalf("err=%v, want negative kcp_buffer rejection", err)
 	}
 }
 

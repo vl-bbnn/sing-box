@@ -34,10 +34,11 @@ const (
 
 	relayHandshakeTimeout = 10 * time.Second
 
-	fullReconnectInit = 5 * time.Second
+	fullReconnectInit = 1 * time.Second
 	fullReconnectMax  = 30 * time.Second
 
-	peerHandshakeRetryMax = 45 * time.Second
+	platformEndedPeerGrace = 5 * time.Second
+	peerHandshakeRetryMax  = 45 * time.Second
 )
 
 // ErrAckRejected is returned when the server sends an error ACK during handshake
@@ -66,6 +67,9 @@ type RelayHandler struct {
 	reconnectMu     sync.Mutex
 	reconnectCtx    context.Context
 	reconnectCancel context.CancelFunc
+	fullReconnects  atomic.Int64
+	reasonMu        sync.Mutex
+	lastReason      string
 
 	log *slog.Logger
 }
@@ -205,7 +209,7 @@ func (D *RelayHandler) Connect(cfg config.ClientConfig) error {
 }
 
 // OpenChannel opens a new logical data channel
-func (D *RelayHandler) OpenChannel(routeIdx byte) (net.Conn, error) {
+func (D *RelayHandler) OpenChannel(ctx context.Context, routeIdx byte) (net.Conn, error) {
 	if !D.running.Load() {
 		return nil, errors.New("not running")
 	}
@@ -219,7 +223,7 @@ func (D *RelayHandler) OpenChannel(routeIdx byte) (net.Conn, error) {
 		return nil, errors.New("relay: no active mux connection")
 	}
 
-	stream, err := muxClient.OpenChannel(routeIdx)
+	stream, err := muxClient.OpenChannelContext(ctx, routeIdx)
 	if err != nil {
 		if D.muxClient == muxClient {
 			D.muxClient = nil
@@ -255,6 +259,23 @@ func (D *RelayHandler) OpenChannel(routeIdx byte) (net.Conn, error) {
 	}
 
 	return wrapped, nil
+}
+
+// Stats returns diagnostics-safe relay runtime counters.
+func (D *RelayHandler) Stats() config.RuntimeStats {
+	var stats config.RuntimeStats
+	stats.Reconnecting = D.reconnecting.Load()
+	stats.FullReconnects = D.fullReconnects.Load()
+	D.reasonMu.Lock()
+	stats.LastReconnectReason = D.lastReason
+	D.reasonMu.Unlock()
+	if D.muxClient != nil {
+		stats.Mux = D.muxClient.Stats()
+	}
+	if D.peerConn != nil {
+		stats.Peer = D.peerConn.Stats()
+	}
+	return stats
 }
 
 // Disconnect gracefully disconnects from the current remote server
@@ -402,6 +423,7 @@ func (D *RelayHandler) connectClientSession() error {
 
 	sessionCtx, sessionCancel := context.WithCancel(D.reconnectCtx)
 	events := platformHandler.WatchEvents(sessionCtx)
+	callEndedCh := make(chan string, 1)
 
 	if err := platformHandler.Connect(); err != nil {
 		sessionCancel()
@@ -416,12 +438,21 @@ func (D *RelayHandler) connectClientSession() error {
 	}
 
 	turnInfo := platformHandler.GetTURNInfo()
+	D.log.Info(
+		"relay turn info received",
+		"turn_server", turnInfo.Address,
+		"turn_servers", len(turnInfo.Addresses),
+		"has_username", turnInfo.Username != "",
+		"has_password", turnInfo.Password != "",
+	)
+	D.log.Info("resolving relay gateway", "gateway", cfg.Gateway)
 	dest, err := common.ResolveUDPAddr(cfg.Gateway)
 	if err != nil {
 		sessionCancel()
 		_ = platformHandler.Disconnect()
 		return fmt.Errorf("invalid relay gateway %q: %w", cfg.Gateway, err)
 	}
+	D.log.Info("relay gateway resolved", "gateway", cfg.Gateway, "resolved", dest.String())
 
 	relayInfo := protocol.RelayInfo{
 		Address:   turnInfo.Address,
@@ -429,8 +460,6 @@ func (D *RelayHandler) connectClientSession() error {
 		Username:  turnInfo.Username,
 		Password:  turnInfo.Password,
 	}
-
-	go relayWatchPlatform(sessionCtx, events, D.log)
 
 	numPeers := cfg.Peers
 	if numPeers < 1 {
@@ -441,6 +470,10 @@ func (D *RelayHandler) connectClientSession() error {
 		if !D.reconnecting.CompareAndSwap(false, true) {
 			return
 		}
+		D.fullReconnects.Add(1)
+		D.reasonMu.Lock()
+		D.lastReason = reason
+		D.reasonMu.Unlock()
 
 		go func() {
 			defer D.reconnecting.Store(false)
@@ -475,6 +508,13 @@ func (D *RelayHandler) connectClientSession() error {
 			}
 		}()
 	}
+
+	go relayWatchPlatform(sessionCtx, events, D.log, func(reason string) {
+		select {
+		case callEndedCh <- reason:
+		default:
+		}
+	})
 
 	type connPair struct {
 		raw, enc net.Conn
@@ -512,21 +552,34 @@ func (D *RelayHandler) connectClientSession() error {
 		connCtx, connCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer connCancel()
 
+		startedAt := time.Now()
+		D.log.Info(
+			"peer connect starting",
+			"peer_idx", idx,
+			"proto", cfg.Proto,
+			"gateway", dest.String(),
+			"turn_servers", len(relayInfo.Addresses),
+		)
 		raw, err = h.Connect(connCtx, dest, relayInfo, true)
 		if err != nil {
+			D.log.Warn("peer underlay connect failed", "peer_idx", idx, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 			return
 		}
+		D.log.Info("peer underlay connected", "peer_idx", idx, "duration_ms", time.Since(startedAt).Milliseconds(), "local", raw.LocalAddr().String(), "remote", raw.RemoteAddr().String())
 
 		_ = raw.SetDeadline(time.Now().Add(relayHandshakeTimeout))
 
+		handshakeStartedAt := time.Now()
 		enc, err = wrapClientEncryptedConn(raw, cfg.PubKey)
 		if err != nil {
 			_ = raw.Close()
 			raw = nil
+			D.log.Warn("peer encryption handshake failed", "peer_idx", idx, "duration_ms", time.Since(handshakeStartedAt).Milliseconds(), "error", err)
 			return
 		}
 
 		_ = raw.SetDeadline(time.Time{})
+		D.log.Info("peer encryption handshake completed", "peer_idx", idx, "duration_ms", time.Since(handshakeStartedAt).Milliseconds())
 
 		return
 	}
@@ -623,6 +676,9 @@ func (D *RelayHandler) connectClientSession() error {
 
 	var peerConn *PeerConn
 	var muxClient *TinyMuxClient
+	var callEndedReason string
+	var callEndedTimer *time.Timer
+	var callEndedTimerC <-chan time.Time
 primaryLoop:
 	for {
 		select {
@@ -630,7 +686,29 @@ primaryLoop:
 			sessionCancel()
 			_ = platformHandler.Disconnect()
 			return sessionCtx.Err()
+		case reason := <-callEndedCh:
+			if reason == "" {
+				reason = "platform signaling ended"
+			}
+			callEndedReason = reason
+			if callEndedTimer == nil {
+				callEndedTimer = time.NewTimer(platformEndedPeerGrace)
+				callEndedTimerC = callEndedTimer.C
+				D.log.Warn("platform signaling ended before relay session connected; waiting briefly for relay peer", "reason", reason, "grace", platformEndedPeerGrace)
+			}
+		case <-callEndedTimerC:
+			sessionCancel()
+			_ = platformHandler.Disconnect()
+			if callEndedReason == "" {
+				callEndedReason = "platform signaling ended"
+			}
+			return fmt.Errorf("platform signaling ended before relay session connected: %s", callEndedReason)
 		case p := <-connCh:
+			if callEndedTimer != nil {
+				callEndedTimer.Stop()
+				callEndedTimer = nil
+				callEndedTimerC = nil
+			}
 
 			_ = p.raw.SetDeadline(time.Now().Add(relayHandshakeTimeout))
 			cfgJson, err := cfg.ToJSON(true)
@@ -677,6 +755,7 @@ primaryLoop:
 			}
 
 			platCfg := platformHandler.GetConfig()
+			platCfg.BandwidthRelay = config.EffectiveRelayBandwidth(platCfg.BandwidthRelay)
 			if platCfg.BandwidthRelay > 0 {
 				muxClient.SetRateLimit(platCfg.BandwidthRelay * float64(numPeers))
 			}
@@ -704,6 +783,17 @@ primaryLoop:
 	D.sessionUUID = sessionUUIDStr
 
 	D.log.Info("relay client session connected", "session_uuid", sessionUUIDStr, "peers", numPeers)
+
+	go func() {
+		select {
+		case reason := <-callEndedCh:
+			if reason == "" {
+				reason = "platform signaling ended"
+			}
+			fullReconnect("platform signaling ended: " + reason)
+		case <-sessionCtx.Done():
+		}
+	}()
 
 	go func() {
 		defer func() {
@@ -930,6 +1020,7 @@ func (D *RelayHandler) handlePrimaryPeer(
 	}
 
 	platCfg := platformHandler.GetConfig()
+	platCfg.BandwidthRelay = config.EffectiveRelayBandwidth(platCfg.BandwidthRelay)
 	muxServer.SetRateLimit(platCfg.BandwidthRelay * float64(clientCfg.Peers))
 
 	peerConn.SetOnAllPeersGone(func() { _ = muxServer.Close() })
@@ -1036,7 +1127,7 @@ func (D *RelayHandler) handleSecondaryPeer(
 }
 
 // relayWatchPlatform watches platform signaling events
-func relayWatchPlatform(ctx context.Context, events <-chan platform.Event, log *slog.Logger) {
+func relayWatchPlatform(ctx context.Context, events <-chan platform.Event, log *slog.Logger, onCallEnded func(string)) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1048,6 +1139,10 @@ func relayWatchPlatform(ctx context.Context, events <-chan platform.Event, log *
 			}
 			if event.Type == platform.EventCallEnded {
 				log.Debug("relay signaling reported call ended", "metadata", event.Metadata)
+				reason := event.Metadata["error"]
+				if onCallEnded != nil {
+					onCallEnded(reason)
+				}
 			}
 		}
 	}

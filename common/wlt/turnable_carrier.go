@@ -19,6 +19,68 @@ import (
 	turnableengine "github.com/theairblow/turnable/pkg/engine"
 )
 
+type logfSlogHandler struct {
+	logf  func(string, ...any)
+	attrs []slog.Attr
+	group string
+}
+
+func newLogfSlogLogger(logf func(string, ...any)) *slog.Logger {
+	if logf == nil {
+		logf = log.Printf
+	}
+	return slog.New(&logfSlogHandler{logf: logf})
+}
+
+func (h *logfSlogHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *logfSlogHandler) Handle(_ context.Context, record slog.Record) error {
+	if h.logf == nil {
+		return nil
+	}
+	if record.Level < slog.LevelInfo {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("turnable ")
+	b.WriteString(strings.ToLower(record.Level.String()))
+	b.WriteString(": ")
+	b.WriteString(record.Message)
+	writeAttr := func(attr slog.Attr) {
+		attr.Value = attr.Value.Resolve()
+		if attr.Key == "" {
+			return
+		}
+		b.WriteByte(' ')
+		b.WriteString(attr.Key)
+		b.WriteByte('=')
+		b.WriteString(attr.Value.String())
+	}
+	for _, attr := range h.attrs {
+		writeAttr(attr)
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		writeAttr(attr)
+		return true
+	})
+	h.logf("%s", b.String())
+	return nil
+}
+
+func (h *logfSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	next := *h
+	next.attrs = append(append([]slog.Attr(nil), h.attrs...), attrs...)
+	return &next
+}
+
+func (h *logfSlogHandler) WithGroup(name string) slog.Handler {
+	next := *h
+	next.group = name
+	return &next
+}
+
 const (
 	defaultTurnableCarrierConnectTimeout = 10 * time.Second
 	defaultTurnableCarrierMaxActive      = 32
@@ -27,6 +89,21 @@ const (
 	defaultTurnableCarrierQueueTimeout   = 1500 * time.Millisecond
 	defaultTurnableCarrierIdleTimeout    = 20 * time.Second
 	defaultTurnableCarrierBufferSize     = 32 * 1024
+
+	defaultTurnableTinyMuxFlowBuffer     = 128
+	defaultTurnableTinyMuxFlowSendBuffer = 32
+	defaultTurnableTinyMuxControlBuffer  = 64
+	defaultTurnableTinyMuxPingTimeout    = 20 * time.Second
+	defaultTurnablePeerIncomingBuffer    = 128
+	defaultTurnablePeerWriteBuffer       = 32
+	defaultTurnableSRTPPacketBuffer      = 256
+	defaultTurnableKCPWindowSize         = 512
+	defaultTurnableKCPReadWriteBuffer    = 512 * 1024
+
+	turnableReconnectRetryInitial = 100 * time.Millisecond
+	turnableReconnectRetryMax     = 500 * time.Millisecond
+	turnableConnectRetryInitial   = 250 * time.Millisecond
+	turnableConnectRetryMax       = 2 * time.Second
 )
 
 type TurnableCarrierOptions struct {
@@ -41,6 +118,18 @@ type TurnableCarrierOptions struct {
 	IdleTimeout      time.Duration
 	BufferSize       int
 
+	TinyMuxFlowBuffer            int
+	TinyMuxFlowSendBuffer        int
+	TinyMuxControlBuffer         int
+	TinyMuxRateBurstBytes        int
+	TinyMuxPingTimeout           time.Duration
+	PeerIncomingBuffer           int
+	PeerWriteBuffer              int
+	SRTPPacketBuffer             int
+	KCPWindowSize                int
+	KCPReadWriteBuffer           int
+	RelayBandwidthBytesPerSecond int
+
 	Logger func(string, ...any)
 }
 
@@ -50,26 +139,35 @@ type TurnableOptions struct {
 }
 
 type CarrierStats struct {
-	ActiveStreams     int64
-	PeakActiveStreams int64
-	PendingDials      int64
-	PeakPendingDials  int64
-	OpenAttempts      int64
-	OpenedStreams     int64
-	ClosedStreams     int64
-	QueuedDials       int64
-	RejectedStreams   int64
-	RejectedQueue     int64
-	RejectedActive    int64
-	RejectedOpen      int64
-	FailedStreams     int64
+	ActiveStreams        int64
+	PeakActiveStreams    int64
+	PendingDials         int64
+	PeakPendingDials     int64
+	OpenAttempts         int64
+	OpenedStreams        int64
+	ClosedStreams        int64
+	QueuedDials          int64
+	RejectedStreams      int64
+	RejectedQueue        int64
+	RejectedActive       int64
+	RejectedOpen         int64
+	FailedStreams        int64
+	LastActiveWaitMillis int64
+	MaxActiveWaitMillis  int64
+	LastOpenWaitMillis   int64
+	MaxOpenWaitMillis    int64
+	LastDialMillis       int64
+	MaxDialMillis        int64
+	ReconnectRetries     int64
+	ReconnectWaitMillis  int64
+	Runtime              turnableconfig.RuntimeStats
 }
 
 type TurnableCarrier struct {
 	client *turnableengine.TurnableClient
 	cancel context.CancelFunc
 
-	dialRoute func(string) (net.Conn, error)
+	dialRoute func(context.Context, string) (net.Conn, error)
 	logf      func(string, ...any)
 
 	connectTimeout   time.Duration
@@ -94,6 +192,14 @@ type TurnableCarrier struct {
 	rejectedActive    atomic.Int64
 	rejectedOpen      atomic.Int64
 	failedStreams     atomic.Int64
+	lastActiveWait    atomic.Int64
+	maxActiveWait     atomic.Int64
+	lastOpenWait      atomic.Int64
+	maxOpenWait       atomic.Int64
+	lastDialDuration  atomic.Int64
+	maxDialDuration   atomic.Int64
+	reconnectRetries  atomic.Int64
+	reconnectWait     atomic.Int64
 	closeOnce         sync.Once
 	closeErr          error
 }
@@ -112,32 +218,18 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 	}
 	options = withTurnableCarrierDefaults(options)
 	runCtx, cancel := context.WithCancel(ctx)
-	turnableconfig.Options.Interactive = false
-	turnableClient := turnableengine.NewTurnableClient(*cfg)
-	turnableClient.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	transportOptions := applyTurnableCarrierRuntimeOptions(options)
 
-	connectCtx, connectCancel := context.WithTimeout(runCtx, options.ConnectTimeout)
-	defer connectCancel()
-	connectDone := make(chan error, 1)
-	go func() {
-		connectDone <- turnableClient.Connect()
-	}()
-	select {
-	case err = <-connectDone:
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-	case <-connectCtx.Done():
+	turnableClient, err := connectTurnableClient(runCtx, cfg, options.ConnectTimeout, logf)
+	if err != nil {
 		cancel()
-		_ = turnableClient.Stop()
-		return nil, fmt.Errorf("connect Turnable carrier: %w", connectCtx.Err())
+		return nil, err
 	}
 
 	carrier := &TurnableCarrier{
 		client:           turnableClient,
 		cancel:           cancel,
-		dialRoute:        turnableClient.DialRoute,
+		dialRoute:        turnableClient.DialRouteContext,
 		logf:             logf,
 		connectTimeout:   options.ConnectTimeout,
 		dialQueueTimeout: options.DialQueueTimeout,
@@ -152,7 +244,7 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 		<-runCtx.Done()
 		_ = carrier.Close()
 	}()
-	logf("Turnable carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d",
+	logf("Turnable carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d relay_bandwidth=%d",
 		len(cfg.Routes),
 		strings.Join(turnableCarrierRouteClasses(carrier.routeByClass), ","),
 		options.MaxActiveStreams,
@@ -161,8 +253,83 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 		options.DialQueueTimeout,
 		options.IdleTimeout,
 		options.BufferSize,
+		transportOptions.KCPWindowSize,
+		transportOptions.KCPReadWriteBuffer,
+		transportOptions.TinyMuxFlowBuffer,
+		transportOptions.TinyMuxFlowSendBuffer,
+		transportOptions.TinyMuxControlBuffer,
+		transportOptions.TinyMuxRateBurstBytes,
+		transportOptions.TinyMuxPingTimeoutMillis,
+		transportOptions.PeerIncomingBuffer,
+		transportOptions.PeerWriteBuffer,
+		transportOptions.SRTPPacketBuffer,
+		transportOptions.RelayBandwidthBytesPerSecond,
 	)
 	return carrier, nil
+}
+
+func connectTurnableClient(ctx context.Context, cfg *turnableconfig.ClientConfig, timeout time.Duration, logf func(string, ...any)) (*turnableengine.TurnableClient, error) {
+	connectCtx, connectCancel := context.WithTimeout(ctx, timeout)
+	defer connectCancel()
+
+	delay := turnableConnectRetryInitial
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		turnableClient := turnableengine.NewTurnableClient(*cfg)
+		turnableClient.SetLogger(newLogfSlogLogger(logf))
+
+		connectDone := make(chan error, 1)
+		go func() {
+			connectDone <- turnableClient.Connect()
+		}()
+
+		select {
+		case err := <-connectDone:
+			if err == nil {
+				if attempt > 1 && logf != nil {
+					logf("Turnable carrier connect recovered attempts=%d", attempt)
+				}
+				return turnableClient, nil
+			}
+			lastErr = err
+			_ = turnableClient.Stop()
+		case <-connectCtx.Done():
+			_ = turnableClient.Stop()
+			if lastErr != nil {
+				return nil, fmt.Errorf("connect Turnable carrier: %w; last error: %v", connectCtx.Err(), lastErr)
+			}
+			return nil, fmt.Errorf("connect Turnable carrier: %w", connectCtx.Err())
+		}
+
+		select {
+		case <-connectCtx.Done():
+			if lastErr != nil {
+				return nil, fmt.Errorf("connect Turnable carrier: %w; last error: %v", connectCtx.Err(), lastErr)
+			}
+			return nil, fmt.Errorf("connect Turnable carrier: %w", connectCtx.Err())
+		default:
+		}
+
+		if logf != nil {
+			logf("Turnable carrier connect failed attempt=%d retry_in=%s error=%v", attempt, delay, lastErr)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-connectCtx.Done():
+			timer.Stop()
+			if lastErr != nil {
+				return nil, fmt.Errorf("connect Turnable carrier: %w; last error: %v", connectCtx.Err(), lastErr)
+			}
+			return nil, fmt.Errorf("connect Turnable carrier: %w", connectCtx.Err())
+		}
+		if delay < turnableConnectRetryMax {
+			delay *= 2
+			if delay > turnableConnectRetryMax {
+				delay = turnableConnectRetryMax
+			}
+		}
+	}
 }
 
 func loadTurnableClientConfig(options TurnableOptions) (*turnableconfig.ClientConfig, error) {
@@ -204,17 +371,20 @@ func (c *TurnableCarrier) DialStream(ctx context.Context, routeClass string, tar
 		c.failedStreams.Add(1)
 		return nil, err
 	}
+	activeWaitStartedAt := time.Now()
 	releaseActive, err := c.acquireActiveSlot(ctx, routeClass, target)
+	c.recordDuration(&c.lastActiveWait, &c.maxActiveWait, time.Since(activeWaitStartedAt))
 	if err != nil {
 		return nil, err
 	}
+	openWaitStartedAt := time.Now()
 	releaseOpen, err := c.acquireOpenSlot(ctx, routeClass, target)
+	c.recordDuration(&c.lastOpenWait, &c.maxOpenWait, time.Since(openWaitStartedAt))
 	if err != nil {
 		releaseActive()
 		return nil, err
 	}
 	defer releaseOpen()
-	c.openAttempts.Add(1)
 
 	dialCtx := ctx
 	var cancel context.CancelFunc
@@ -225,46 +395,52 @@ func (c *TurnableCarrier) DialStream(ctx context.Context, routeClass string, tar
 	}
 	defer cancel()
 
-	type dialResult struct {
-		conn net.Conn
-		err  error
+	dialStartedAt := time.Now()
+	var (
+		conn              net.Conn
+		reconnectAttempts int
+	)
+	for {
+		c.openAttempts.Add(1)
+		conn, err = c.dialRoute(dialCtx, routeID)
+		if err == nil || !isTurnableReconnectInProgress(err) {
+			break
+		}
+		if !c.waitForReconnectRetry(dialCtx, reconnectAttempts) {
+			break
+		}
+		reconnectAttempts++
 	}
-	result := make(chan dialResult, 1)
-	go func() {
-		conn, err := c.dialRoute(routeID)
-		select {
-		case result <- dialResult{conn: conn, err: err}:
-		case <-dialCtx.Done():
-			if conn != nil {
-				_ = conn.Close()
-			}
-		}
-	}()
-
-	select {
-	case result := <-result:
-		if result.err != nil {
-			releaseActive()
-			c.failedStreams.Add(1)
-			return nil, result.err
-		}
-		if result.conn == nil {
-			releaseActive()
-			c.failedStreams.Add(1)
-			return nil, errors.New("Turnable carrier returned nil stream")
-		}
-		c.openedStreams.Add(1)
-		return &turnableCarrierConn{
-			Conn:          result.conn,
-			carrier:       c,
-			releaseActive: releaseActive,
-			idleTimeout:   c.idleTimeout,
-		}, nil
-	case <-dialCtx.Done():
+	dialElapsed := time.Since(dialStartedAt)
+	c.recordDuration(&c.lastDialDuration, &c.maxDialDuration, dialElapsed)
+	if err != nil {
 		releaseActive()
 		c.failedStreams.Add(1)
-		return nil, fmt.Errorf("open Turnable stream route=%s target=%s: %w", routeClass, target, dialCtx.Err())
+		if c.logf != nil {
+			c.logf("Turnable stream open failed route=%s target=%s elapsed=%s error=%v", routeClass, target, dialElapsed, err)
+		}
+		return nil, fmt.Errorf("open Turnable stream route=%s target=%s: %w", routeClass, target, err)
 	}
+	if conn == nil {
+		releaseActive()
+		c.failedStreams.Add(1)
+		return nil, errors.New("Turnable carrier returned nil stream")
+	}
+	if dialElapsed > 1500*time.Millisecond {
+		if c.logf != nil {
+			c.logf("Turnable stream open slow route=%s target=%s elapsed=%s", routeClass, target, dialElapsed)
+		}
+	}
+	if reconnectAttempts > 0 && c.logf != nil {
+		c.logf("Turnable stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d", routeClass, target, dialElapsed, reconnectAttempts)
+	}
+	c.openedStreams.Add(1)
+	return &turnableCarrierConn{
+		Conn:          conn,
+		carrier:       c,
+		releaseActive: releaseActive,
+		idleTimeout:   c.idleTimeout,
+	}, nil
 }
 
 func (c *TurnableCarrier) Close() error {
@@ -288,21 +464,33 @@ func (c *TurnableCarrier) Stats() CarrierStats {
 	if c == nil {
 		return CarrierStats{}
 	}
-	return CarrierStats{
-		ActiveStreams:     c.activeStreams.Load(),
-		PeakActiveStreams: c.peakActiveStreams.Load(),
-		PendingDials:      c.pendingDials.Load(),
-		PeakPendingDials:  c.peakPendingDials.Load(),
-		OpenAttempts:      c.openAttempts.Load(),
-		OpenedStreams:     c.openedStreams.Load(),
-		ClosedStreams:     c.closedStreams.Load(),
-		QueuedDials:       c.queuedDials.Load(),
-		RejectedStreams:   c.rejectedStreams.Load(),
-		RejectedQueue:     c.rejectedQueue.Load(),
-		RejectedActive:    c.rejectedActive.Load(),
-		RejectedOpen:      c.rejectedOpen.Load(),
-		FailedStreams:     c.failedStreams.Load(),
+	stats := CarrierStats{
+		ActiveStreams:        c.activeStreams.Load(),
+		PeakActiveStreams:    c.peakActiveStreams.Load(),
+		PendingDials:         c.pendingDials.Load(),
+		PeakPendingDials:     c.peakPendingDials.Load(),
+		OpenAttempts:         c.openAttempts.Load(),
+		OpenedStreams:        c.openedStreams.Load(),
+		ClosedStreams:        c.closedStreams.Load(),
+		QueuedDials:          c.queuedDials.Load(),
+		RejectedStreams:      c.rejectedStreams.Load(),
+		RejectedQueue:        c.rejectedQueue.Load(),
+		RejectedActive:       c.rejectedActive.Load(),
+		RejectedOpen:         c.rejectedOpen.Load(),
+		FailedStreams:        c.failedStreams.Load(),
+		LastActiveWaitMillis: nanosToMillis(c.lastActiveWait.Load()),
+		MaxActiveWaitMillis:  nanosToMillis(c.maxActiveWait.Load()),
+		LastOpenWaitMillis:   nanosToMillis(c.lastOpenWait.Load()),
+		MaxOpenWaitMillis:    nanosToMillis(c.maxOpenWait.Load()),
+		LastDialMillis:       nanosToMillis(c.lastDialDuration.Load()),
+		MaxDialMillis:        nanosToMillis(c.maxDialDuration.Load()),
+		ReconnectRetries:     c.reconnectRetries.Load(),
+		ReconnectWaitMillis:  nanosToMillis(c.reconnectWait.Load()),
 	}
+	if c.client != nil {
+		stats.Runtime = c.client.Stats()
+	}
+	return stats
 }
 
 func (c *TurnableCarrier) acquireActiveSlot(ctx context.Context, routeClass string, target string) (func(), error) {
@@ -413,6 +601,58 @@ func (c *TurnableCarrier) updatePeakPendingDials() {
 	}
 }
 
+func (c *TurnableCarrier) recordDuration(last *atomic.Int64, max *atomic.Int64, value time.Duration) {
+	if value < 0 {
+		value = 0
+	}
+	nanos := int64(value)
+	last.Store(nanos)
+	updateMaxAtomicInt64(max, nanos)
+}
+
+func updateMaxAtomicInt64(slot *atomic.Int64, value int64) {
+	for {
+		previous := slot.Load()
+		if value <= previous || slot.CompareAndSwap(previous, value) {
+			return
+		}
+	}
+}
+
+func (c *TurnableCarrier) waitForReconnectRetry(ctx context.Context, attempt int) bool {
+	delay := turnableReconnectRetryInitial
+	for i := 0; i < attempt; i++ {
+		delay *= 2
+		if delay >= turnableReconnectRetryMax {
+			delay = turnableReconnectRetryMax
+			break
+		}
+	}
+	waitStartedAt := time.Now()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		c.reconnectRetries.Add(1)
+		c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
+		return true
+	case <-ctx.Done():
+		c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
+		return false
+	}
+}
+
+func isTurnableReconnectInProgress(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "full reconnect is in progress")
+}
+
+func nanosToMillis(value int64) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return value / int64(time.Millisecond)
+}
+
 func (c *TurnableCarrier) routeIDForClass(routeClass string) (string, error) {
 	routeClass = normalizeTurnableRouteClass(routeClass)
 	if routeClass == "" {
@@ -447,6 +687,79 @@ func withTurnableCarrierDefaults(options TurnableCarrierOptions) TurnableCarrier
 		options.BufferSize = defaultTurnableCarrierBufferSize
 	}
 	return options
+}
+
+func applyTurnableCarrierRuntimeOptions(options TurnableCarrierOptions) turnableconfig.TransportOptions {
+	bufferSize := options.BufferSize
+	if bufferSize <= 0 {
+		bufferSize = defaultTurnableCarrierBufferSize
+	}
+	transportOptions := turnableconfig.TransportOptions{
+		TinyMuxFlowBuffer:            clampInt(bufferSize/256, 64, 256),
+		TinyMuxFlowSendBuffer:        clampInt(bufferSize/1024, 16, 64),
+		TinyMuxControlBuffer:         clampInt(bufferSize/512, 32, 128),
+		TinyMuxRateBurstBytes:        options.TinyMuxRateBurstBytes,
+		TinyMuxPingTimeoutMillis:     int(defaultTurnableTinyMuxPingTimeout / time.Millisecond),
+		PeerIncomingBuffer:           clampInt(bufferSize/256, 64, 256),
+		PeerWriteBuffer:              clampInt(bufferSize/1024, 16, 64),
+		SRTPPacketBuffer:             clampInt(bufferSize/128, 128, 512),
+		KCPWindowSize:                clampInt(bufferSize/64, 256, 768),
+		KCPReadWriteBuffer:           scaleClampedInt(bufferSize, 16, 256*1024, 1024*1024),
+		RelayBandwidthBytesPerSecond: turnableconfig.Options.Transport.RelayBandwidthBytesPerSecond,
+	}
+	if options.RelayBandwidthBytesPerSecond > 0 {
+		transportOptions.RelayBandwidthBytesPerSecond = options.RelayBandwidthBytesPerSecond
+	}
+	if options.TinyMuxFlowBuffer > 0 {
+		transportOptions.TinyMuxFlowBuffer = options.TinyMuxFlowBuffer
+	}
+	if options.TinyMuxFlowSendBuffer > 0 {
+		transportOptions.TinyMuxFlowSendBuffer = options.TinyMuxFlowSendBuffer
+	}
+	if options.TinyMuxControlBuffer > 0 {
+		transportOptions.TinyMuxControlBuffer = options.TinyMuxControlBuffer
+	}
+	if options.TinyMuxPingTimeout > 0 {
+		transportOptions.TinyMuxPingTimeoutMillis = int(options.TinyMuxPingTimeout / time.Millisecond)
+	}
+	if options.PeerIncomingBuffer > 0 {
+		transportOptions.PeerIncomingBuffer = options.PeerIncomingBuffer
+	}
+	if options.PeerWriteBuffer > 0 {
+		transportOptions.PeerWriteBuffer = options.PeerWriteBuffer
+	}
+	if options.SRTPPacketBuffer > 0 {
+		transportOptions.SRTPPacketBuffer = options.SRTPPacketBuffer
+	}
+	if options.KCPWindowSize > 0 {
+		transportOptions.KCPWindowSize = options.KCPWindowSize
+	}
+	if options.KCPReadWriteBuffer > 0 {
+		transportOptions.KCPReadWriteBuffer = options.KCPReadWriteBuffer
+	}
+	turnableconfig.Options.Interactive = false
+	turnableconfig.Options.Transport = transportOptions
+	return transportOptions
+}
+
+func clampInt(value int, minimum int, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func scaleClampedInt(value int, scale int, minimum int, maximum int) int {
+	if value <= 0 || scale <= 0 {
+		return minimum
+	}
+	if value > maximum/scale {
+		return maximum
+	}
+	return clampInt(value*scale, minimum, maximum)
 }
 
 func turnableCarrierRouteMap(cfg *turnableconfig.ClientConfig) map[string]string {

@@ -21,8 +21,10 @@ import (
 )
 
 const (
-	srtpPayloadType = 100  // RTP payload type used to mimic VP8 WebRTC traffic
-	srtpMTU         = 1440 // SRTP record payload limit
+	srtpPayloadType         = 100  // RTP payload type used to mimic VP8 WebRTC traffic
+	srtpMTU                 = 1440 // SRTP record payload limit
+	defaultDTLSPacketBuffer = 64
+	defaultSRTPPacketBuffer = 2048
 )
 
 // SRTPHandler disguises VPN traffic as WebRTC SRTP
@@ -142,6 +144,7 @@ func (S *SRTPHandler) AcceptClients(ctx context.Context) (<-chan ServerClient, e
 
 // acceptSession performs the DTLS-SRTP handshake for one incoming client
 func (S *SRTPHandler) acceptSession(ctx context.Context, sess *srtpDemuxSession, out chan<- ServerClient) {
+	slog.Info("srtp server accept session started", "addr", sess.addr)
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		slog.Warn("srtp server cert generation failed", "error", err)
@@ -197,7 +200,7 @@ func (S *SRTPHandler) Connect(ctx context.Context, dest net.Addr, relay RelayInf
 
 	if forceTURN {
 		S.log.Debug("srtp connect using forced turn relay")
-		underlay, remoteAddr, err := connectViaTURN(relay, dest, "srtp", S.log)
+		underlay, remoteAddr, err := connectViaTURN(ctx, relay, dest, "srtp", S.log)
 		if err != nil {
 			return nil, err
 		}
@@ -226,7 +229,7 @@ func (S *SRTPHandler) Connect(ctx context.Context, dest net.Addr, relay RelayInf
 	}
 
 	S.log.Info("srtp direct connect failed, falling back to turn", "error", err)
-	turnUnderlay, turnRemote, turnErr := connectViaTURN(relay, dest, "srtp", S.log)
+	turnUnderlay, turnRemote, turnErr := connectViaTURN(ctx, relay, dest, "srtp", S.log)
 	if turnErr != nil {
 		return nil, errors.Join(err, turnErr)
 	}
@@ -249,8 +252,8 @@ func (S *SRTPHandler) connectPacketConn(ctx context.Context, underlay net.Packet
 		return nil, errors.New("srtp connect requires remote address")
 	}
 
-	dtlsCh := make(chan []byte, 64)
-	srtpCh := make(chan []byte, 2048)
+	dtlsCh := make(chan []byte, defaultDTLSPacketBuffer)
+	srtpCh := make(chan []byte, srtpPacketBufferSize())
 	go func() {
 		buf := make([]byte, 2048)
 		for {
@@ -392,13 +395,14 @@ func (d *srtpDemux) run() {
 
 		if !ok {
 			sess = &srtpDemuxSession{
-				dtlsCh: make(chan []byte, 64),
-				srtpCh: make(chan []byte, 2048),
+				dtlsCh: make(chan []byte, defaultDTLSPacketBuffer),
+				srtpCh: make(chan []byte, srtpPacketBufferSize()),
 				addr:   addr,
 			}
 			d.mu.Lock()
 			d.sessions[key] = sess
 			d.mu.Unlock()
+			slog.Info("srtp demux new session", "addr", addr, "first_byte", fmt.Sprintf("0x%02x", buf[0]), "packet_bytes", n)
 
 			select {
 			case d.newSess <- sess:
@@ -413,14 +417,22 @@ func (d *srtpDemux) run() {
 			select {
 			case sess.dtlsCh <- pkt:
 			default:
+				slog.Warn("srtp demux dtls channel full", "addr", addr, "packet_bytes", n)
 			}
 		} else if isRTPByte(buf[0]) {
 			select {
 			case sess.srtpCh <- pkt:
 			default:
+				slog.Warn("srtp demux srtp channel full", "addr", addr, "packet_bytes", n)
 			}
+		} else {
+			slog.Warn("srtp demux ignored packet", "addr", addr, "first_byte", fmt.Sprintf("0x%02x", buf[0]), "packet_bytes", n)
 		}
 	}
+}
+
+func srtpPacketBufferSize() int {
+	return config.PositiveOr(config.Options.Transport.SRTPPacketBuffer, defaultSRTPPacketBuffer)
 }
 
 // deadlineState manages a read deadline capable channel

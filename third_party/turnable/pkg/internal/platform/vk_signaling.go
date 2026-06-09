@@ -43,6 +43,7 @@ func (V *VKHandler) Connect() error {
 
 	V.mu.RLock()
 	endpoint := V.endpoint
+	deviceID := V.deviceID
 	profile := V.profile
 	videoTrackSlots := V.videoTrackSlots
 	turnUser := V.turnUser
@@ -69,6 +70,7 @@ func (V *VKHandler) Connect() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	endpoint = withVKSignalingParams(endpoint, deviceID)
 	wsDialer := &websocket.Dialer{
 		NetDialContext:   common.ResolverDialContext(),
 		HandshakeTimeout: 45 * time.Second,
@@ -167,6 +169,25 @@ func (V *VKHandler) Connect() error {
 	}})
 	slog.Info("vk signaling connected", "endpoint_host", endpointHost)
 	return nil
+}
+
+func withVKSignalingParams(endpoint string, deviceID string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	query := parsed.Query()
+	if query.Get("appVersion") == "" {
+		query.Set("appVersion", vkCallsClientVer)
+	}
+	if query.Get("device") == "" && strings.TrimSpace(deviceID) != "" {
+		query.Set("device", deviceID)
+	}
+	if query.Get("version") == "" {
+		query.Set("version", strconv.Itoa(vkCallsSessionVersion))
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 // Disconnect gracefully disconnects from the signaling server
@@ -461,6 +482,9 @@ func (V *VKHandler) runSignalingLoop(ctx context.Context, conn *websocket.Conn) 
 					"vk signaling error message",
 					"bytes", len(result.payload),
 					"response", msg.Response,
+					"reason", msg.Reason,
+					"description", compactPayloadPreview([]byte(msg.Description), 240),
+					"preview", compactPayloadPreview(result.payload, 240),
 				)
 				continue
 			}
@@ -546,10 +570,18 @@ func marshalCommandJSON(command string, sequence int, payload map[string]any) ([
 	out.Write(cmdJSON)
 	out.WriteString(`,"sequence":`)
 	out.WriteString(strconv.Itoa(sequence))
+	if _, exists := payload["appVersion"]; !exists {
+		appVersionJSON, err := json.Marshal(vkCallsClientVer)
+		if err != nil {
+			return nil, err
+		}
+		out.WriteString(`,"appVersion":`)
+		out.Write(appVersionJSON)
+	}
 
 	keys := make([]string, 0, len(payload))
 	for key := range payload {
-		if key == "command" || key == "sequence" {
+		if key == "command" || key == "sequence" || key == "appVersion" {
 			continue
 		}
 		keys = append(keys, key)

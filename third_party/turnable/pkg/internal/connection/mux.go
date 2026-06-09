@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	turnableconfig "github.com/theairblow/turnable/pkg/config"
 	"github.com/theairblow/turnable/pkg/internal/transport"
 	"golang.org/x/time/rate"
 )
@@ -26,10 +27,11 @@ const (
 	muxControlTypeClose      byte = 4
 	muxControlTypeDisconnect byte = 7
 
-	muxFlowBufSize      = 2048
-	muxWriteCtrlBufSize = 256
-	muxFlowSendBuf      = 256
-	muxMaxPacket        = 65535
+	defaultMuxFlowBufSize      = 2048
+	defaultMuxWriteCtrlBufSize = 256
+	defaultMuxFlowSendBuf      = 256
+	defaultMuxOpenReplyBufSize = 256
+	muxMaxPacket               = 65535
 
 	muxDRRQuantum = 32768
 	muxBurstFloor = 2 * 1420
@@ -70,6 +72,18 @@ type tinyMuxCore struct {
 	stageBuf    []byte
 
 	log *slog.Logger
+
+	flowPacketsIn    atomic.Int64
+	flowBytesIn      atomic.Int64
+	flowPacketsOut   atomic.Int64
+	flowBytesOut     atomic.Int64
+	flowDrops        atomic.Int64
+	controlFramesOut atomic.Int64
+	rateWaits        atomic.Int64
+	rateWaitNanos    atomic.Int64
+	rateBurstBytes   atomic.Int64
+	lastReadNano     atomic.Int64
+	lastWriteNano    atomic.Int64
 }
 
 // newTinyMuxCore creates a new tinymux core
@@ -78,12 +92,16 @@ func newTinyMuxCore(conn net.Conn) *tinyMuxCore {
 		conn:        conn,
 		nextID:      1,
 		done:        make(chan struct{}),
-		ctrlCh:      make(chan []byte, muxWriteCtrlBufSize),
+		ctrlCh:      make(chan []byte, muxWriteCtrlBufferSize()),
 		notifyCh:    make(chan struct{}, 1),
 		rateLimiter: rate.NewLimiter(rate.Inf, 256*1024),
 		stageBuf:    make([]byte, muxMaxPacket+2),
 		log:         slog.Default(),
 	}
+	now := time.Now().UnixNano()
+	m.lastReadNano.Store(now)
+	m.lastWriteNano.Store(now)
+	m.rateBurstBytes.Store(256 * 1024)
 
 	go m.readLoop()
 	go m.writeLoop()
@@ -105,16 +123,20 @@ func (m *tinyMuxCore) readLoop() {
 		if n < 2 {
 			continue
 		}
+		m.lastReadNano.Store(time.Now().UnixNano())
 
 		flowID := binary.BigEndian.Uint16(buf[:2])
 		payload := make([]byte, n-2)
 		copy(payload, buf[2:n])
+		m.flowPacketsIn.Add(1)
+		m.flowBytesIn.Add(int64(len(payload)))
 
 		if raw, ok := m.flows.Load(flowID); ok {
 			fc := raw.(*flowConn)
 			select {
 			case fc.incoming <- payload:
 			default:
+				m.flowDrops.Add(1)
 				m.log.Debug("mux flow receive buffer full, dropping packet", "flow_id", flowID)
 			}
 		}
@@ -126,11 +148,11 @@ func (m *tinyMuxCore) createFlow(id uint16) *flowConn {
 	fc := &flowConn{
 		mux:      m,
 		id:       id,
-		incoming: make(chan []byte, muxFlowBufSize),
+		incoming: make(chan []byte, muxFlowBufferSize()),
 		closed:   make(chan struct{}),
 	}
 	if id != 0 {
-		fc.sendCh = make(chan []byte, muxFlowSendBuf)
+		fc.sendCh = make(chan []byte, muxFlowSendBufferSize())
 		m.drFlowsMu.Lock()
 		m.drFlows = append(m.drFlows, fc)
 		m.drFlowsMu.Unlock()
@@ -176,6 +198,9 @@ func (m *tinyMuxCore) drainControl() {
 				_ = m.Close()
 				return
 			}
+			m.controlFramesOut.Add(1)
+			m.flowBytesOut.Add(int64(len(frame)))
+			m.lastWriteNano.Store(time.Now().UnixNano())
 		default:
 			return
 		}
@@ -187,17 +212,34 @@ func (m *tinyMuxCore) setRateLimit(bytesPerSec float64) {
 	if bytesPerSec <= 0 {
 		m.rateLimiter.SetLimit(rate.Inf)
 		m.rateLimiter.SetBurst(256 * 1024)
+		m.rateBurstBytes.Store(256 * 1024)
 	} else {
 		m.rateLimiter.SetLimit(rate.Limit(bytesPerSec))
-		burst := int(bytesPerSec / 20)
+		burst := turnableconfig.Options.Transport.TinyMuxRateBurstBytes
+		if burst <= 0 {
+			burst = int(bytesPerSec / 20)
+		}
 		if burst < muxBurstFloor {
 			burst = muxBurstFloor
 		}
-		if burst > 128*1024 {
+		if turnableconfig.Options.Transport.TinyMuxRateBurstBytes <= 0 && burst > 128*1024 {
 			burst = 128 * 1024
 		}
 		m.rateLimiter.SetBurst(burst)
+		m.rateBurstBytes.Store(int64(burst))
 	}
+}
+
+func muxFlowBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.TinyMuxFlowBuffer, defaultMuxFlowBufSize)
+}
+
+func muxWriteCtrlBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.TinyMuxControlBuffer, defaultMuxWriteCtrlBufSize)
+}
+
+func muxFlowSendBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.TinyMuxFlowSendBuffer, defaultMuxFlowSendBuf)
 }
 
 // rateWait absorbs the rate-limiter delay for n bytes, draining control packets while sleeping.
@@ -210,6 +252,8 @@ func (m *tinyMuxCore) rateWait(n int) {
 	if delay <= 0 {
 		return
 	}
+	m.rateWaits.Add(1)
+	m.rateWaitNanos.Add(int64(delay))
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	for {
@@ -219,6 +263,9 @@ func (m *tinyMuxCore) rateWait(n int) {
 				_ = m.Close()
 				return
 			}
+			m.controlFramesOut.Add(1)
+			m.flowBytesOut.Add(int64(len(frame)))
+			m.lastWriteNano.Store(time.Now().UnixNano())
 		case <-timer.C:
 			return
 		case <-m.done:
@@ -261,6 +308,9 @@ func (m *tinyMuxCore) writeLoop() {
 						_ = m.Close()
 						return
 					}
+					m.flowPacketsOut.Add(1)
+					m.flowBytesOut.Add(int64(n))
+					m.lastWriteNano.Store(time.Now().UnixNano())
 					fc.deficit -= len(payload)
 					anyActive = true
 					m.drainControl()
@@ -281,12 +331,63 @@ func (m *tinyMuxCore) writeLoop() {
 					_ = m.Close()
 					return
 				}
+				m.controlFramesOut.Add(1)
+				m.flowBytesOut.Add(int64(len(frame)))
+				m.lastWriteNano.Store(time.Now().UnixNano())
 			case <-m.notifyCh:
 			case <-m.done:
 				return
 			}
 		}
 	}
+}
+
+func muxPingTimeoutDuration() time.Duration {
+	if value := turnableconfig.Options.Transport.TinyMuxPingTimeoutMillis; value > 0 {
+		return time.Duration(value) * time.Millisecond
+	}
+	return muxPingTimeout
+}
+
+func (m *tinyMuxCore) hasRecentIO(window time.Duration) bool {
+	if m == nil || window <= 0 {
+		return false
+	}
+	cutoff := time.Now().Add(-window).UnixNano()
+	return m.lastReadNano.Load() >= cutoff || m.lastWriteNano.Load() >= cutoff
+}
+
+func (m *tinyMuxCore) stats() turnableconfig.TinyMuxRuntimeStats {
+	if m == nil {
+		return turnableconfig.TinyMuxRuntimeStats{}
+	}
+	return turnableconfig.TinyMuxRuntimeStats{
+		FlowPacketsIn:    m.flowPacketsIn.Load(),
+		FlowBytesIn:      m.flowBytesIn.Load(),
+		FlowPacketsOut:   m.flowPacketsOut.Load(),
+		FlowBytesOut:     m.flowBytesOut.Load(),
+		FlowDrops:        m.flowDrops.Load(),
+		ControlFramesOut: m.controlFramesOut.Load(),
+		RateWaits:        m.rateWaits.Load(),
+		RateWaitNanos:    m.rateWaitNanos.Load(),
+		RateBurstBytes:   m.rateBurstBytes.Load(),
+	}
+}
+
+func updateMaxAtomicInt64(slot *atomic.Int64, value int64) {
+	for {
+		previous := slot.Load()
+		if value <= previous || slot.CompareAndSwap(previous, value) {
+			return
+		}
+	}
+}
+
+func nanosToMillis(value int64) int64 {
+	if value <= 0 {
+		return 0
+	}
+	return value / int64(time.Millisecond)
 }
 
 // sendControl enqueues a pre-framed control packet for the write goroutine
@@ -435,6 +536,21 @@ type TinyMuxClient struct {
 	lastPingSent    atomic.Int64
 	lastPong        atomic.Int64
 	firstUnanswered atomic.Int64
+	openRequests    atomic.Int64
+	openReplies     atomic.Int64
+	openCanceled    atomic.Int64
+	openErrors      atomic.Int64
+	openPending     atomic.Int64
+	peakOpenPending atomic.Int64
+	pingSent        atomic.Int64
+	pongReceived    atomic.Int64
+	pingTimeouts    atomic.Int64
+	disconnects     atomic.Int64
+	controlErrors   atomic.Int64
+	lastOpenLatency atomic.Int64
+	maxOpenLatency  atomic.Int64
+	lastPingRTT     atomic.Int64
+	maxPingRTT      atomic.Int64
 
 	pingCtx    context.Context
 	pingCancel context.CancelFunc
@@ -479,7 +595,7 @@ func NewTinyMuxClient(ctx context.Context, conn net.Conn) (*TinyMuxClient, error
 		control:     controlKCP,
 		pingCtx:     pingCtx,
 		pingCancel:  pingCancel,
-		openReplyCh: make(chan uint16, 16),
+		openReplyCh: make(chan uint16, defaultMuxOpenReplyBufSize),
 	}
 
 	now := time.Now().UnixNano()
@@ -500,11 +616,17 @@ func (c *TinyMuxClient) pingLoop() {
 		case <-c.pingCtx.Done():
 			return
 		case <-ticker.C:
+			pingTimeout := muxPingTimeoutDuration()
 			if c.lastPong.Load() < c.lastPingSent.Load() {
 				if c.firstUnanswered.Load() == 0 {
 					c.firstUnanswered.Store(time.Now().UnixNano())
-				} else if time.Since(time.Unix(0, c.firstUnanswered.Load())) > muxPingTimeout {
-					c.mux.log.Debug("tinymux client pong timeout")
+				} else if time.Since(time.Unix(0, c.firstUnanswered.Load())) > pingTimeout {
+					if c.mux.hasRecentIO(pingTimeout) {
+						c.mux.log.Debug("tinymux client pong timeout deferred because mux has recent data")
+						continue
+					}
+					c.pingTimeouts.Add(1)
+					c.mux.log.Debug("tinymux client pong timeout", "timeout", pingTimeout)
 					c.pingCancel()
 					_ = c.mux.Close()
 					return
@@ -519,6 +641,7 @@ func (c *TinyMuxClient) pingLoop() {
 
 			if err == nil {
 				c.lastPingSent.Store(time.Now().UnixNano())
+				c.pingSent.Add(1)
 			}
 		}
 	}
@@ -532,6 +655,7 @@ func (c *TinyMuxClient) controlReader() {
 			select {
 			case <-c.pingCtx.Done():
 			default:
+				c.controlErrors.Add(1)
 				c.mux.log.Debug("tinymux client cut off unexpectedly", "error", err)
 				c.pingCancel()
 				_ = c.mux.Close()
@@ -540,17 +664,28 @@ func (c *TinyMuxClient) controlReader() {
 		}
 		switch msg.Type {
 		case muxControlTypePong:
-			c.lastPong.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			lastPing := c.lastPingSent.Load()
+			if lastPing > 0 && now > lastPing {
+				rtt := now - lastPing
+				c.lastPingRTT.Store(rtt)
+				updateMaxAtomicInt64(&c.maxPingRTT, rtt)
+			}
+			c.lastPong.Store(now)
+			c.pongReceived.Add(1)
 		case muxControlTypeOpen:
+			c.openReplies.Add(1)
 			select {
 			case c.openReplyCh <- msg.FlowID:
-			default:
+			case <-c.pingCtx.Done():
+				return
 			}
 		case muxControlTypeClose:
 			if raw, ok := c.flowStates.LoadAndDelete(msg.FlowID); ok {
 				_ = raw.(*managedFlowConn).flowConn.Close()
 			}
 		case muxControlTypeDisconnect:
+			c.disconnects.Add(1)
 			c.mux.log.Debug("tinymux client received disconnect, triggering full reconnect")
 			c.pingCancel()
 			_ = c.mux.Close()
@@ -562,21 +697,74 @@ func (c *TinyMuxClient) controlReader() {
 // Done returns a channel closed when the mux session terminates
 func (c *TinyMuxClient) Done() <-chan struct{} { return c.pingCtx.Done() }
 
-// OpenChannel requests a new data flow from the server and returns it
+// OpenChannel requests a new data flow from the server and returns it.
 func (c *TinyMuxClient) OpenChannel(routeIdx byte) (net.Conn, error) {
+	return c.OpenChannelContext(context.Background(), routeIdx)
+}
+
+// OpenChannelContext requests a new data flow from the server and aborts the
+// pending request when ctx expires. The current control protocol does not carry
+// request IDs, so the mux session is closed on cancellation to avoid stale open
+// replies being consumed by later calls.
+func (c *TinyMuxClient) OpenChannelContext(ctx context.Context, routeIdx byte) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	startedAt := time.Now()
+	c.openRequests.Add(1)
+	pending := c.openPending.Add(1)
+	updateMaxAtomicInt64(&c.peakOpenPending, pending)
+	defer c.openPending.Add(-1)
+
 	if err := c.writeControl(muxControlMessage{Type: muxControlTypeOpen, RouteIdx: routeIdx}); err != nil {
+		c.openErrors.Add(1)
 		return nil, err
 	}
 	select {
 	case flowID := <-c.openReplyCh:
+		latency := time.Since(startedAt).Nanoseconds()
+		c.lastOpenLatency.Store(latency)
+		updateMaxAtomicInt64(&c.maxOpenLatency, latency)
 		fc := c.mux.createFlow(flowID)
 		mf := &managedFlowConn{flowConn: fc, writeControl: c.writeControl, flowStates: &c.flowStates}
 		c.flowStates.Store(flowID, mf)
 		c.mux.log.Debug("tinymux channel opened", "side", "client", "flow_id", flowID)
 		return mf, nil
+	case <-ctx.Done():
+		c.openCanceled.Add(1)
+		c.openErrors.Add(1)
+		c.mux.log.Debug("tinymux channel open canceled, closing mux to discard stale reply", "route_idx", routeIdx, "elapsed", time.Since(startedAt), "error", ctx.Err())
+		c.pingCancel()
+		_ = c.mux.Close()
+		return nil, ctx.Err()
 	case <-c.pingCtx.Done():
+		c.openErrors.Add(1)
 		return nil, errors.New("tinymux client session closed")
 	}
+}
+
+// Stats returns diagnostics-safe client mux counters.
+func (c *TinyMuxClient) Stats() turnableconfig.TinyMuxRuntimeStats {
+	if c == nil {
+		return turnableconfig.TinyMuxRuntimeStats{}
+	}
+	stats := c.mux.stats()
+	stats.OpenRequests = c.openRequests.Load()
+	stats.OpenReplies = c.openReplies.Load()
+	stats.OpenCanceled = c.openCanceled.Load()
+	stats.OpenErrors = c.openErrors.Load()
+	stats.OpenPending = c.openPending.Load()
+	stats.PeakOpenPending = c.peakOpenPending.Load()
+	stats.PingSent = c.pingSent.Load()
+	stats.PongReceived = c.pongReceived.Load()
+	stats.PingTimeouts = c.pingTimeouts.Load()
+	stats.Disconnects = c.disconnects.Load()
+	stats.ControlReadErrors = c.controlErrors.Load()
+	stats.LastOpenLatencyMillis = nanosToMillis(c.lastOpenLatency.Load())
+	stats.MaxOpenLatencyMillis = nanosToMillis(c.maxOpenLatency.Load())
+	stats.LastPingRTTMillis = nanosToMillis(c.lastPingRTT.Load())
+	stats.MaxPingRTTMillis = nanosToMillis(c.maxPingRTT.Load())
+	return stats
 }
 
 // Disconnect sends a Disconnect message to the server
@@ -724,7 +912,8 @@ func (s *TinyMuxServer) AcceptChannels(ctx context.Context) <-chan MuxChannel {
 
 // pingTimeoutLoop closes the mux if the client stops sending pings within the timeout window
 func (s *TinyMuxServer) pingTimeoutLoop(ctx context.Context) {
-	ticker := time.NewTicker(muxPingTimeout)
+	pingTimeout := muxPingTimeoutDuration()
+	ticker := time.NewTicker(pingTimeout)
 	defer ticker.Stop()
 	for {
 		select {
@@ -733,8 +922,12 @@ func (s *TinyMuxServer) pingTimeoutLoop(ctx context.Context) {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			if time.Since(time.Unix(0, s.lastPing.Load())) > muxPingTimeout {
-				s.mux.log.Debug("tinymux server ping timeout")
+			if time.Since(time.Unix(0, s.lastPing.Load())) > pingTimeout {
+				if s.mux.hasRecentIO(pingTimeout) {
+					s.mux.log.Debug("tinymux server ping timeout deferred because mux has recent data")
+					continue
+				}
+				s.mux.log.Debug("tinymux server ping timeout", "timeout", pingTimeout)
 				_ = s.Close()
 				return
 			}

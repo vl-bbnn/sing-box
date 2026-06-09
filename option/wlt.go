@@ -11,16 +11,27 @@ import (
 )
 
 type WLTServiceOptions struct {
-	Transport          string             `json:"transport,omitempty"`
-	TurnableConfig     string             `json:"turnable_config,omitempty"`
-	TurnableConfigFile string             `json:"turnable_config_file,omitempty"`
-	ConnectTimeout     badoption.Duration `json:"connect_timeout,omitempty"`
-	MaxActiveStreams   int                `json:"max_active_streams,omitempty"`
-	MaxOpenAttempts    int                `json:"max_open_attempts,omitempty"`
-	MaxPendingDials    int                `json:"max_pending_dials,omitempty"`
-	DialQueueTimeout   badoption.Duration `json:"dial_queue_timeout,omitempty"`
-	IdleTimeout        badoption.Duration `json:"idle_timeout,omitempty"`
-	BufferSize         int                `json:"buffer_size,omitempty"`
+	Transport                    string             `json:"transport,omitempty"`
+	TurnableConfig               string             `json:"turnable_config,omitempty"`
+	TurnableConfigFile           string             `json:"turnable_config_file,omitempty"`
+	ConnectTimeout               badoption.Duration `json:"connect_timeout,omitempty"`
+	MaxActiveStreams             int                `json:"max_active_streams,omitempty"`
+	MaxOpenAttempts              int                `json:"max_open_attempts,omitempty"`
+	MaxPendingDials              int                `json:"max_pending_dials,omitempty"`
+	DialQueueTimeout             badoption.Duration `json:"dial_queue_timeout,omitempty"`
+	IdleTimeout                  badoption.Duration `json:"idle_timeout,omitempty"`
+	BufferSize                   int                `json:"buffer_size,omitempty"`
+	TinyMuxFlowBuffer            int                `json:"tiny_mux_flow_buffer,omitempty"`
+	TinyMuxFlowSendBuffer        int                `json:"tiny_mux_send_buffer,omitempty"`
+	TinyMuxControlBuffer         int                `json:"tiny_mux_control_buffer,omitempty"`
+	TinyMuxRateBurstBytes        int                `json:"mux_rate_burst,omitempty"`
+	TinyMuxPingTimeout           badoption.Duration `json:"tiny_mux_ping_timeout,omitempty"`
+	PeerIncomingBuffer           int                `json:"peer_incoming_buffer,omitempty"`
+	PeerWriteBuffer              int                `json:"peer_write_buffer,omitempty"`
+	SRTPPacketBuffer             int                `json:"srtp_packet_buffer,omitempty"`
+	KCPWindowSize                int                `json:"kcp_window,omitempty"`
+	KCPReadWriteBuffer           int                `json:"kcp_buffer,omitempty"`
+	RelayBandwidthBytesPerSecond int                `json:"relay_bandwidth_bytes_per_second,omitempty"`
 }
 
 func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []byte) error {
@@ -51,6 +62,36 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if o.BufferSize < 0 {
 		return E.New("wlt service buffer_size must be non-negative")
+	}
+	if o.TinyMuxFlowBuffer < 0 {
+		return E.New("wlt service tiny_mux_flow_buffer must be non-negative")
+	}
+	if o.TinyMuxFlowSendBuffer < 0 {
+		return E.New("wlt service tiny_mux_send_buffer must be non-negative")
+	}
+	if o.TinyMuxControlBuffer < 0 {
+		return E.New("wlt service tiny_mux_control_buffer must be non-negative")
+	}
+	if o.TinyMuxRateBurstBytes < 0 {
+		return E.New("wlt service mux_rate_burst must be non-negative")
+	}
+	if o.PeerIncomingBuffer < 0 {
+		return E.New("wlt service peer_incoming_buffer must be non-negative")
+	}
+	if o.PeerWriteBuffer < 0 {
+		return E.New("wlt service peer_write_buffer must be non-negative")
+	}
+	if o.SRTPPacketBuffer < 0 {
+		return E.New("wlt service srtp_packet_buffer must be non-negative")
+	}
+	if o.KCPWindowSize < 0 {
+		return E.New("wlt service kcp_window must be non-negative")
+	}
+	if o.KCPReadWriteBuffer < 0 {
+		return E.New("wlt service kcp_buffer must be non-negative")
+	}
+	if o.RelayBandwidthBytesPerSecond < 0 {
+		return E.New("wlt service relay_bandwidth_bytes_per_second must be non-negative")
 	}
 	return nil
 }
