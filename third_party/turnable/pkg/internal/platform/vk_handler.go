@@ -46,6 +46,7 @@ type VKHandler struct {
 	messagesAccessToken string
 	anonymToken         string
 	sessionKey          string
+	deviceID            string
 	endpoint            string
 
 	turnUser  string

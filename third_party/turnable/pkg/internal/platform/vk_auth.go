@@ -47,12 +47,14 @@ type vkStartedConversationInfo struct {
 }
 
 const vkAuthCacheTTL = 9 * time.Minute // Cache TTL for VK authorization snapshots
+const vkCallsSessionVersion = 2        // Anonymous VK calls session protocol version
 
 // vkAuthSnapshot stores one cached VK authorization result
 type vkAuthSnapshot struct {
 	MessagesAccessToken string
 	AnonymToken         string
 	SessionKey          string
+	DeviceID            string
 	Endpoint            string
 	TurnUser            string
 	TurnPass            string
@@ -160,6 +162,7 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 			V.messagesAccessToken = cached.MessagesAccessToken
 			V.anonymToken = cached.AnonymToken
 			V.sessionKey = cached.SessionKey
+			V.deviceID = cached.DeviceID
 			V.endpoint = cached.Endpoint
 			V.turnUser = cached.TurnUser
 			V.turnPass = cached.TurnPass
@@ -191,7 +194,7 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 		return err
 	}
 
-	sessionKey, err := V.callsLogin(ctx)
+	sessionKey, deviceID, err := V.callsLogin(ctx)
 	if err != nil {
 		slog.Warn("vk calls login failed", "error", err)
 		return err
@@ -213,6 +216,7 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 	V.messagesAccessToken = messagesToken
 	V.anonymToken = anonymToken
 	V.sessionKey = sessionKey
+	V.deviceID = deviceID
 	V.endpoint = startedInfo.Endpoint
 	V.turnUser = startedInfo.TurnServer.Username
 	V.turnPass = startedInfo.TurnServer.Password
@@ -222,6 +226,7 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 		MessagesAccessToken: V.messagesAccessToken,
 		AnonymToken:         V.anonymToken,
 		SessionKey:          V.sessionKey,
+		DeviceID:            V.deviceID,
 		Endpoint:            V.endpoint,
 		TurnUser:            V.turnUser,
 		TurnPass:            V.turnPass,
@@ -333,16 +338,17 @@ func (V *VKHandler) authorizeAnonymous(ctx context.Context, joinURL, username st
 }
 
 // callsLogin creates an anonymous calls session in the VK calls backend
-func (V *VKHandler) callsLogin(ctx context.Context) (string, error) {
+func (V *VKHandler) callsLogin(ctx context.Context) (string, string, error) {
+	deviceID := uuid.NewString()
 	sessionData := vkCallsSessionData{
-		Version:       2,
-		DeviceID:      uuid.NewString(),
+		Version:       vkCallsSessionVersion,
+		DeviceID:      deviceID,
 		ClientVersion: vkCallsClientVer,
 		ClientType:    "SDK_JS",
 	}
 	sessionDataJSON, err := json.Marshal(sessionData)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	slog.Debug("vk calls login request prepared", "session_data_bytes", len(sessionDataJSON))
 
@@ -356,15 +362,15 @@ func (V *VKHandler) callsLogin(ctx context.Context) (string, error) {
 		"Referer": "https://vk.com/",
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	sessionKey, ok := resp["session_key"].(string)
 	if !ok || sessionKey == "" {
-		return "", fmt.Errorf("unexpected anonym login response: %v", resp)
+		return "", "", fmt.Errorf("unexpected anonym login response: %v", resp)
 	}
 	slog.Debug("vk calls login completed")
-	return sessionKey, nil
+	return sessionKey, deviceID, nil
 }
 
 // joinConversation joins the target call and returns the signaling bootstrap payload

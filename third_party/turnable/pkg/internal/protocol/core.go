@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,7 +40,7 @@ func openDirectUnderlay(dest net.Addr, proto string, log *slog.Logger) (net.Pack
 }
 
 // openTURNUnderlay allocates a TURN relay socket
-func openTURNUnderlay(relay RelayInfo, dest net.Addr, proto string, log *slog.Logger) (net.PacketConn, net.Addr, error) {
+func openTURNUnderlay(ctx context.Context, relay RelayInfo, dest net.Addr, proto string, log *slog.Logger) (net.PacketConn, net.Addr, error) {
 	if relay.Address == "" {
 		return nil, nil, fmt.Errorf("%s turn requires turn address", proto)
 	}
@@ -66,7 +67,7 @@ func openTURNUnderlay(relay RelayInfo, dest net.Addr, proto string, log *slog.Lo
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open local udp socket for turn: %w", err)
 	}
-	log.Debug("turn base socket opened", "proto", proto, "network", network, "local", underlay.LocalAddr().String(), "turn_server", turnAddr)
+	log.Info("turn allocation starting", "proto", proto, "network", network, "local", underlay.LocalAddr().String(), "turn_server", turnAddr, "peer", dest.String())
 
 	infoLevel := slog.LevelInfo
 	var connRef atomic.Pointer[turnPacketConn]
@@ -88,56 +89,100 @@ func openTURNUnderlay(relay RelayInfo, dest net.Addr, proto string, log *slog.Lo
 		return nil, nil, fmt.Errorf("failed to create turn client: %w", err)
 	}
 
+	cancelWatcherDone := make(chan struct{})
+	var closeOnce sync.Once
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				closeOnce.Do(func() {
+					client.Close()
+					_ = underlay.Close()
+				})
+			case <-cancelWatcherDone:
+			}
+		}()
+	}
+	closeCancelWatcher := func() {
+		select {
+		case <-cancelWatcherDone:
+		default:
+			close(cancelWatcherDone)
+		}
+	}
+	cleanup := func() {
+		closeCancelWatcher()
+		closeOnce.Do(func() {
+			client.Close()
+			_ = underlay.Close()
+		})
+	}
+
 	if err := client.Listen(); err != nil {
-		client.Close()
-		_ = underlay.Close()
+		cleanup()
 		return nil, nil, fmt.Errorf("failed to start turn client listener: %w", err)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		cleanup()
+		return nil, nil, ctx.Err()
 	}
 
 	log.Debug("turn client listener started", "proto", proto, "turn_server", relay.Address)
 	allocation, err := client.Allocate()
 	if err != nil {
-		client.Close()
-		_ = underlay.Close()
+		cleanup()
 		return nil, nil, fmt.Errorf("failed to allocate turn relay: %w", err)
 	}
-
-	log.Debug("turn allocation created", "proto", proto, "turn_server", relay.Address)
-	if err := client.CreatePermission(dest); err != nil {
+	if ctx != nil && ctx.Err() != nil {
 		_ = allocation.Close()
-		client.Close()
-		_ = underlay.Close()
-		return nil, nil, fmt.Errorf("failed to create turn permission for %s: %w", dest.String(), err)
+		cleanup()
+		return nil, nil, ctx.Err()
 	}
 
-	log.Debug("turn permission created", "proto", proto, "peer", dest.String(), "turn_server", relay.Address)
+	log.Info("turn allocation created", "proto", proto, "turn_server", relay.Address)
+	if err := client.CreatePermission(dest); err != nil {
+		_ = allocation.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("failed to create turn permission for %s: %w", dest.String(), err)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		_ = allocation.Close()
+		cleanup()
+		return nil, nil, ctx.Err()
+	}
+
+	log.Info("turn permission created", "proto", proto, "peer", dest.String(), "turn_server", relay.Address)
 	conn := &turnPacketConn{PacketConn: allocation, underlay: underlay, client: client}
 	connRef.Store(conn)
+	closeCancelWatcher()
 	return conn, dest, nil
 }
 
 // connectViaTURN tries each TURN server in relay.Addresses and returns the first successful underlay
-func connectViaTURN(relay RelayInfo, dest net.Addr, proto string, log *slog.Logger) (net.PacketConn, net.Addr, error) {
+func connectViaTURN(ctx context.Context, relay RelayInfo, dest net.Addr, proto string, log *slog.Logger) (net.PacketConn, net.Addr, error) {
 	servers := relay.Addresses
 	if len(servers) == 0 {
 		return nil, nil, fmt.Errorf("%s turn fallback requires turn address", proto)
 	}
-	log.Debug("trying turn servers", "proto", proto, "count", len(servers), "servers", strings.Join(servers, ","))
+	log.Info("trying turn servers", "proto", proto, "count", len(servers), "servers", strings.Join(servers, ","))
 
 	var lastErr error
 	for i, address := range servers {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
 		candidate := relay
 		candidate.Address = address
-		log.Debug("trying turn candidate", "proto", proto, "index", i+1, "count", len(servers), "server", address, "dest", dest.String())
+		log.Info("trying turn candidate", "proto", proto, "index", i+1, "count", len(servers), "server", address, "dest", dest.String())
 
-		underlay, remoteAddr, err := openTURNUnderlay(candidate, dest, proto, log)
+		underlay, remoteAddr, err := openTURNUnderlay(ctx, candidate, dest, proto, log)
 		if err != nil {
 			lastErr = err
 			log.Warn("turn candidate failed", "proto", proto, "index", i+1, "count", len(servers), "server", address, "error", err)
 			continue
 		}
 
-		log.Debug("turn candidate selected", "proto", proto, "index", i+1, "count", len(servers), "server", address)
+		log.Info("turn candidate selected", "proto", proto, "index", i+1, "count", len(servers), "server", address)
 		return underlay, remoteAddr, nil
 	}
 

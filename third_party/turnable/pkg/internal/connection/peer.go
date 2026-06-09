@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	turnableconfig "github.com/theairblow/turnable/pkg/config"
 	"github.com/theairblow/turnable/pkg/internal/protocol"
 )
 
@@ -17,12 +18,12 @@ import (
 var ErrPeerDone = errors.New("peer: done")
 
 const (
-	peerMaxPacket       = muxMaxPacket + 2 // maximum packet size read from a peer connection; must hold a full mux frame
-	peerReconnectInit   = 5 * time.Second  // initial back-off delay before the first peer reconnect attempt
-	peerReconnectMax    = 30 * time.Second // maximum back-off delay between peer reconnect attempts
-	peerQuotaBackoff    = 30 * time.Second // delay when TURN allocation quota is exhausted
-	peerIncomingBufSize = 1024             // channel buffer size for packets arriving from all peers
-	peerWriteSendBuf    = 256              // per-peer outbound write queue depth
+	peerMaxPacket              = muxMaxPacket + 2 // maximum packet size read from a peer connection; must hold a full mux frame
+	peerReconnectInit          = 5 * time.Second  // initial back-off delay before the first peer reconnect attempt
+	peerReconnectMax           = 30 * time.Second // maximum back-off delay between peer reconnect attempts
+	peerQuotaBackoff           = 30 * time.Second // delay when TURN allocation quota is exhausted
+	defaultPeerIncomingBufSize = 1024             // channel buffer size for packets arriving from all peers
+	defaultPeerWriteSendBuf    = 256              // per-peer outbound write queue depth
 )
 
 // peerEntry holds one live connection inside PeerConn
@@ -46,13 +47,26 @@ type PeerConn struct {
 
 	log            *slog.Logger
 	onAllPeersGone func()
+
+	peerOnlineEvents   atomic.Int64
+	peerOfflineEvents  atomic.Int64
+	incomingPackets    atomic.Int64
+	incomingBytes      atomic.Int64
+	incomingQueueFull  atomic.Int64
+	outgoingPackets    atomic.Int64
+	outgoingBytes      atomic.Int64
+	outgoingQueueFull  atomic.Int64
+	writeErrors        atomic.Int64
+	reconnectAttempts  atomic.Int64
+	reconnectFailures  atomic.Int64
+	reconnectSuccesses atomic.Int64
 }
 
 // NewPeerConn creates an empty PeerConn derived from the given context
 func NewPeerConn(ctx context.Context) *PeerConn {
 	ctx, cancel := context.WithCancel(ctx)
 	p := &PeerConn{
-		incoming: make(chan []byte, peerIncomingBufSize),
+		incoming: make(chan []byte, peerIncomingBufferSize()),
 		ctx:      ctx,
 		cancel:   cancel,
 		log:      slog.Default(),
@@ -83,17 +97,26 @@ func (m *PeerConn) AddPeer(conn net.Conn, reconnectFn func(context.Context) (net
 	m.allGone.Store(false)
 	entry := &peerEntry{
 		conn:   conn,
-		sendCh: make(chan []byte, peerWriteSendBuf),
+		sendCh: make(chan []byte, peerWriteBufferSize()),
 	}
 	entry.connected.Store(true)
 	m.mu.Lock()
 	idx := len(m.peers)
 	m.peers = append(m.peers, entry)
 	m.mu.Unlock()
+	m.peerOnlineEvents.Add(1)
 	m.log.Info("peer online", "peer_idx", idx, "online", m.countOnline(), "total", m.totalSlots())
 	go m.peerWriteLoop(entry)
 	go m.peerReadLoop(idx, entry, reconnectFn)
 	return nil
+}
+
+func peerIncomingBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.PeerIncomingBuffer, defaultPeerIncomingBufSize)
+}
+
+func peerWriteBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.PeerWriteBuffer, defaultPeerWriteSendBuf)
 }
 
 // peerWriteLoop drains the per-peer send queue and writes each packet to the connection
@@ -111,7 +134,14 @@ func (m *PeerConn) peerWriteLoop(entry *peerEntry) {
 			conn := entry.conn
 			entry.mu.Unlock()
 			if conn != nil {
-				_, _ = conn.Write(pkt)
+				n, err := conn.Write(pkt)
+				if err != nil {
+					m.writeErrors.Add(1)
+				}
+				if n > 0 {
+					m.outgoingPackets.Add(1)
+					m.outgoingBytes.Add(int64(n))
+				}
 			}
 		case <-m.ctx.Done():
 			return
@@ -135,6 +165,17 @@ func (m *PeerConn) peerReadLoop(idx int, entry *peerEntry, reconnectFn func(cont
 			copy(pkt, buf[:n])
 			select {
 			case m.incoming <- pkt:
+				m.incomingPackets.Add(1)
+				m.incomingBytes.Add(int64(n))
+				delay = peerReconnectInit
+				continue
+			default:
+				m.incomingQueueFull.Add(1)
+			}
+			select {
+			case m.incoming <- pkt:
+				m.incomingPackets.Add(1)
+				m.incomingBytes.Add(int64(n))
 			case <-m.ctx.Done():
 				return
 			}
@@ -153,6 +194,7 @@ func (m *PeerConn) peerReadLoop(idx int, entry *peerEntry, reconnectFn func(cont
 		}
 
 		entry.connected.Store(false)
+		m.peerOfflineEvents.Add(1)
 		_ = conn.Close()
 		m.log.Info("peer offline", "peer_idx", idx, "online", m.countOnline(), "total", m.totalSlots(), "error", err)
 		if m.countOnline() == 0 {
@@ -176,8 +218,10 @@ func (m *PeerConn) peerReadLoop(idx int, entry *peerEntry, reconnectFn func(cont
 				delay = peerReconnectMax
 			}
 
+			m.reconnectAttempts.Add(1)
 			newConn, err := reconnectFn(m.ctx)
 			if err != nil {
+				m.reconnectFailures.Add(1)
 				if errors.Is(err, ErrPeerDone) {
 					m.log.Info("peer done, removing slot", "peer_idx", idx)
 					m.removePeer(idx)
@@ -195,6 +239,8 @@ func (m *PeerConn) peerReadLoop(idx int, entry *peerEntry, reconnectFn func(cont
 			entry.conn = newConn
 			entry.mu.Unlock()
 			entry.connected.Store(true)
+			m.peerOnlineEvents.Add(1)
+			m.reconnectSuccesses.Add(1)
 			delay = peerReconnectInit
 			m.log.Info("peer online", "peer_idx", idx, "online", m.countOnline(), "total", m.totalSlots())
 			break
@@ -286,6 +332,7 @@ func (m *PeerConn) Write(p []byte) (int, error) {
 		case entry.sendCh <- buf:
 			return len(p), nil
 		default:
+			m.outgoingQueueFull.Add(1)
 		}
 	}
 
@@ -304,6 +351,29 @@ func (m *PeerConn) Write(p []byte) (int, error) {
 	}
 
 	return 0, errors.New("peer: no live peers")
+}
+
+// Stats returns diagnostics-safe peer counters.
+func (m *PeerConn) Stats() turnableconfig.PeerRuntimeStats {
+	if m == nil {
+		return turnableconfig.PeerRuntimeStats{}
+	}
+	return turnableconfig.PeerRuntimeStats{
+		OnlinePeers:        int64(m.countOnline()),
+		TotalPeerSlots:     int64(m.totalSlots()),
+		PeerOnlineEvents:   m.peerOnlineEvents.Load(),
+		PeerOfflineEvents:  m.peerOfflineEvents.Load(),
+		IncomingPackets:    m.incomingPackets.Load(),
+		IncomingBytes:      m.incomingBytes.Load(),
+		IncomingQueueFull:  m.incomingQueueFull.Load(),
+		OutgoingPackets:    m.outgoingPackets.Load(),
+		OutgoingBytes:      m.outgoingBytes.Load(),
+		OutgoingQueueFull:  m.outgoingQueueFull.Load(),
+		WriteErrors:        m.writeErrors.Load(),
+		ReconnectAttempts:  m.reconnectAttempts.Load(),
+		ReconnectFailures:  m.reconnectFailures.Load(),
+		ReconnectSuccesses: m.reconnectSuccesses.Load(),
+	}
 }
 
 // RemoteAddr returns a dummy remote address

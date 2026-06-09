@@ -53,7 +53,7 @@ func (N *NoneHandler) Connect(ctx context.Context, dest net.Addr, relay RelayInf
 
 	if forceTURN {
 		N.log.Debug("none connect using forced turn relay")
-		underlay, remoteAddr, err := connectViaTURN(relay, dest, "none", N.log)
+		underlay, remoteAddr, err := connectViaTURN(ctx, relay, dest, "none", N.log)
 		if err != nil {
 			return nil, err
 		}

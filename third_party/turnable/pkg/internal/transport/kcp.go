@@ -7,18 +7,19 @@ import (
 	"sync"
 	"time"
 
+	turnableconfig "github.com/theairblow/turnable/pkg/config"
 	kcp "github.com/xtaci/kcp-go/v5"
 )
 
 const (
-	kcpWindowSize      = 1024            // KCP send/receive window size
-	kcpUpdateMs        = 10              // KCP update interval in milliseconds
-	kcpControlUpdateMs = 1               // KCP update interval for control channels
-	kcpResend          = 2               // Fast resend after 2 duplicate ACKs
-	kcpDisableCC       = 1               // Disable KCP congestion control
-	kcpMTU             = 1418            // DTLS MTU excluding the overhead
-	kcpReadWriteBuff   = 2 * 1024 * 1024 // Read/write buffer size for the session
-	kcpConversation    = 1               // Conversation ID for this transport channel
+	defaultKCPWindowSize    = 1024            // KCP send/receive window size
+	kcpUpdateMs             = 10              // KCP update interval in milliseconds
+	kcpControlUpdateMs      = 1               // KCP update interval for control channels
+	kcpResend               = 2               // Fast resend after 2 duplicate ACKs
+	kcpDisableCC            = 1               // Disable KCP congestion control
+	kcpMTU                  = 1418            // DTLS MTU excluding the overhead
+	defaultKCPReadWriteBuff = 2 * 1024 * 1024 // Read/write buffer size for the session
+	kcpConversation         = 1               // Conversation ID for this transport channel
 )
 
 // KCPHandler represents a KCP transport handler
@@ -58,15 +59,25 @@ func wrapKCPWithInterval(conn net.Conn, intervalMs int, resend int) (net.Conn, e
 	}
 
 	session.SetNoDelay(1, intervalMs, resend, kcpDisableCC)
-	session.SetWindowSize(kcpWindowSize, kcpWindowSize)
+	windowSize := kcpWindowSize()
+	session.SetWindowSize(windowSize, windowSize)
 	session.SetACKNoDelay(true)
 	session.SetStreamMode(true)
 	session.SetWriteDelay(false)
-	_ = session.SetReadBuffer(kcpReadWriteBuff)
-	_ = session.SetWriteBuffer(kcpReadWriteBuff)
+	readWriteBuffer := kcpReadWriteBufferSize()
+	_ = session.SetReadBuffer(readWriteBuffer)
+	_ = session.SetWriteBuffer(readWriteBuffer)
 	_ = session.SetMtu(kcpMTU)
 
 	return &managedKCPConn{underlying: conn, packetConn: pc, session: session}, nil
+}
+
+func kcpWindowSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.KCPWindowSize, defaultKCPWindowSize)
+}
+
+func kcpReadWriteBufferSize() int {
+	return turnableconfig.PositiveOr(turnableconfig.Options.Transport.KCPReadWriteBuffer, defaultKCPReadWriteBuff)
 }
 
 // managedKCPConn wraps a KCP session and implements net.Conn

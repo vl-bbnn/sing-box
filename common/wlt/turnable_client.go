@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"strings"
 	"sync"
 
@@ -44,7 +42,7 @@ func StartTurnableListenerClient(ctx context.Context, options TurnableListenerCl
 	runCtx, cancel := context.WithCancel(ctx)
 	turnableconfig.Options.Interactive = false
 	turnableClient := turnableengine.NewTurnableClient(*cfg)
-	turnableClient.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	turnableClient.SetLogger(newLogfSlogLogger(options.Logger))
 	if err := turnableClient.Start(listenAddrs); err != nil {
 		cancel()
 		return nil, err

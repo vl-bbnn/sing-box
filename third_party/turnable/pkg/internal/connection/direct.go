@@ -266,7 +266,7 @@ func (D *DirectHandler) connectSession() error {
 }
 
 // OpenChannel opens a new logical data channel
-func (D *DirectHandler) OpenChannel(_ byte) (net.Conn, error) {
+func (D *DirectHandler) OpenChannel(_ context.Context, _ byte) (net.Conn, error) {
 	if !D.running.Load() {
 		return nil, errors.New("not running")
 	}
@@ -277,6 +277,16 @@ func (D *DirectHandler) OpenChannel(_ byte) (net.Conn, error) {
 		return nil, errors.New("direct: no active connection")
 	}
 	return D.peerConn, nil
+}
+
+// Stats returns diagnostics-safe direct-mode counters.
+func (D *DirectHandler) Stats() config.RuntimeStats {
+	var stats config.RuntimeStats
+	stats.Reconnecting = D.reconnecting.Load()
+	if D.peerConn != nil {
+		stats.Peer = D.peerConn.Stats()
+	}
+	return stats
 }
 
 // Disconnect gracefully tears down all peer connections
