@@ -21,6 +21,9 @@ type TransportOptions struct {
 	TinyMuxPingTimeoutMillis     int
 	PeerIncomingBuffer           int
 	PeerWriteBuffer              int
+	AdaptivePeerData             bool
+	AdaptivePeerThresholdBytes   int
+	AdaptivePeerIdleMillis       int
 	SRTPPacketBuffer             int
 	KCPWindowSize                int
 	KCPReadWriteBuffer           int
@@ -66,20 +69,23 @@ type TinyMuxRuntimeStats struct {
 }
 
 type PeerRuntimeStats struct {
-	OnlinePeers        int64
-	TotalPeerSlots     int64
-	PeerOnlineEvents   int64
-	PeerOfflineEvents  int64
-	IncomingPackets    int64
-	IncomingBytes      int64
-	IncomingQueueFull  int64
-	OutgoingPackets    int64
-	OutgoingBytes      int64
-	OutgoingQueueFull  int64
-	WriteErrors        int64
-	ReconnectAttempts  int64
-	ReconnectFailures  int64
-	ReconnectSuccesses int64
+	OnlinePeers         int64
+	TotalPeerSlots      int64
+	PeerOnlineEvents    int64
+	PeerOfflineEvents   int64
+	IncomingPackets     int64
+	IncomingBytes       int64
+	IncomingQueueFull   int64
+	OutgoingPackets     int64
+	OutgoingBytes       int64
+	OutgoingQueueFull   int64
+	WriteErrors         int64
+	ReconnectAttempts   int64
+	ReconnectFailures   int64
+	ReconnectSuccesses  int64
+	ActiveDataPeers     int64
+	AdaptiveActivations int64
+	AdaptiveFallbacks   int64
 }
 
 func init() {
@@ -90,6 +96,19 @@ func init() {
 func ApplyEnvironmentOptions() {
 	if value := positiveIntEnv("TURNABLE_RELAY_BANDWIDTH_BYTES_PER_SECOND"); value > 0 {
 		Options.Transport.RelayBandwidthBytesPerSecond = value
+	}
+	if value := positiveIntEnv("TURNABLE_KCP_WINDOW"); value > 0 {
+		Options.Transport.KCPWindowSize = value
+	}
+	if value := positiveIntEnv("TURNABLE_KCP_BUFFER"); value > 0 {
+		Options.Transport.KCPReadWriteBuffer = value
+	}
+	Options.Transport.AdaptivePeerData = boolEnv("TURNABLE_ADAPTIVE_PEER_DATA", Options.Transport.AdaptivePeerData)
+	if value := positiveIntEnv("TURNABLE_ADAPTIVE_PEER_THRESHOLD_BYTES_PER_SECOND"); value > 0 {
+		Options.Transport.AdaptivePeerThresholdBytes = value
+	}
+	if value := positiveIntEnv("TURNABLE_ADAPTIVE_PEER_IDLE_MILLIS"); value > 0 {
+		Options.Transport.AdaptivePeerIdleMillis = value
 	}
 }
 
@@ -119,4 +138,19 @@ func positiveIntEnv(name string) int {
 		return 0
 	}
 	return value
+}
+
+func boolEnv(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }

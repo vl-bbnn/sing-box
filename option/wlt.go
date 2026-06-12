@@ -28,6 +28,9 @@ type WLTServiceOptions struct {
 	TinyMuxPingTimeout           badoption.Duration `json:"tiny_mux_ping_timeout,omitempty"`
 	PeerIncomingBuffer           int                `json:"peer_incoming_buffer,omitempty"`
 	PeerWriteBuffer              int                `json:"peer_write_buffer,omitempty"`
+	AdaptivePeerData             bool               `json:"adaptive_peer_data,omitempty"`
+	AdaptivePeerThresholdBytes   int                `json:"adaptive_peer_threshold_bytes_per_second,omitempty"`
+	AdaptivePeerIdleTimeout      badoption.Duration `json:"adaptive_peer_idle_timeout,omitempty"`
 	SRTPPacketBuffer             int                `json:"srtp_packet_buffer,omitempty"`
 	KCPWindowSize                int                `json:"kcp_window,omitempty"`
 	KCPReadWriteBuffer           int                `json:"kcp_buffer,omitempty"`
@@ -80,6 +83,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if o.PeerWriteBuffer < 0 {
 		return E.New("wlt service peer_write_buffer must be non-negative")
+	}
+	if o.AdaptivePeerThresholdBytes < 0 {
+		return E.New("wlt service adaptive_peer_threshold_bytes_per_second must be non-negative")
 	}
 	if o.SRTPPacketBuffer < 0 {
 		return E.New("wlt service srtp_packet_buffer must be non-negative")

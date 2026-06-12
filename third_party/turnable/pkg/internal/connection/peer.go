@@ -24,6 +24,8 @@ const (
 	peerQuotaBackoff           = 30 * time.Second // delay when TURN allocation quota is exhausted
 	defaultPeerIncomingBufSize = 1024             // channel buffer size for packets arriving from all peers
 	defaultPeerWriteSendBuf    = 256              // per-peer outbound write queue depth
+	defaultAdaptiveThreshold   = 2 * 1024 * 1024  // bytes per second before using all peers
+	defaultAdaptiveIdle        = 8 * time.Second
 )
 
 // peerEntry holds one live connection inside PeerConn
@@ -48,28 +50,47 @@ type PeerConn struct {
 	log            *slog.Logger
 	onAllPeersGone func()
 
-	peerOnlineEvents   atomic.Int64
-	peerOfflineEvents  atomic.Int64
-	incomingPackets    atomic.Int64
-	incomingBytes      atomic.Int64
-	incomingQueueFull  atomic.Int64
-	outgoingPackets    atomic.Int64
-	outgoingBytes      atomic.Int64
-	outgoingQueueFull  atomic.Int64
-	writeErrors        atomic.Int64
-	reconnectAttempts  atomic.Int64
-	reconnectFailures  atomic.Int64
-	reconnectSuccesses atomic.Int64
+	peerOnlineEvents    atomic.Int64
+	peerOfflineEvents   atomic.Int64
+	incomingPackets     atomic.Int64
+	incomingBytes       atomic.Int64
+	incomingQueueFull   atomic.Int64
+	outgoingPackets     atomic.Int64
+	outgoingBytes       atomic.Int64
+	outgoingQueueFull   atomic.Int64
+	writeErrors         atomic.Int64
+	reconnectAttempts   atomic.Int64
+	reconnectFailures   atomic.Int64
+	reconnectSuccesses  atomic.Int64
+	adaptiveActivations atomic.Int64
+	adaptiveFallbacks   atomic.Int64
+
+	adaptiveMu        sync.Mutex
+	adaptiveEnabled   bool
+	adaptiveThreshold int64
+	adaptiveIdle      time.Duration
+	adaptiveWindowAt  time.Time
+	adaptiveBytes     int64
+	adaptiveUntil     time.Time
 }
 
 // NewPeerConn creates an empty PeerConn derived from the given context
 func NewPeerConn(ctx context.Context) *PeerConn {
 	ctx, cancel := context.WithCancel(ctx)
 	p := &PeerConn{
-		incoming: make(chan []byte, peerIncomingBufferSize()),
-		ctx:      ctx,
-		cancel:   cancel,
-		log:      slog.Default(),
+		incoming:        make(chan []byte, peerIncomingBufferSize()),
+		ctx:             ctx,
+		cancel:          cancel,
+		log:             slog.Default(),
+		adaptiveEnabled: turnableconfig.Options.Transport.AdaptivePeerData,
+		adaptiveThreshold: int64(turnableconfig.PositiveOr(
+			turnableconfig.Options.Transport.AdaptivePeerThresholdBytes,
+			defaultAdaptiveThreshold,
+		)),
+		adaptiveIdle: time.Duration(turnableconfig.PositiveOr(
+			turnableconfig.Options.Transport.AdaptivePeerIdleMillis,
+			int(defaultAdaptiveIdle/time.Millisecond),
+		)) * time.Millisecond,
 	}
 	return p
 }
@@ -161,6 +182,7 @@ func (m *PeerConn) peerReadLoop(idx int, entry *peerEntry, reconnectFn func(cont
 
 		n, err := conn.Read(buf)
 		if err == nil && n > 0 {
+			m.recordAdaptiveTraffic(n, m.totalSlots())
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
 			select {
@@ -307,10 +329,11 @@ func (m *PeerConn) Read(p []byte) (int, error) {
 	}
 }
 
-// Write enqueues one packet to the next live peer's send channel in round-robin order
+// Write enqueues one packet to a live peer. With adaptive peer data enabled,
+// the first peer carries light traffic and additional peers join under load.
 func (m *PeerConn) Write(p []byte) (int, error) {
 	m.mu.RLock()
-	peers := m.peers
+	peers := append([]*peerEntry(nil), m.peers...)
 	m.mu.RUnlock()
 
 	total := uint64(len(peers))
@@ -318,12 +341,19 @@ func (m *PeerConn) Write(p []byte) (int, error) {
 		return 0, errors.New("peer: no peers")
 	}
 
-	start := m.writeIdx.Add(1) - 1
 	buf := make([]byte, len(p))
 	copy(buf, p)
 
-	// Fast path: non-blocking enqueue to the next live peer
-	for i := uint64(0); i < total; i++ {
+	useAll := m.recordAdaptiveTraffic(len(p), int(total))
+	start := uint64(0)
+	limit := uint64(1)
+	if useAll {
+		start = m.writeIdx.Add(1) - 1
+		limit = total
+	}
+
+	// Fast path: prefer one peer for light traffic, then spread sustained load.
+	for i := uint64(0); i < limit; i++ {
 		entry := peers[(start+i)%total]
 		if entry == nil || !entry.connected.Load() {
 			continue
@@ -333,6 +363,26 @@ func (m *PeerConn) Write(p []byte) (int, error) {
 			return len(p), nil
 		default:
 			m.outgoingQueueFull.Add(1)
+		}
+	}
+
+	// A missing or saturated preferred peer immediately promotes this packet
+	// to all peers instead of waiting on the standby path.
+	if !useAll && total > 1 {
+		m.adaptiveFallbacks.Add(1)
+		m.activateAdaptive(time.Now())
+		start = m.writeIdx.Add(1) - 1
+		for i := uint64(0); i < total; i++ {
+			entry := peers[(start+i)%total]
+			if entry == nil || !entry.connected.Load() {
+				continue
+			}
+			select {
+			case entry.sendCh <- buf:
+				return len(p), nil
+			default:
+				m.outgoingQueueFull.Add(1)
+			}
 		}
 	}
 
@@ -353,26 +403,76 @@ func (m *PeerConn) Write(p []byte) (int, error) {
 	return 0, errors.New("peer: no live peers")
 }
 
+func (m *PeerConn) recordAdaptiveTraffic(size int, total int) bool {
+	if !m.adaptiveEnabled || total <= 1 {
+		return true
+	}
+	now := time.Now()
+	m.adaptiveMu.Lock()
+	defer m.adaptiveMu.Unlock()
+	if m.adaptiveWindowAt.IsZero() || now.Sub(m.adaptiveWindowAt) >= time.Second {
+		m.adaptiveWindowAt = now
+		m.adaptiveBytes = 0
+	}
+	m.adaptiveBytes += int64(size)
+	if m.adaptiveBytes >= m.adaptiveThreshold {
+		if !now.Before(m.adaptiveUntil) {
+			m.adaptiveActivations.Add(1)
+		}
+		m.adaptiveUntil = now.Add(m.adaptiveIdle)
+	}
+	return now.Before(m.adaptiveUntil)
+}
+
+func (m *PeerConn) activateAdaptive(now time.Time) {
+	if !m.adaptiveEnabled {
+		return
+	}
+	m.adaptiveMu.Lock()
+	if !now.Before(m.adaptiveUntil) {
+		m.adaptiveActivations.Add(1)
+	}
+	m.adaptiveUntil = now.Add(m.adaptiveIdle)
+	m.adaptiveMu.Unlock()
+}
+
+func (m *PeerConn) activeDataPeers() int64 {
+	online := int64(m.countOnline())
+	if !m.adaptiveEnabled || online <= 1 {
+		return online
+	}
+	m.adaptiveMu.Lock()
+	active := time.Now().Before(m.adaptiveUntil)
+	m.adaptiveMu.Unlock()
+	if active {
+		return online
+	}
+	return 1
+}
+
 // Stats returns diagnostics-safe peer counters.
 func (m *PeerConn) Stats() turnableconfig.PeerRuntimeStats {
 	if m == nil {
 		return turnableconfig.PeerRuntimeStats{}
 	}
 	return turnableconfig.PeerRuntimeStats{
-		OnlinePeers:        int64(m.countOnline()),
-		TotalPeerSlots:     int64(m.totalSlots()),
-		PeerOnlineEvents:   m.peerOnlineEvents.Load(),
-		PeerOfflineEvents:  m.peerOfflineEvents.Load(),
-		IncomingPackets:    m.incomingPackets.Load(),
-		IncomingBytes:      m.incomingBytes.Load(),
-		IncomingQueueFull:  m.incomingQueueFull.Load(),
-		OutgoingPackets:    m.outgoingPackets.Load(),
-		OutgoingBytes:      m.outgoingBytes.Load(),
-		OutgoingQueueFull:  m.outgoingQueueFull.Load(),
-		WriteErrors:        m.writeErrors.Load(),
-		ReconnectAttempts:  m.reconnectAttempts.Load(),
-		ReconnectFailures:  m.reconnectFailures.Load(),
-		ReconnectSuccesses: m.reconnectSuccesses.Load(),
+		OnlinePeers:         int64(m.countOnline()),
+		TotalPeerSlots:      int64(m.totalSlots()),
+		PeerOnlineEvents:    m.peerOnlineEvents.Load(),
+		PeerOfflineEvents:   m.peerOfflineEvents.Load(),
+		IncomingPackets:     m.incomingPackets.Load(),
+		IncomingBytes:       m.incomingBytes.Load(),
+		IncomingQueueFull:   m.incomingQueueFull.Load(),
+		OutgoingPackets:     m.outgoingPackets.Load(),
+		OutgoingBytes:       m.outgoingBytes.Load(),
+		OutgoingQueueFull:   m.outgoingQueueFull.Load(),
+		WriteErrors:         m.writeErrors.Load(),
+		ReconnectAttempts:   m.reconnectAttempts.Load(),
+		ReconnectFailures:   m.reconnectFailures.Load(),
+		ReconnectSuccesses:  m.reconnectSuccesses.Load(),
+		ActiveDataPeers:     m.activeDataPeers(),
+		AdaptiveActivations: m.adaptiveActivations.Load(),
+		AdaptiveFallbacks:   m.adaptiveFallbacks.Load(),
 	}
 }
 
@@ -386,7 +486,7 @@ func (m *PeerConn) Close() error {
 	}
 	m.cancel()
 	m.mu.RLock()
-	peers := m.peers
+	peers := append([]*peerEntry(nil), m.peers...)
 	m.mu.RUnlock()
 	for _, entry := range peers {
 		if entry == nil {

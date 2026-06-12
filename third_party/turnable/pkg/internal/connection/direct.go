@@ -29,6 +29,7 @@ type DirectHandler struct {
 	peerConn        *PeerConn
 	clientConfig    *config.ClientConfig
 	reconnecting    atomic.Bool
+	ready           readyState
 	reconnectMu     sync.Mutex
 	reconnectCtx    context.Context
 	reconnectCancel context.CancelFunc
@@ -103,6 +104,7 @@ func (D *DirectHandler) Connect(cfg config.ClientConfig) error {
 	D.clientConfig = &cfg
 	D.reconnectCtx = reconnectCtx
 	D.reconnectCancel = reconnectCancel
+	D.ready.set(false)
 
 	if err := D.connectSession(); err != nil {
 		reconnectCancel()
@@ -186,6 +188,7 @@ func (D *DirectHandler) connectSession() error {
 		if !D.reconnecting.CompareAndSwap(false, true) {
 			return
 		}
+		D.ready.set(false)
 		go func() {
 			defer D.reconnecting.Store(false)
 			delay := fullReconnectInit
@@ -261,6 +264,7 @@ func (D *DirectHandler) connectSession() error {
 
 	D.cancel = sessionCancel
 	D.peerConn = peerConn
+	D.ready.set(true)
 	D.log.Info("direct session connected", "gateway", cfg.Gateway, "peers", numPeers)
 	return nil
 }
@@ -277,6 +281,11 @@ func (D *DirectHandler) OpenChannel(_ context.Context, _ byte) (net.Conn, error)
 		return nil, errors.New("direct: no active connection")
 	}
 	return D.peerConn, nil
+}
+
+// WaitReady waits until a reconnect has produced a usable peer connection.
+func (D *DirectHandler) WaitReady(ctx context.Context) error {
+	return D.ready.waitReady(ctx)
 }
 
 // Stats returns diagnostics-safe direct-mode counters.
@@ -302,6 +311,7 @@ func (D *DirectHandler) Disconnect() error {
 	D.reconnectCtx = nil
 	D.reconnectCancel = nil
 	D.clientConfig = nil
+	D.ready.set(false)
 
 	if cancel != nil {
 		cancel()
