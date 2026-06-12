@@ -39,6 +39,7 @@ type Outbound struct {
 	transport       adapter.V2RayClientTransport
 	packetAddr      bool
 	xudp            bool
+	logConnections  bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
@@ -47,10 +48,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeVLESS, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
+		Adapter:        outbound.NewAdapterWithDialerOptions(C.TypeVLESS, tag, options.Network.Build(), options.DialerOptions),
+		logger:         logger,
+		dialer:         outboundDialer,
+		serverAddr:     options.ServerOptions.Build(),
+		logConnections: options.LogConnections == nil || *options.LogConnections,
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClientWithOptions(tls.ClientOptions{
@@ -99,19 +101,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if h.multiplexDialer == nil {
-		switch N.NetworkName(network) {
-		case N.NetworkTCP:
-			h.logger.InfoContext(ctx, "outbound connection to ", destination)
-		case N.NetworkUDP:
-			h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		if h.logConnections {
+			switch N.NetworkName(network) {
+			case N.NetworkTCP:
+				h.logger.InfoContext(ctx, "outbound connection to ", destination)
+			case N.NetworkUDP:
+				h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+			}
 		}
 		return (*vlessDialer)(h).DialContext(ctx, network, destination)
 	} else {
-		switch N.NetworkName(network) {
-		case N.NetworkTCP:
-			h.logger.InfoContext(ctx, "outbound multiplex connection to ", destination)
-		case N.NetworkUDP:
-			h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
+		if h.logConnections {
+			switch N.NetworkName(network) {
+			case N.NetworkTCP:
+				h.logger.InfoContext(ctx, "outbound multiplex connection to ", destination)
+			case N.NetworkUDP:
+				h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
+			}
 		}
 		return h.multiplexDialer.DialContext(ctx, network, destination)
 	}
@@ -119,10 +125,14 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if h.multiplexDialer == nil {
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		if h.logConnections {
+			h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		}
 		return (*vlessDialer)(h).ListenPacket(ctx, destination)
 	} else {
-		h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
+		if h.logConnections {
+			h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
+		}
 		return h.multiplexDialer.ListenPacket(ctx, destination)
 	}
 }
@@ -160,10 +170,14 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		if h.logConnections {
+			h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		}
 		return h.client.DialEarlyConn(conn, destination)
 	case N.NetworkUDP:
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		if h.logConnections {
+			h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		}
 		if h.xudp {
 			return h.client.DialEarlyXUDPPacketConn(conn, destination)
 		} else if h.packetAddr {
@@ -184,7 +198,9 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 }
 
 func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	if h.logConnections {
+		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
