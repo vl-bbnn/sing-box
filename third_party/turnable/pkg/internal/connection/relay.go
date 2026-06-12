@@ -65,6 +65,7 @@ type RelayHandler struct {
 	clientConfig    *config.ClientConfig
 	sessionUUID     string
 	reconnecting    atomic.Bool
+	ready           readyState
 	reconnectMu     sync.Mutex
 	reconnectCtx    context.Context
 	reconnectCancel context.CancelFunc
@@ -205,6 +206,7 @@ func (D *RelayHandler) Connect(cfg config.ClientConfig) error {
 	D.clientConfig = &cfg
 	D.reconnectCtx = reconnectCtx
 	D.reconnectCancel = reconnectCancel
+	D.ready.set(false)
 
 	if err := D.connectClientSession(); err != nil {
 		reconnectCancel()
@@ -268,6 +270,11 @@ func (D *RelayHandler) OpenChannel(ctx context.Context, routeIdx byte) (net.Conn
 	return wrapped, nil
 }
 
+// WaitReady waits until a reconnect has produced a usable mux session.
+func (D *RelayHandler) WaitReady(ctx context.Context) error {
+	return D.ready.waitReady(ctx)
+}
+
 // Stats returns diagnostics-safe relay runtime counters.
 func (D *RelayHandler) Stats() config.RuntimeStats {
 	var stats config.RuntimeStats
@@ -304,6 +311,7 @@ func (D *RelayHandler) Disconnect() error {
 	D.reconnectCancel = nil
 	D.clientConfig = nil
 	D.sessionUUID = ""
+	D.ready.set(false)
 
 	if cancel != nil {
 		cancel()
@@ -355,6 +363,7 @@ func (D *RelayHandler) Close() error {
 	D.reconnectCancel = nil
 	D.clientConfig = nil
 	D.sessionUUID = ""
+	D.ready.set(false)
 
 	if cancel != nil {
 		cancel()
@@ -477,6 +486,7 @@ func (D *RelayHandler) connectClientSession() error {
 		if !D.reconnecting.CompareAndSwap(false, true) {
 			return
 		}
+		D.ready.set(false)
 		D.fullReconnects.Add(1)
 		D.reasonMu.Lock()
 		D.lastReason = reason
@@ -788,6 +798,7 @@ primaryLoop:
 	D.muxClient = muxClient
 	D.peerConn = peerConn
 	D.sessionUUID = sessionUUIDStr
+	D.ready.set(true)
 
 	D.log.Info("relay client session connected", "session_uuid", sessionUUIDStr, "peers", numPeers)
 

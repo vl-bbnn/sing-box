@@ -114,6 +114,14 @@ func (c *TurnableClient) OpenRouteContext(ctx context.Context, routeIdx byte) (n
 	return c.handler.OpenChannel(ctx, routeIdx)
 }
 
+// WaitReady waits until the active handler can open logical channels.
+func (c *TurnableClient) WaitReady(ctx context.Context) error {
+	if c.handler == nil || !c.running.Load() {
+		return errors.New("not running")
+	}
+	return c.handler.WaitReady(ctx)
+}
+
 // Stats returns diagnostics-safe counters for the active connection handler.
 func (c *TurnableClient) Stats() config.RuntimeStats {
 	if c.handler == nil || !c.running.Load() {

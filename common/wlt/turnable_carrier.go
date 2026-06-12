@@ -100,10 +100,11 @@ const (
 	defaultTurnableKCPWindowSize         = 512
 	defaultTurnableKCPReadWriteBuffer    = 512 * 1024
 
-	turnableReconnectRetryInitial = 100 * time.Millisecond
-	turnableReconnectRetryMax     = 500 * time.Millisecond
-	turnableConnectRetryInitial   = 250 * time.Millisecond
-	turnableConnectRetryMax       = 2 * time.Second
+	turnableConnectRetryInitial = 250 * time.Millisecond
+	turnableConnectRetryMax     = 2 * time.Second
+
+	turnableReconnectRetryInitial = 20 * time.Millisecond
+	turnableReconnectRetryMax     = 250 * time.Millisecond
 )
 
 type TurnableCarrierOptions struct {
@@ -125,6 +126,9 @@ type TurnableCarrierOptions struct {
 	TinyMuxPingTimeout           time.Duration
 	PeerIncomingBuffer           int
 	PeerWriteBuffer              int
+	AdaptivePeerData             bool
+	AdaptivePeerThresholdBytes   int
+	AdaptivePeerIdleTimeout      time.Duration
 	SRTPPacketBuffer             int
 	KCPWindowSize                int
 	KCPReadWriteBuffer           int
@@ -168,6 +172,7 @@ type TurnableCarrier struct {
 	cancel context.CancelFunc
 
 	dialRoute func(context.Context, string) (net.Conn, error)
+	waitReady func(context.Context) error
 	logf      func(string, ...any)
 
 	connectTimeout   time.Duration
@@ -230,6 +235,7 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 		client:           turnableClient,
 		cancel:           cancel,
 		dialRoute:        turnableClient.DialRouteContext,
+		waitReady:        turnableClient.WaitReady,
 		logf:             logf,
 		connectTimeout:   options.ConnectTimeout,
 		dialQueueTimeout: options.DialQueueTimeout,
@@ -244,7 +250,7 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 		<-runCtx.Done()
 		_ = carrier.Close()
 	}()
-	logf("Turnable carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d relay_bandwidth=%d",
+	logf("Turnable carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
 		len(cfg.Routes),
 		strings.Join(turnableCarrierRouteClasses(carrier.routeByClass), ","),
 		options.MaxActiveStreams,
@@ -262,6 +268,9 @@ func StartTurnableCarrier(ctx context.Context, options TurnableCarrierOptions) (
 		transportOptions.TinyMuxPingTimeoutMillis,
 		transportOptions.PeerIncomingBuffer,
 		transportOptions.PeerWriteBuffer,
+		transportOptions.AdaptivePeerData,
+		transportOptions.AdaptivePeerThresholdBytes,
+		transportOptions.AdaptivePeerIdleMillis,
 		transportOptions.SRTPPacketBuffer,
 		transportOptions.RelayBandwidthBytesPerSecond,
 	)
@@ -397,19 +406,46 @@ func (c *TurnableCarrier) DialStream(ctx context.Context, routeClass string, tar
 
 	dialStartedAt := time.Now()
 	var (
-		conn              net.Conn
-		reconnectAttempts int
+		conn                  net.Conn
+		reconnectAttempts     int
+		reconnectBackoff      = turnableReconnectRetryInitial
+		reconnectBackoffTotal time.Duration
 	)
+reconnectLoop:
 	for {
 		c.openAttempts.Add(1)
 		conn, err = c.dialRoute(dialCtx, routeID)
 		if err == nil || !isTurnableReconnectInProgress(err) {
 			break
 		}
-		if !c.waitForReconnectRetry(dialCtx, reconnectAttempts) {
-			break
+		waitStartedAt := time.Now()
+		if c.waitReady != nil {
+			if waitErr := c.waitReady(dialCtx); waitErr != nil {
+				c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
+				err = waitErr
+				break
+			}
 		}
+		c.reconnectRetries.Add(1)
+		c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
 		reconnectAttempts++
+
+		timer := time.NewTimer(reconnectBackoff)
+		select {
+		case <-timer.C:
+			reconnectBackoffTotal += reconnectBackoff
+			c.reconnectWait.Add(int64(reconnectBackoff))
+		case <-dialCtx.Done():
+			timer.Stop()
+			err = dialCtx.Err()
+			break reconnectLoop
+		}
+		if reconnectBackoff < turnableReconnectRetryMax {
+			reconnectBackoff *= 2
+			if reconnectBackoff > turnableReconnectRetryMax {
+				reconnectBackoff = turnableReconnectRetryMax
+			}
+		}
 	}
 	dialElapsed := time.Since(dialStartedAt)
 	c.recordDuration(&c.lastDialDuration, &c.maxDialDuration, dialElapsed)
@@ -432,7 +468,7 @@ func (c *TurnableCarrier) DialStream(ctx context.Context, routeClass string, tar
 		}
 	}
 	if reconnectAttempts > 0 && c.logf != nil {
-		c.logf("Turnable stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d", routeClass, target, dialElapsed, reconnectAttempts)
+		c.logf("Turnable stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d backoff=%s", routeClass, target, dialElapsed, reconnectAttempts, reconnectBackoffTotal)
 	}
 	c.openedStreams.Add(1)
 	return &turnableCarrierConn{
@@ -619,29 +655,6 @@ func updateMaxAtomicInt64(slot *atomic.Int64, value int64) {
 	}
 }
 
-func (c *TurnableCarrier) waitForReconnectRetry(ctx context.Context, attempt int) bool {
-	delay := turnableReconnectRetryInitial
-	for i := 0; i < attempt; i++ {
-		delay *= 2
-		if delay >= turnableReconnectRetryMax {
-			delay = turnableReconnectRetryMax
-			break
-		}
-	}
-	waitStartedAt := time.Now()
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		c.reconnectRetries.Add(1)
-		c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
-		return true
-	case <-ctx.Done():
-		c.reconnectWait.Add(int64(time.Since(waitStartedAt)))
-		return false
-	}
-}
-
 func isTurnableReconnectInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "full reconnect is in progress")
 }
@@ -702,6 +715,9 @@ func applyTurnableCarrierRuntimeOptions(options TurnableCarrierOptions) turnable
 		TinyMuxPingTimeoutMillis:     int(defaultTurnableTinyMuxPingTimeout / time.Millisecond),
 		PeerIncomingBuffer:           clampInt(bufferSize/256, 64, 256),
 		PeerWriteBuffer:              clampInt(bufferSize/1024, 16, 64),
+		AdaptivePeerData:             options.AdaptivePeerData,
+		AdaptivePeerThresholdBytes:   options.AdaptivePeerThresholdBytes,
+		AdaptivePeerIdleMillis:       int(options.AdaptivePeerIdleTimeout / time.Millisecond),
 		SRTPPacketBuffer:             clampInt(bufferSize/128, 128, 512),
 		KCPWindowSize:                clampInt(bufferSize/64, 256, 768),
 		KCPReadWriteBuffer:           scaleClampedInt(bufferSize, 16, 256*1024, 1024*1024),

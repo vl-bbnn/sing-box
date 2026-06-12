@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync"
 
 	"github.com/theairblow/turnable/pkg/common"
 	"github.com/theairblow/turnable/pkg/config"
@@ -21,10 +22,58 @@ type Handler interface {
 	AcceptClients(ctx context.Context) (<-chan ServerClient, error)   // Accepts and emits new authenticated server clients
 	Connect(config config.ClientConfig) error                         // Connects to a remote server
 	OpenChannel(ctx context.Context, routeIdx byte) (net.Conn, error) // Opens a new logical data channel for the given route index
+	WaitReady(ctx context.Context) error                              // Waits until logical channels can be opened after reconnect
 	Stats() config.RuntimeStats                                       // Returns diagnostics-safe runtime counters
 	Disconnect() error                                                // Gracefully disconnects from the current remote server
 	Close() error                                                     // Forcibly closes the current remove server connection
 	SetLogger(log *slog.Logger)                                       // Changes the slog logger instance
+}
+
+type readyState struct {
+	mu    sync.Mutex
+	ready bool
+	wait  chan struct{}
+}
+
+func (s *readyState) set(ready bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ready {
+		if s.ready {
+			return
+		}
+		s.ready = true
+		if s.wait != nil {
+			close(s.wait)
+			s.wait = nil
+		}
+		return
+	}
+	if !s.ready && s.wait != nil {
+		return
+	}
+	s.ready = false
+	s.wait = make(chan struct{})
+}
+
+func (s *readyState) waitReady(ctx context.Context) error {
+	s.mu.Lock()
+	if s.ready {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.wait == nil {
+		s.wait = make(chan struct{})
+	}
+	wait := s.wait
+	s.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wait:
+		return nil
+	}
 }
 
 // ServerClient represents a server client

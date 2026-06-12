@@ -395,6 +395,15 @@ func TestTurnableCarrierDialStreamCancelsOpen(t *testing.T) {
 func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
 	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
 	var calls int
+	ready := make(chan struct{})
+	carrier.waitReady = func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ready:
+			return nil
+		}
+	}
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
 		_ = ctx
 		_ = routeID
@@ -406,6 +415,10 @@ func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
 		_ = right.Close()
 		return left, nil
 	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(ready)
+	}()
 
 	conn, err := carrier.DialStream(context.Background(), "eu", "reconnect.example:443")
 	if err != nil {
@@ -415,6 +428,41 @@ func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
 	stats := carrier.Stats()
 	if calls != 2 || stats.OpenAttempts != 2 || stats.ReconnectRetries != 1 || stats.ReconnectWaitMillis <= 0 || stats.FailedStreams != 0 {
 		t.Fatalf("calls=%d stats=%+v, want one reconnect retry and successful open", calls, stats)
+	}
+}
+
+func TestTurnableCarrierDialStreamBacksOffWhenReconnectWaitReturnsEarly(t *testing.T) {
+	carrier := newTestTurnableCarrier(1, 1, 1, 120*time.Millisecond, time.Second)
+	var calls int
+	carrier.waitReady = func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
+		_ = routeID
+		calls++
+		return nil, errors.New("full reconnect is in progress")
+	}
+
+	startedAt := time.Now()
+	if _, err := carrier.DialStream(context.Background(), "eu", "reconnect.example:443"); err == nil {
+		t.Fatal("expected reconnect timeout")
+	}
+	elapsed := time.Since(startedAt)
+	stats := carrier.Stats()
+	if calls > 10 || stats.OpenAttempts > 10 {
+		t.Fatalf("calls=%d stats=%+v, want bounded reconnect retry loop", calls, stats)
+	}
+	if stats.ReconnectRetries == 0 || stats.ReconnectWaitMillis == 0 || elapsed < 50*time.Millisecond {
+		t.Fatalf("elapsed=%s stats=%+v, want reconnect backoff before timeout", elapsed, stats)
+	}
+	if stats.FailedStreams != 1 || stats.ActiveStreams != 0 {
+		t.Fatalf("stats=%+v, want failed reconnect open with released active slot", stats)
 	}
 }
 
