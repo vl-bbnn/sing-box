@@ -46,8 +46,9 @@ type vkStartedConversationInfo struct {
 	} `json:"turnServer"`
 }
 
-const vkAuthCacheTTL = 9 * time.Minute // Cache TTL for VK authorization snapshots
-const vkCallsSessionVersion = 2        // Anonymous VK calls session protocol version
+const defaultVKAuthCacheTTL = 30 * time.Minute // Fresh cache TTL for VK authorization snapshots
+const defaultVKAuthStaleTTL = 2 * time.Hour    // Emergency stale cache window when VK bootstrap is temporarily unavailable
+const vkCallsSessionVersion = 2                // Anonymous VK calls session protocol version
 
 // vkAuthSnapshot stores one cached VK authorization result
 type vkAuthSnapshot struct {
@@ -73,7 +74,7 @@ var vkAuthCacheState = struct { // Shared VK auth cache and in-flight coordinati
 	inflight: make(map[string]chan struct{}),
 }
 
-// getCachedVKAuth returns a cached VK auth snapshot when it is still valid
+// getCachedVKAuth returns a cached VK auth snapshot when it is still fresh.
 func getCachedVKAuth(key string) (vkAuthSnapshot, bool) {
 	now := time.Now()
 
@@ -85,19 +86,77 @@ func getCachedVKAuth(key string) (vkAuthSnapshot, bool) {
 		return vkAuthSnapshot{}, false
 	}
 	if now.After(snapshot.ExpiresAt) {
-		delete(vkAuthCacheState.entries, key)
+		if now.After(snapshot.ExpiresAt.Add(vkAuthStaleTTL())) {
+			delete(vkAuthCacheState.entries, key)
+		}
 		return vkAuthSnapshot{}, false
 	}
 	return snapshot, true
 }
 
+// getStaleVKAuth returns an expired-but-recent snapshot as a best-effort fallback.
+func getStaleVKAuth(key string) (vkAuthSnapshot, time.Duration, bool) {
+	now := time.Now()
+
+	vkAuthCacheState.mu.Lock()
+	defer vkAuthCacheState.mu.Unlock()
+
+	snapshot, ok := vkAuthCacheState.entries[key]
+	if !ok {
+		return vkAuthSnapshot{}, 0, false
+	}
+	if now.Before(snapshot.ExpiresAt) {
+		return snapshot, 0, true
+	}
+	expiredFor := now.Sub(snapshot.ExpiresAt)
+	if expiredFor > vkAuthStaleTTL() {
+		delete(vkAuthCacheState.entries, key)
+		return vkAuthSnapshot{}, 0, false
+	}
+	return snapshot, expiredFor, true
+}
+
 // putCachedVKAuth stores a VK auth snapshot with a fresh expiration time
 func putCachedVKAuth(key string, snapshot vkAuthSnapshot) {
-	snapshot.ExpiresAt = time.Now().Add(vkAuthCacheTTL)
+	snapshot.ExpiresAt = time.Now().Add(vkAuthCacheTTL())
 
 	vkAuthCacheState.mu.Lock()
 	defer vkAuthCacheState.mu.Unlock()
 	vkAuthCacheState.entries[key] = snapshot
+}
+
+func vkAuthCacheTTL() time.Duration {
+	return positiveDurationEnv("TURNABLE_VK_AUTH_CACHE_TTL", defaultVKAuthCacheTTL)
+}
+
+func vkAuthStaleTTL() time.Duration {
+	return positiveDurationEnv("TURNABLE_VK_AUTH_STALE_TTL", defaultVKAuthStaleTTL)
+}
+
+func positiveDurationEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func (V *VKHandler) applyAuthSnapshot(snapshot vkAuthSnapshot) {
+	V.mu.Lock()
+	defer V.mu.Unlock()
+	V.messagesAccessToken = snapshot.MessagesAccessToken
+	V.anonymToken = snapshot.AnonymToken
+	V.sessionKey = snapshot.SessionKey
+	V.deviceID = snapshot.DeviceID
+	V.endpoint = snapshot.Endpoint
+	V.turnUser = snapshot.TurnUser
+	V.turnPass = snapshot.TurnPass
+	V.turnAddr = snapshot.TurnAddr
+	V.turnAddrs = append([]string(nil), snapshot.TurnAddrs...)
 }
 
 // beginVKAuth registers one in-flight VK auth request and returns its coordination channel
@@ -158,17 +217,7 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 	cacheKey := normalizedCallID + "|" + name
 	for {
 		if cached, ok := getCachedVKAuth(cacheKey); ok {
-			V.mu.Lock()
-			V.messagesAccessToken = cached.MessagesAccessToken
-			V.anonymToken = cached.AnonymToken
-			V.sessionKey = cached.SessionKey
-			V.deviceID = cached.DeviceID
-			V.endpoint = cached.Endpoint
-			V.turnUser = cached.TurnUser
-			V.turnPass = cached.TurnPass
-			V.turnAddr = cached.TurnAddr
-			V.turnAddrs = append([]string(nil), cached.TurnAddrs...)
-			V.mu.Unlock()
+			V.applyAuthSnapshot(cached)
 			slog.Debug("vk authorize reused cached auth state")
 			return nil
 		}
@@ -190,18 +239,33 @@ func (V *VKHandler) Authorize(callID string, username string) error {
 
 	messagesToken, anonymToken, err := V.authorizeAnonymous(ctx, joinURL, name)
 	if err != nil {
+		if stale, expiredFor, ok := getStaleVKAuth(cacheKey); ok {
+			V.applyAuthSnapshot(stale)
+			slog.Warn("vk authorize anonymous flow failed, using stale cached auth state", "expired_for_ms", expiredFor.Milliseconds(), "error", err)
+			return nil
+		}
 		slog.Warn("vk authorize anonymous flow failed", "error", err)
 		return err
 	}
 
 	sessionKey, deviceID, err := V.callsLogin(ctx)
 	if err != nil {
+		if stale, expiredFor, ok := getStaleVKAuth(cacheKey); ok {
+			V.applyAuthSnapshot(stale)
+			slog.Warn("vk calls login failed, using stale cached auth state", "expired_for_ms", expiredFor.Milliseconds(), "error", err)
+			return nil
+		}
 		slog.Warn("vk calls login failed", "error", err)
 		return err
 	}
 
 	startedInfo, err := V.joinConversation(ctx, normalizedCallID, anonymToken, sessionKey)
 	if err != nil {
+		if stale, expiredFor, ok := getStaleVKAuth(cacheKey); ok {
+			V.applyAuthSnapshot(stale)
+			slog.Warn("vk join conversation failed, using stale cached auth state", "expired_for_ms", expiredFor.Milliseconds(), "error", err)
+			return nil
+		}
 		slog.Warn("vk join conversation failed", "error", err)
 		return err
 	}
