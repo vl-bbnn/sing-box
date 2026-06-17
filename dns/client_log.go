@@ -3,11 +3,26 @@ package dns
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common/logger"
 
 	"github.com/miekg/dns"
 )
+
+const slowExchangeThreshold = time.Second
+
+func logSlowExchange(logger logger.ContextLogger, ctx context.Context, transportTag string, question dns.Question, elapsed time.Duration, err error) {
+	if logger == nil || elapsed < slowExchangeThreshold {
+		return
+	}
+	domain := FqdnToDomain(question.Name)
+	if err != nil {
+		logger.WarnContext(ctx, "slow DNS exchange transport=", transportTag, " domain=", domain, " type=", dns.Type(question.Qtype).String(), " elapsed=", elapsed.String(), " error=", err)
+	} else {
+		logger.WarnContext(ctx, "slow DNS exchange transport=", transportTag, " domain=", domain, " type=", dns.Type(question.Qtype).String(), " elapsed=", elapsed.String())
+	}
+}
 
 func logCachedResponse(logger logger.ContextLogger, ctx context.Context, response *dns.Msg, ttl int) {
 	if logger == nil || len(response.Question) == 0 {
