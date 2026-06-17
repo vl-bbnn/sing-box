@@ -18,6 +18,7 @@ import (
 
 const (
 	wltStatsHeartbeatInterval    = 30 * time.Second
+	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMaxLog = 4
@@ -143,16 +144,46 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
 	statsCtx, cancel := context.WithCancel(s.ctx)
 	s.statsCancel = cancel
 	go func() {
-		ticker := time.NewTicker(wltStatsHeartbeatInterval)
-		defer ticker.Stop()
+		heartbeatTicker := time.NewTicker(wltStatsHeartbeatInterval)
+		defer heartbeatTicker.Stop()
+		incidentTicker := time.NewTicker(wltIncidentPollInterval)
+		defer incidentTicker.Stop()
 		var reconnectingSince time.Time
-		lastStats := carrier.Stats()
+		initialStats := carrier.Stats()
+		lastStats := initialStats
+		lastIncidentStats := initialStats
 		lastStatsAt := time.Now()
+		var lastIncidentAt time.Time
+		lastIncident := "none"
 		for {
 			select {
 			case <-statsCtx.Done():
 				return
-			case <-ticker.C:
+			case <-incidentTicker.C:
+				now := time.Now()
+				stats := carrier.Stats()
+				if incident := describeWLTIncident(stats, lastIncidentStats); incident != "" {
+					lastIncidentAt = now
+					lastIncident = incident
+					s.logger.Warn("wlt service incident ", incident)
+				}
+				lastIncidentStats = stats
+				rt := stats.Runtime
+				if rt.Reconnecting && rt.Peer.OnlinePeers == 0 {
+					if reconnectingSince.IsZero() {
+						reconnectingSince = now
+						s.logger.Warn("wlt service reconnect outage started reason=", rt.LastReconnectReason)
+					}
+					if now.Sub(reconnectingSince) >= wltReconnectRecoveryAfter {
+						s.logger.Warn("wlt service reconnect outage exceeded threshold elapsed=", now.Sub(reconnectingSince).String(), " threshold=", wltReconnectRecoveryAfter.String(), " reason=", rt.LastReconnectReason)
+						go s.restartCarrier(carrier, "reconnect outage: "+rt.LastReconnectReason)
+						return
+					}
+				} else if !reconnectingSince.IsZero() {
+					s.logger.Info("wlt service reconnect outage recovered elapsed=", now.Sub(reconnectingSince).String())
+					reconnectingSince = time.Time{}
+				}
+			case <-heartbeatTicker.C:
 				now := time.Now()
 				stats := carrier.Stats()
 				rt := stats.Runtime
@@ -161,23 +192,9 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
 				elapsed := now.Sub(lastStatsAt)
 				lastMux := lastStats.Runtime.Mux
 				lastPeer := lastStats.Runtime.Peer
-				s.logger.Info("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes)
+				s.logger.Info("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " last_incident=", lastIncident, " last_incident_age_ms=", incidentAgeMillis(now, lastIncidentAt), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes)
 				lastStats = stats
 				lastStatsAt = now
-				if rt.Reconnecting && peer.OnlinePeers == 0 {
-					if reconnectingSince.IsZero() {
-						reconnectingSince = time.Now()
-						s.logger.Warn("wlt service reconnect outage started reason=", rt.LastReconnectReason)
-					}
-					if time.Since(reconnectingSince) >= wltReconnectRecoveryAfter {
-						s.logger.Warn("wlt service reconnect outage exceeded threshold elapsed=", time.Since(reconnectingSince).String(), " threshold=", wltReconnectRecoveryAfter.String(), " reason=", rt.LastReconnectReason)
-						go s.restartCarrier(carrier, "reconnect outage: "+rt.LastReconnectReason)
-						return
-					}
-				} else if !reconnectingSince.IsZero() {
-					s.logger.Info("wlt service reconnect outage recovered elapsed=", time.Since(reconnectingSince).String())
-					reconnectingSince = time.Time{}
-				}
 			}
 		}
 	}()
@@ -251,4 +268,44 @@ func kibPerSecond(bytes int64, elapsed time.Duration) int64 {
 		return 0
 	}
 	return int64(float64(bytes) / 1024 / elapsed.Seconds())
+}
+
+func describeWLTIncident(current wltpkg.CarrierStats, previous wltpkg.CarrierStats) string {
+	currentMux := current.Runtime.Mux
+	previousMux := previous.Runtime.Mux
+	currentPeer := current.Runtime.Peer
+	previousPeer := previous.Runtime.Peer
+	parts := make([]string, 0, 12)
+	appendDelta := func(name string, value int64, oldValue int64) {
+		if delta := counterDelta(value, oldValue); delta > 0 {
+			parts = append(parts, fmt.Sprintf("%s_delta=%d", name, delta))
+		}
+	}
+	appendDelta("reconnects", current.Runtime.FullReconnects, previous.Runtime.FullReconnects)
+	appendDelta("reconnect_retries", current.ReconnectRetries, previous.ReconnectRetries)
+	appendDelta("failed", current.FailedStreams, previous.FailedStreams)
+	appendDelta("rejected", current.RejectedStreams, previous.RejectedStreams)
+	appendDelta("rejected_queue", current.RejectedQueue, previous.RejectedQueue)
+	appendDelta("rejected_active", current.RejectedActive, previous.RejectedActive)
+	appendDelta("rejected_open", current.RejectedOpen, previous.RejectedOpen)
+	appendDelta("mux_open_errors", currentMux.OpenErrors, previousMux.OpenErrors)
+	appendDelta("mux_ping_timeouts", currentMux.PingTimeouts, previousMux.PingTimeouts)
+	appendDelta("mux_disconnects", currentMux.Disconnects, previousMux.Disconnects)
+	appendDelta("mux_control_errors", currentMux.ControlReadErrors, previousMux.ControlReadErrors)
+	appendDelta("mux_flow_drops", currentMux.FlowDrops, previousMux.FlowDrops)
+	appendDelta("peer_in_queue_full", currentPeer.IncomingQueueFull, previousPeer.IncomingQueueFull)
+	appendDelta("peer_out_queue_full", currentPeer.OutgoingQueueFull, previousPeer.OutgoingQueueFull)
+	appendDelta("peer_reconnect_failures", currentPeer.ReconnectFailures, previousPeer.ReconnectFailures)
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " ") +
+		fmt.Sprintf(" reconnecting=%t peer_online=%d active=%d pending=%d last_reconnect=%s", current.Runtime.Reconnecting, currentPeer.OnlinePeers, current.ActiveStreams, current.PendingDials, current.Runtime.LastReconnectReason)
+}
+
+func incidentAgeMillis(now time.Time, incidentAt time.Time) int64 {
+	if incidentAt.IsZero() {
+		return -1
+	}
+	return now.Sub(incidentAt).Milliseconds()
 }
