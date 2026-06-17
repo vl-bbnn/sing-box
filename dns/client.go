@@ -188,8 +188,10 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	exchangeStartedAt := time.Now()
 	response, err := transport.Exchange(ctx, message)
 	cancel()
+	logSlowExchange(c.logger, ctx, transport.Tag(), question, time.Since(exchangeStartedAt), err)
 	if err != nil {
 		var rcodeError RcodeError
 		if errors.As(err, &rcodeError) {
