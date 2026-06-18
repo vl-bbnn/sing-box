@@ -69,7 +69,7 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 	var message mDNS.Msg
 	err := message.Unpack(payload)
 	if err != nil {
-		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
+		r.logger.DebugContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
 		return
 	}
 	r.searchProcessInfo(ctx, &metadata)
