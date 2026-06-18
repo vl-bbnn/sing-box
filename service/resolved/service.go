@@ -154,6 +154,10 @@ func (i *Service) exchangePacket(buffer *buf.Buffer, oob []byte, source M.Socksa
 	ctx := log.ContextWithNewID(i.ctx)
 	err := i.exchangePacket0(ctx, buffer, oob, source)
 	if err != nil {
+		if strings.Contains(err.Error(), "unpack request") {
+			i.logger.DebugContext(ctx, "process DNS packet: ", err)
+			return
+		}
 		i.logger.ErrorContext(ctx, "process DNS packet: ", err)
 	}
 }

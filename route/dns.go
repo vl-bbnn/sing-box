@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -65,6 +66,10 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
 func ExchangeDNSPacket(ctx context.Context, router adapter.DNSRouter, logger logger.ContextLogger, conn N.PacketConn, buffer *buf.Buffer, metadata adapter.InboundContext, destination M.Socksaddr) {
 	err := exchangeDNSPacket(ctx, router, conn, buffer, metadata, destination)
 	if err != nil && !R.IsRejected(err) && !E.IsClosedOrCanceled(err) {
+		if strings.Contains(err.Error(), "unpack request") {
+			logger.DebugContext(ctx, E.Cause(err, "process DNS packet"))
+			return
+		}
 		logger.ErrorContext(ctx, E.Cause(err, "process DNS packet"))
 	}
 }
