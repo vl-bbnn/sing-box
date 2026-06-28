@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -87,6 +88,22 @@ func TestLoadCarrierAuthSnapshotIgnoresMissingFile(t *testing.T) {
 	missingPath := t.TempDir() + "/missing-auth-snapshot.json"
 	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshotFile: missingPath}, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadCarrierAuthSnapshotIgnoresCorruptFile(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshotFile: path}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadCarrierAuthSnapshotRejectsCorruptInlineSnapshot(t *testing.T) {
+	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshot: "{not-json"}, nil); err == nil {
+		t.Fatal("expected corrupt inline snapshot to fail")
 	}
 }
 

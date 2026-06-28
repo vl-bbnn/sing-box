@@ -283,6 +283,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 
 	runtimeClient, err := connectCarrierClient(runCtx, cfg, options.ConnectTimeout, logf)
 	if err != nil {
+		if snapshotErr := saveCarrierAuthSnapshot(options, cfg, logf); snapshotErr != nil && logf != nil {
+			logf("WLT carrier auth snapshot save after failed connect failed error=%v", snapshotErr)
+		}
 		cancel()
 		if logf != nil {
 			logf("WLT carrier start failed phase=connect elapsed=%s error=%v", time.Since(startedAt), err)
@@ -448,9 +451,18 @@ func loadCarrierAuthSnapshot(options CarrierOptions, logf func(string, ...any)) 
 		source = "file"
 	}
 	if raw == "" {
+		if source == "file" && logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_empty source=file")
+		}
 		return nil
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
+		if source == "file" {
+			if logf != nil {
+				logf("WLT carrier start phase=auth_snapshot_ignored source=file error=%v", err)
+			}
+			return nil
+		}
 		return fmt.Errorf("import auth snapshot: %w", err)
 	}
 	if logf != nil {
