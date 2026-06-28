@@ -10,11 +10,26 @@ run() {
 	"$@"
 }
 
+lx_tags=""
+lx_ldflags=""
+if [[ -f Makefile.lx ]]; then
+	lx_tags="$(make -f Makefile.lx lx-print-tags)"
+	lx_ldflags="-checklinkname=0"
+fi
+
 printf '==> checking default build and tests\n'
 run go test ./...
 
 printf '==> checking WLT build and tests\n'
 run go test -tags with_wlt ./...
+
+if [[ -n "$lx_tags" ]]; then
+	printf '==> checking LX build and tests\n'
+	run go test -tags "$lx_tags" -ldflags "$lx_ldflags" ./...
+
+	printf '==> checking LX+WLT build and tests\n'
+	run go test -tags "$lx_tags,with_wlt" -ldflags "$lx_ldflags" ./...
+fi
 
 printf '==> checking default dependency graph stays WLT-free\n'
 if go list -deps ./cmd/sing-box | rg -q 'github.com/(2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
@@ -22,10 +37,26 @@ if go list -deps ./cmd/sing-box | rg -q 'github.com/(2b2n/wlt-carrier|theairblow
 	exit 1
 fi
 
+if [[ -n "$lx_tags" ]]; then
+	printf '==> checking LX dependency graph stays WLT-free\n'
+	if go list -tags "$lx_tags" -deps ./cmd/sing-box | rg -q 'github.com/(2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
+		echo "LX sing-box dependency graph includes WLT carrier dependencies without with_wlt" >&2
+		exit 1
+	fi
+fi
+
 printf '==> checking WLT dependency graph includes carrier runtime\n'
 if ! go list -tags with_wlt -deps ./cmd/sing-box | rg -q 'github.com/2b2n/wlt-carrier/pkg/config'; then
 	echo "with_wlt dependency graph does not include carrier runtime config package" >&2
 	exit 1
+fi
+
+if [[ -n "$lx_tags" ]]; then
+	printf '==> checking LX+WLT dependency graph includes carrier runtime\n'
+	if ! go list -tags "$lx_tags,with_wlt" -deps ./cmd/sing-box | rg -q 'github.com/2b2n/wlt-carrier/pkg/config'; then
+		echo "LX+with_wlt dependency graph does not include carrier runtime config package" >&2
+		exit 1
+	fi
 fi
 
 printf '==> checking carrier runtime source mode\n'
