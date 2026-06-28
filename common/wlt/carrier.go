@@ -216,20 +216,65 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	if logf == nil {
 		logf = log.Printf
 	}
+	startedAt := time.Now()
+	if logf != nil {
+		logf("WLT carrier start phase=load_config source=%s", carrierConfigSource(options))
+	}
 	cfg, err := loadCarrierClientConfig(CarrierConfigOptions{
 		Config:     options.Config,
 		ConfigFile: options.ConfigFile,
 	})
 	if err != nil {
+		if logf != nil {
+			logf("WLT carrier start failed phase=load_config elapsed=%s error=%v", time.Since(startedAt), err)
+		}
 		return nil, err
+	}
+	if logf != nil {
+		logf("WLT carrier start phase=config_ready type=%s platform=%s routes=%d route_ids=%s peers=%d force_turn=%t proto=%s gateway_configured=%t elapsed=%s",
+			safeLogValue(cfg.Type),
+			safeLogValue(cfg.PlatformID),
+			len(cfg.Routes),
+			strings.Join(carrierRouteIDs(cfg), ","),
+			cfg.Peers,
+			cfg.ForceTurn,
+			safeLogValue(cfg.Proto),
+			strings.TrimSpace(cfg.Gateway) != "",
+			time.Since(startedAt),
+		)
 	}
 	options = withCarrierDefaults(options)
 	runCtx, cancel := context.WithCancel(ctx)
 	transportOptions := applyCarrierRuntimeOptions(options)
+	if logf != nil {
+		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
+			options.MaxActiveStreams,
+			options.MaxOpenAttempts,
+			options.MaxPendingDials,
+			options.DialQueueTimeout,
+			options.ConnectTimeout,
+			options.IdleTimeout,
+			options.BufferSize,
+			transportOptions.TinyMuxFlowBuffer,
+			transportOptions.TinyMuxFlowSendBuffer,
+			transportOptions.TinyMuxControlBuffer,
+			transportOptions.TinyMuxRateBurstBytes,
+			transportOptions.PeerIncomingBuffer,
+			transportOptions.PeerWriteBuffer,
+			transportOptions.SRTPPacketBuffer,
+			transportOptions.KCPWindowSize,
+			transportOptions.KCPReadWriteBuffer,
+			transportOptions.RelayBandwidthBytesPerSecond,
+			time.Since(startedAt),
+		)
+	}
 
 	runtimeClient, err := connectCarrierClient(runCtx, cfg, options.ConnectTimeout, logf)
 	if err != nil {
 		cancel()
+		if logf != nil {
+			logf("WLT carrier start failed phase=connect elapsed=%s error=%v", time.Since(startedAt), err)
+		}
 		return nil, err
 	}
 
@@ -280,23 +325,37 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 }
 
 func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, timeout time.Duration, logf func(string, ...any)) (*carrierengine.Client, error) {
+	startedAt := time.Now()
 	connectCtx, connectCancel := context.WithTimeout(ctx, timeout)
 	defer connectCancel()
 
 	delay := carrierConnectRetryInitial
 	var lastErr error
 	for attempt := 1; ; attempt++ {
+		attemptStartedAt := time.Now()
 		runtimeClient := carrierengine.NewClient(*cfg)
 		runtimeClient.SetLogger(newLogfSlogLogger(logf))
+		if logf != nil {
+			logf("WLT carrier connect attempt started attempt=%d timeout=%s routes=%d peers=%d elapsed=%s", attempt, timeout, len(cfg.Routes), cfg.Peers, time.Since(startedAt))
+		}
 
 		connectDone := make(chan error, 1)
+		pendingTimer := time.AfterFunc(3*time.Second, func() {
+			if logf != nil {
+				logf("WLT carrier connect attempt still pending attempt=%d elapsed=%s total_elapsed=%s", attempt, time.Since(attemptStartedAt), time.Since(startedAt))
+			}
+		})
 		go func() {
 			connectDone <- runtimeClient.Connect()
 		}()
 
 		select {
 		case err := <-connectDone:
+			pendingTimer.Stop()
 			if err == nil {
+				if logf != nil {
+					logf("WLT carrier connect attempt succeeded attempt=%d elapsed=%s total_elapsed=%s", attempt, time.Since(attemptStartedAt), time.Since(startedAt))
+				}
 				if attempt > 1 && logf != nil {
 					logf("WLT carrier connect recovered attempts=%d", attempt)
 				}
@@ -305,6 +364,7 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 			lastErr = err
 			_ = runtimeClient.Stop()
 		case <-connectCtx.Done():
+			pendingTimer.Stop()
 			_ = runtimeClient.Stop()
 			if lastErr != nil {
 				return nil, fmt.Errorf("connect WLT carrier: %w; last error: %v", connectCtx.Err(), lastErr)
@@ -371,6 +431,38 @@ func loadCarrierClientConfig(options CarrierConfigOptions) (*carrierconfig.Clien
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func carrierConfigSource(options CarrierOptions) string {
+	if strings.TrimSpace(options.Config) != "" {
+		return "inline"
+	}
+	if strings.TrimSpace(options.ConfigFile) != "" {
+		return "file"
+	}
+	return "missing"
+}
+
+func carrierRouteIDs(cfg *carrierconfig.ClientConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	routeIDs := make([]string, 0, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		routeIDs = append(routeIDs, safeLogValue(route.RouteID))
+	}
+	if len(routeIDs) == 0 {
+		return []string{"none"}
+	}
+	return routeIDs
+}
+
+func safeLogValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "none"
+	}
+	return value
 }
 
 func (c *Carrier) DialStream(ctx context.Context, routeClass string, target string) (io.ReadWriteCloser, error) {

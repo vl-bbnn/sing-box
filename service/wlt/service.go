@@ -72,8 +72,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	s.access.RUnlock()
 
 	startedAt := time.Now()
+	s.logger.Info("wlt service starting transport=", s.options.Transport)
 	carrier, err := s.startCarrier()
 	if err != nil {
+		s.logger.Error("wlt service start failed elapsed=", time.Since(startedAt).String(), " error=", err)
 		return err
 	}
 	s.access.Lock()
@@ -236,6 +238,7 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 			return
 		}
 		startedAt := time.Now()
+		s.logger.Info("wlt service carrier restart attempt=", attempt, " reason=", reason)
 		carrier, err := s.startCarrier()
 		if err == nil {
 			s.access.Lock()
