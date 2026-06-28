@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package wlt
 
 import (
@@ -19,7 +21,7 @@ import (
 )
 
 type carrierService interface {
-	Carrier() *wltpkg.TurnableCarrier
+	Carrier() *wltpkg.Carrier
 }
 
 func RegisterOutbound(registry *outbound.Registry) {

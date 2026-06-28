@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package option_test
 
 import (
@@ -17,9 +19,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 		"services": [
 			{
 				"type": "wlt",
-				"tag": "wlt-turnable",
-				"transport": "turnable",
-				"turnable_config": "{}",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
 				"max_open_attempts": 16,
@@ -47,7 +49,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 			{
 				"type": "wlt",
 				"tag": "wlt-eu",
-				"service": "wlt-turnable",
+				"service": "wlt-carrier",
 				"route": "eu",
 				"network": "tcp"
 			}
@@ -75,6 +77,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	if !serviceOptions.AdaptivePeerData || serviceOptions.AdaptivePeerThresholdBytes != 2097152 {
 		t.Fatalf("adaptive peer options=%+v", serviceOptions)
 	}
+	if serviceOptions.CarrierConfig != "{}" {
+		t.Fatalf("carrier config=%q, want inline config", serviceOptions.CarrierConfig)
+	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))
 	}
@@ -87,7 +92,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 }
 
-func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
+func TestWLTConfigUnmarshalAcceptsLegacyTurnableFields(t *testing.T) {
 	ctx := include.Context(context.Background())
 	var options option.Options
 	err := json.UnmarshalContext(ctx, []byte(`{
@@ -96,7 +101,32 @@ func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
 				"type": "wlt",
 				"tag": "wlt-turnable",
 				"transport": "turnable",
-				"turnable_config": "{}",
+				"turnable_config": "{}"
+			}
+		]
+	}`), &options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceOptions, ok := options.Services[0].Options.(*option.WLTServiceOptions)
+	if !ok {
+		t.Fatalf("service options type=%T, want *option.WLTServiceOptions", options.Services[0].Options)
+	}
+	if serviceOptions.CarrierConfig != "{}" {
+		t.Fatalf("carrier config=%q, want legacy turnable config", serviceOptions.CarrierConfig)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
 				"max_pending_dials": -1
 			}
 		]
@@ -113,9 +143,9 @@ func TestWLTServiceUnmarshalRejectsNegativeRelayBandwidth(t *testing.T) {
 		"services": [
 			{
 				"type": "wlt",
-				"tag": "wlt-turnable",
-				"transport": "turnable",
-				"turnable_config": "{}",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
 				"relay_bandwidth_bytes_per_second": -1
 			}
 		]
@@ -132,9 +162,9 @@ func TestWLTServiceUnmarshalRejectsNegativeDebugTransportOption(t *testing.T) {
 		"services": [
 			{
 				"type": "wlt",
-				"tag": "wlt-turnable",
-				"transport": "turnable",
-				"turnable_config": "{}",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
 				"kcp_buffer": -1
 			}
 		]
@@ -180,7 +210,7 @@ func TestWLTOutboundUnmarshalRejectsPacketNetwork(t *testing.T) {
 	var options option.Options
 	err := json.UnmarshalContext(ctx, []byte(`{
 		"outbounds": [
-			{"type": "wlt", "tag": "wlt-eu", "service": "wlt-turnable", "route": "eu", "network": ["tcp", "udp"]}
+			{"type": "wlt", "tag": "wlt-eu", "service": "wlt-carrier", "route": "eu", "network": ["tcp", "udp"]}
 		]
 	}`), &options)
 	if err == nil || !strings.Contains(err.Error(), "tcp network only") {

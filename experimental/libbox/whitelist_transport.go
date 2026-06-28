@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package libbox
 
 import (
@@ -20,6 +22,9 @@ type WhitelistTransportOptions struct {
 	TelemostVP8FPS      int32
 	TelemostVP8Batch    int32
 	TelemostPayloadSize int32
+	CarrierConfig       string
+	CarrierConfigFile   string
+	CarrierListeners    string
 	TurnableConfig      string
 	TurnableConfigFile  string
 	TurnableListeners   string
@@ -27,7 +32,7 @@ type WhitelistTransportOptions struct {
 
 type WhitelistTransportClient struct {
 	cancel context.CancelFunc
-	client *wlt.TurnableListenerClient
+	client *wlt.ListenerClient
 }
 
 func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTransportClient, error) {
@@ -36,7 +41,7 @@ func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTran
 	}
 	transport := options.Transport
 	if transport == "" {
-		transport = "telemost"
+		transport = "wlt"
 	}
 	startTimeout := time.Duration(options.StartTimeoutMS) * time.Millisecond
 	if startTimeout <= 0 {
@@ -45,13 +50,25 @@ func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTran
 
 	ctx, cancel := context.WithCancel(context.Background())
 	timer := time.AfterFunc(startTimeout, cancel)
-	var client *wlt.TurnableListenerClient
+	var client *wlt.ListenerClient
 	var err error
-	if strings.EqualFold(transport, "turnable") {
-		client, err = wlt.StartTurnableListenerClient(ctx, wlt.TurnableListenerClientOptions{
-			Config:     options.TurnableConfig,
-			ConfigFile: options.TurnableConfigFile,
-			Listeners:  options.TurnableListeners,
+	if strings.EqualFold(transport, "wlt") || strings.EqualFold(transport, "carrier") || strings.EqualFold(transport, "turnable") {
+		config := strings.TrimSpace(options.CarrierConfig)
+		if config == "" {
+			config = options.TurnableConfig
+		}
+		configFile := strings.TrimSpace(options.CarrierConfigFile)
+		if configFile == "" {
+			configFile = options.TurnableConfigFile
+		}
+		listeners := strings.TrimSpace(options.CarrierListeners)
+		if listeners == "" {
+			listeners = options.TurnableListeners
+		}
+		client, err = wlt.StartListenerClient(ctx, wlt.ListenerClientOptions{
+			Config:     config,
+			ConfigFile: configFile,
+			Listeners:  listeners,
 			Logger: func(format string, args ...any) {
 				fmt.Printf("wlt: "+format+"\n", args...)
 			},
