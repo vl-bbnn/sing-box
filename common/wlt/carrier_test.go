@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	carrierconfig "github.com/2b2n/wlt-carrier/pkg/config"
+	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 )
 
 func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {

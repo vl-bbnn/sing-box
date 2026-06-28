@@ -5,6 +5,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+carrier_module="github.com/vl-bbnn/wlt-carrier"
+case ",${GOPRIVATE:-}," in
+*,"$carrier_module",*) ;;
+*) export GOPRIVATE="${GOPRIVATE:+$GOPRIVATE,}$carrier_module" ;;
+esac
+
 run() {
 	printf '==> %s\n' "$*"
 	"$@"
@@ -32,46 +38,46 @@ if [[ -n "$lx_tags" ]]; then
 fi
 
 printf '==> checking default dependency graph stays WLT-free\n'
-if go list -deps ./cmd/sing-box | rg -q 'github.com/(2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
+if go list -deps ./cmd/sing-box | rg -q 'github.com/(vl-bbnn/wlt-carrier|2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
 	echo "default sing-box dependency graph includes WLT carrier dependencies" >&2
 	exit 1
 fi
 
 if [[ -n "$lx_tags" ]]; then
 	printf '==> checking LX dependency graph stays WLT-free\n'
-	if go list -tags "$lx_tags" -deps ./cmd/sing-box | rg -q 'github.com/(2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
+	if go list -tags "$lx_tags" -deps ./cmd/sing-box | rg -q 'github.com/(vl-bbnn/wlt-carrier|2b2n/wlt-carrier|theairblow/turnable|pion/)'; then
 		echo "LX sing-box dependency graph includes WLT carrier dependencies without with_wlt" >&2
 		exit 1
 	fi
 fi
 
 printf '==> checking WLT dependency graph includes carrier runtime\n'
-if ! go list -tags with_wlt -deps ./cmd/sing-box | rg -q 'github.com/2b2n/wlt-carrier/pkg/config'; then
+if ! go list -tags with_wlt -deps ./cmd/sing-box | rg -q "$carrier_module/pkg/config"; then
 	echo "with_wlt dependency graph does not include carrier runtime config package" >&2
 	exit 1
 fi
 
 if [[ -n "$lx_tags" ]]; then
 	printf '==> checking LX+WLT dependency graph includes carrier runtime\n'
-	if ! go list -tags "$lx_tags,with_wlt" -deps ./cmd/sing-box | rg -q 'github.com/2b2n/wlt-carrier/pkg/config'; then
+	if ! go list -tags "$lx_tags,with_wlt" -deps ./cmd/sing-box | rg -q "$carrier_module/pkg/config"; then
 		echo "LX+with_wlt dependency graph does not include carrier runtime config package" >&2
 		exit 1
 	fi
 fi
 
 printf '==> checking carrier runtime source mode\n'
-if [[ "${WLT_REQUIRE_EXTERNAL_CARRIER:-${WLT_REQUIRE_EXTERNAL_TURNABLE:-0}}" == "1" ]]; then
-	if rg -q '^replace github\.com/2b2n/wlt-carrier => \.\./wlt-carrier$' go.mod; then
+if rg -q '^replace github\.com/vl-bbnn/wlt-carrier => \.\./wlt-carrier$' go.mod; then
+	if [[ "${WLT_REQUIRE_EXTERNAL_CARRIER:-${WLT_REQUIRE_EXTERNAL_TURNABLE:-0}}" == "1" ]]; then
 		echo "local sibling wlt-carrier replace is still present" >&2
 		exit 1
 	fi
-else
-	if ! rg -q '^replace github\.com/2b2n/wlt-carrier => \.\./wlt-carrier$' go.mod; then
-		echo "local carrier runtime replace is missing; set WLT_REQUIRE_EXTERNAL_CARRIER=1 for an external module" >&2
+	if ! rg -q '^module github\.com/vl-bbnn/wlt-carrier$' ../wlt-carrier/go.mod; then
+		echo "../wlt-carrier/go.mod does not expose $carrier_module" >&2
 		exit 1
 	fi
-	if ! rg -q '^module github\.com/2b2n/wlt-carrier$' ../wlt-carrier/go.mod; then
-		echo "../wlt-carrier/go.mod does not expose github.com/2b2n/wlt-carrier" >&2
+else
+	if ! go list -m "$carrier_module" | rg -q "^$carrier_module v"; then
+		echo "carrier runtime is not resolved as a versioned module" >&2
 		exit 1
 	fi
 fi

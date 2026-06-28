@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	carrierconfig "github.com/2b2n/wlt-carrier/pkg/config"
-	carrierengine "github.com/2b2n/wlt-carrier/pkg/engine"
+	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
+	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
 type ListenerClientOptions struct {
