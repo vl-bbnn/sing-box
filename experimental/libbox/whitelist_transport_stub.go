@@ -32,3 +32,7 @@ func StartWhitelistTransport(options *WhitelistTransportOptions) (*WhitelistTran
 func (c *WhitelistTransportClient) Close() error {
 	return nil
 }
+
+func PrewarmWLTAuth(carrierConfig string, carrierConfigFile string, snapshotOutputFile string) error {
+	return fmt.Errorf("WLT support is disabled; rebuild libbox with the with_wlt tag")
+}

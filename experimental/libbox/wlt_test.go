@@ -31,3 +31,10 @@ func TestCheckConfigAcceptsWLTServiceAfterOutbound(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPrewarmWLTAuthRejectsMissingCarrierConfig(t *testing.T) {
+	err := PrewarmWLTAuth("", "", "")
+	if err == nil {
+		t.Fatal("expected missing carrier config error")
+	}
+}

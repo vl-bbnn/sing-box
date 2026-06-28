@@ -5,10 +5,14 @@ package libbox
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/common/wlt"
+	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
+	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
 type WhitelistTransportOptions struct {
@@ -97,4 +101,58 @@ func (c *WhitelistTransportClient) Close() error {
 		return c.client.Close()
 	}
 	return nil
+}
+
+func PrewarmWLTAuth(carrierConfig string, carrierConfigFile string, snapshotOutputFile string) error {
+	cfg, err := loadPrewarmCarrierConfig(carrierConfig, carrierConfigFile)
+	if err != nil {
+		return err
+	}
+	snapshot, err := carrierengine.PrewarmAuth(*cfg)
+	if err != nil {
+		return err
+	}
+	snapshotOutputFile = strings.TrimSpace(snapshotOutputFile)
+	if snapshotOutputFile == "" {
+		return nil
+	}
+	if dir := filepath.Dir(snapshotOutputFile); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create auth snapshot directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(snapshotOutputFile, snapshot, 0o600); err != nil {
+		return fmt.Errorf("write auth snapshot file: %w", err)
+	}
+	return nil
+}
+
+func loadPrewarmCarrierConfig(configContent string, configFile string) (*carrierconfig.ClientConfig, error) {
+	raw := strings.TrimSpace(configContent)
+	if raw == "" && strings.TrimSpace(configFile) != "" {
+		content, err := os.ReadFile(strings.TrimSpace(configFile))
+		if err != nil {
+			return nil, err
+		}
+		raw = strings.TrimSpace(string(content))
+	}
+	if raw == "" {
+		return nil, fmt.Errorf("carrier config is not configured")
+	}
+	var (
+		cfg *carrierconfig.ClientConfig
+		err error
+	)
+	if strings.HasPrefix(raw, "turnable://") {
+		cfg, err = carrierconfig.NewClientConfigFromURL(raw)
+	} else {
+		cfg, err = carrierconfig.NewClientConfigFromJSON(raw)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
