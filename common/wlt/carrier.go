@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +114,10 @@ const (
 type CarrierOptions struct {
 	Config     string
 	ConfigFile string
+
+	AuthSnapshot           string
+	AuthSnapshotFile       string
+	AuthSnapshotOutputFile string
 
 	ConnectTimeout   time.Duration
 	MaxActiveStreams int
@@ -244,6 +249,12 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			time.Since(startedAt),
 		)
 	}
+	if err := loadCarrierAuthSnapshot(options, logf); err != nil {
+		if logf != nil {
+			logf("WLT carrier start failed phase=auth_snapshot elapsed=%s error=%v", time.Since(startedAt), err)
+		}
+		return nil, err
+	}
 	options = withCarrierDefaults(options)
 	runCtx, cancel := context.WithCancel(ctx)
 	transportOptions := applyCarrierRuntimeOptions(options)
@@ -277,6 +288,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			logf("WLT carrier start failed phase=connect elapsed=%s error=%v", time.Since(startedAt), err)
 		}
 		return nil, err
+	}
+	if err := saveCarrierAuthSnapshot(options, cfg, logf); err != nil && logf != nil {
+		logf("WLT carrier auth snapshot save failed error=%v", err)
 	}
 
 	carrier := &Carrier{
@@ -412,6 +426,63 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 
 func isFatalCarrierConnectError(err error) bool {
 	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
+}
+
+func loadCarrierAuthSnapshot(options CarrierOptions, logf func(string, ...any)) error {
+	raw := strings.TrimSpace(options.AuthSnapshot)
+	source := ""
+	if raw != "" {
+		source = "inline"
+	} else if path := strings.TrimSpace(options.AuthSnapshotFile); path != "" {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if logf != nil {
+					logf("WLT carrier start phase=auth_snapshot_missing source=file")
+				}
+				return nil
+			}
+			return fmt.Errorf("read auth snapshot file: %w", err)
+		}
+		raw = strings.TrimSpace(string(content))
+		source = "file"
+	}
+	if raw == "" {
+		return nil
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
+		return fmt.Errorf("import auth snapshot: %w", err)
+	}
+	if logf != nil {
+		logf("WLT carrier start phase=auth_snapshot_loaded source=%s", source)
+	}
+	return nil
+}
+
+func saveCarrierAuthSnapshot(options CarrierOptions, cfg *carrierconfig.ClientConfig, logf func(string, ...any)) error {
+	path := strings.TrimSpace(options.AuthSnapshotOutputFile)
+	if path == "" {
+		path = strings.TrimSpace(options.AuthSnapshotFile)
+	}
+	if path == "" {
+		return nil
+	}
+	data, err := carrierengine.ExportAuthSnapshotJSON(*cfg)
+	if err != nil {
+		return fmt.Errorf("export auth snapshot: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create auth snapshot directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write auth snapshot file: %w", err)
+	}
+	if logf != nil {
+		logf("WLT carrier auth snapshot saved")
+	}
+	return nil
 }
 
 func loadCarrierClientConfig(options CarrierConfigOptions) (*carrierconfig.ClientConfig, error) {

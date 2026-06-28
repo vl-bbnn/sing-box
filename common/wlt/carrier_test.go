@@ -5,15 +5,18 @@ package wlt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
+	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
 func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {
@@ -41,6 +44,49 @@ func TestFatalCarrierConnectErrorIncludesManualCaptchaUnavailable(t *testing.T) 
 	err := errors.Join(errors.New("connect failed"), carriercommon.ErrManualCaptchaUnavailable)
 	if !isFatalCarrierConnectError(err) {
 		t.Fatal("manual captcha unavailable error should be fatal for startup connect")
+	}
+}
+
+func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	snapshot := fmt.Sprintf(`{
+		"version":1,
+		"platform_id":"vk.com",
+		"call_id":"snapshot-test",
+		"username":"tester",
+		"expires_at":%q,
+		"vk":{
+			"messages_access_token":"messages",
+			"anonym_token":"anonymous",
+			"session_key":"session",
+			"device_id":"device",
+			"endpoint":"wss://example.invalid/ws",
+			"turn_user":"turn-user",
+			"turn_pass":"turn-pass",
+			"turn_addr":"turn:one.example.invalid",
+			"turn_addrs":["turn:one.example.invalid"]
+		}
+	}`, expiresAt)
+	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshot: snapshot}, nil); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := carrierengine.ExportAuthSnapshotJSON(carrierconfig.ClientConfig{
+		PlatformID: "vk.com",
+		CallID:     "snapshot-test",
+		Username:   "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported), `"anonym_token":"anonymous"`) {
+		t.Fatalf("exported snapshot does not contain imported token: %s", exported)
+	}
+}
+
+func TestLoadCarrierAuthSnapshotIgnoresMissingFile(t *testing.T) {
+	missingPath := t.TempDir() + "/missing-auth-snapshot.json"
+	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshotFile: missingPath}, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

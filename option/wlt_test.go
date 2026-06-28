@@ -22,6 +22,8 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"tag": "wlt-carrier",
 				"transport": "wlt",
 				"carrier_config": "{}",
+				"auth_snapshot_file": "/tmp/wlt-auth.json",
+				"auth_snapshot_output_file": "/tmp/wlt-auth-next.json",
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
 				"max_open_attempts": 16,
@@ -79,6 +81,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.CarrierConfig != "{}" {
 		t.Fatalf("carrier config=%q, want inline config", serviceOptions.CarrierConfig)
+	}
+	if serviceOptions.AuthSnapshotFile != "/tmp/wlt-auth.json" || serviceOptions.AuthSnapshotOutputFile != "/tmp/wlt-auth-next.json" {
+		t.Fatalf("auth snapshot options=%+v", serviceOptions)
 	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))

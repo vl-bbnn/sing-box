@@ -16,6 +16,10 @@ type WLTServiceOptions struct {
 	Transport         string `json:"transport,omitempty"`
 	CarrierConfig     string `json:"carrier_config,omitempty"`
 	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
+	AuthSnapshot      string `json:"auth_snapshot,omitempty"`
+	AuthSnapshotFile  string `json:"auth_snapshot_file,omitempty"`
+	// AuthSnapshotOutputFile is updated after successful carrier auth.
+	AuthSnapshotOutputFile string `json:"auth_snapshot_output_file,omitempty"`
 	// Deprecated: use carrier_config.
 	TurnableConfig string `json:"turnable_config,omitempty"`
 	// Deprecated: use carrier_config_file.
@@ -59,6 +63,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	o.CarrierConfig = strings.TrimSpace(o.CarrierConfig)
 	o.CarrierConfigFile = strings.TrimSpace(o.CarrierConfigFile)
+	o.AuthSnapshot = strings.TrimSpace(o.AuthSnapshot)
+	o.AuthSnapshotFile = strings.TrimSpace(o.AuthSnapshotFile)
+	o.AuthSnapshotOutputFile = strings.TrimSpace(o.AuthSnapshotOutputFile)
 	o.TurnableConfig = strings.TrimSpace(o.TurnableConfig)
 	o.TurnableConfigFile = strings.TrimSpace(o.TurnableConfigFile)
 	if o.CarrierConfig == "" {
