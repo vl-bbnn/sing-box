@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 )
 
@@ -33,6 +34,13 @@ func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {
 	}
 	if !reflect.DeepEqual(routeByClass, want) {
 		t.Fatalf("route map=%v, want %v", routeByClass, want)
+	}
+}
+
+func TestFatalCarrierConnectErrorIncludesManualCaptchaUnavailable(t *testing.T) {
+	err := errors.Join(errors.New("connect failed"), carriercommon.ErrManualCaptchaUnavailable)
+	if !isFatalCarrierConnectError(err) {
+		t.Fatal("manual captcha unavailable error should be fatal for startup connect")
 	}
 }
 

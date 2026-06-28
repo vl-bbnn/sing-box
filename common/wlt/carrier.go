@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
@@ -363,6 +364,12 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 			}
 			lastErr = err
 			_ = runtimeClient.Stop()
+			if isFatalCarrierConnectError(err) {
+				if logf != nil {
+					logf("WLT carrier connect failed permanently attempt=%d elapsed=%s error=%v", attempt, time.Since(startedAt), err)
+				}
+				return nil, fmt.Errorf("connect WLT carrier: %w", err)
+			}
 		case <-connectCtx.Done():
 			pendingTimer.Stop()
 			_ = runtimeClient.Stop()
@@ -401,6 +408,10 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 			}
 		}
 	}
+}
+
+func isFatalCarrierConnectError(err error) bool {
+	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
 }
 
 func loadCarrierClientConfig(options CarrierConfigOptions) (*carrierconfig.ClientConfig, error) {
