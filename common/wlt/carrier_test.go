@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
@@ -68,7 +70,7 @@ func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
 			"turn_addrs":["turn:one.example.invalid"]
 		}
 	}`, expiresAt)
-	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshot: snapshot}, nil); err != nil {
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{AuthSnapshot: snapshot}, nil); err != nil {
 		t.Fatal(err)
 	}
 	exported, err := carrierengine.ExportAuthSnapshotJSON(carrierconfig.ClientConfig{
@@ -86,7 +88,7 @@ func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
 
 func TestLoadCarrierAuthSnapshotIgnoresMissingFile(t *testing.T) {
 	missingPath := t.TempDir() + "/missing-auth-snapshot.json"
-	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshotFile: missingPath}, nil); err != nil {
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{AuthSnapshotFile: missingPath}, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -96,14 +98,35 @@ func TestLoadCarrierAuthSnapshotIgnoresCorruptFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshotFile: path}, nil); err != nil {
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{AuthSnapshotFile: path}, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestLoadCarrierAuthSnapshotRejectsCorruptInlineSnapshot(t *testing.T) {
-	if err := loadCarrierAuthSnapshot(CarrierOptions{AuthSnapshot: "{not-json"}, nil); err == nil {
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{AuthSnapshot: "{not-json"}, nil); err == nil {
 		t.Fatal("expected corrupt inline snapshot to fail")
+	}
+}
+
+func TestFetchCarrierAuthSnapshotUsesHTTPSAndBoundsPayload(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			t.Fatalf("method=%s, want GET", request.Method)
+		}
+		_, _ = writer.Write([]byte(`{"version":1}`))
+	}))
+	defer server.Close()
+
+	data, err := fetchCarrierAuthSnapshotWithClient(context.Background(), server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"version":1}` {
+		t.Fatalf("snapshot=%q", data)
+	}
+	if _, err := fetchCarrierAuthSnapshot(context.Background(), "http://example.com/snapshot", time.Second); err == nil {
+		t.Fatal("expected non-HTTPS URL rejection")
 	}
 }
 

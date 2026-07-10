@@ -92,6 +92,8 @@ func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
 		ConfigFile:                   s.options.CarrierConfigFile,
 		AuthSnapshot:                 s.options.AuthSnapshot,
 		AuthSnapshotFile:             s.options.AuthSnapshotFile,
+		AuthSnapshotURL:              s.options.AuthSnapshotURL,
+		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
 		AuthSnapshotOutputFile:       s.options.AuthSnapshotOutputFile,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,

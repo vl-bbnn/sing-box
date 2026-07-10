@@ -10,6 +10,8 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -109,15 +111,20 @@ const (
 
 	carrierReconnectRetryInitial = 20 * time.Millisecond
 	carrierReconnectRetryMax     = 250 * time.Millisecond
+
+	defaultAuthSnapshotFetchTimeout = 5 * time.Second
+	maxAuthSnapshotBytes            = 256 * 1024
 )
 
 type CarrierOptions struct {
 	Config     string
 	ConfigFile string
 
-	AuthSnapshot           string
-	AuthSnapshotFile       string
-	AuthSnapshotOutputFile string
+	AuthSnapshot             string
+	AuthSnapshotFile         string
+	AuthSnapshotURL          string
+	AuthSnapshotFetchTimeout time.Duration
+	AuthSnapshotOutputFile   string
 
 	ConnectTimeout   time.Duration
 	MaxActiveStreams int
@@ -249,7 +256,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			time.Since(startedAt),
 		)
 	}
-	if err := loadCarrierAuthSnapshot(options, logf); err != nil {
+	if err := loadCarrierAuthSnapshot(ctx, options, logf); err != nil {
 		if logf != nil {
 			logf("WLT carrier start failed phase=auth_snapshot elapsed=%s error=%v", time.Since(startedAt), err)
 		}
@@ -431,7 +438,26 @@ func isFatalCarrierConnectError(err error) bool {
 	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
 }
 
-func loadCarrierAuthSnapshot(options CarrierOptions, logf func(string, ...any)) error {
+func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf func(string, ...any)) error {
+	if snapshotURL := strings.TrimSpace(options.AuthSnapshotURL); snapshotURL != "" {
+		if raw, err := fetchCarrierAuthSnapshot(ctx, snapshotURL, options.AuthSnapshotFetchTimeout); err != nil {
+			if logf != nil {
+				logf("WLT carrier auth snapshot remote refresh unavailable error=%v", err)
+			}
+		} else if err := carrierengine.ImportAuthSnapshotJSON(raw); err != nil {
+			if logf != nil {
+				logf("WLT carrier auth snapshot remote refresh ignored error=%v", err)
+			}
+		} else {
+			if err := writeCarrierAuthSnapshot(options, raw); err != nil && logf != nil {
+				logf("WLT carrier auth snapshot remote cache write failed error=%v", err)
+			}
+			if logf != nil {
+				logf("WLT carrier start phase=auth_snapshot_loaded source=remote")
+			}
+			return nil
+		}
+	}
 	raw := strings.TrimSpace(options.AuthSnapshot)
 	source := ""
 	if raw != "" {
@@ -471,7 +497,61 @@ func loadCarrierAuthSnapshot(options CarrierOptions, logf func(string, ...any)) 
 	return nil
 }
 
+func fetchCarrierAuthSnapshot(ctx context.Context, rawURL string, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = defaultAuthSnapshotFetchTimeout
+	}
+	return fetchCarrierAuthSnapshotWithClient(ctx, rawURL, &http.Client{Timeout: timeout})
+}
+
+func fetchCarrierAuthSnapshotWithClient(ctx context.Context, rawURL string, client *http.Client) ([]byte, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, errors.New("auth snapshot URL must be absolute HTTPS")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create auth snapshot request: %w", err)
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch auth snapshot: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch auth snapshot: HTTP %d", response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxAuthSnapshotBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read auth snapshot: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("auth snapshot response is empty")
+	}
+	if len(data) > maxAuthSnapshotBytes {
+		return nil, errors.New("auth snapshot response exceeds size limit")
+	}
+	return data, nil
+}
+
 func saveCarrierAuthSnapshot(options CarrierOptions, cfg *carrierconfig.ClientConfig, logf func(string, ...any)) error {
+	data, err := carrierengine.ExportAuthSnapshotJSON(*cfg)
+	if err != nil {
+		return fmt.Errorf("export auth snapshot: %w", err)
+	}
+	if err := writeCarrierAuthSnapshot(options, data); err != nil {
+		return err
+	}
+	if strings.TrimSpace(options.AuthSnapshotOutputFile) == "" && strings.TrimSpace(options.AuthSnapshotFile) == "" {
+		return nil
+	}
+	if logf != nil {
+		logf("WLT carrier auth snapshot saved")
+	}
+	return nil
+}
+
+func writeCarrierAuthSnapshot(options CarrierOptions, data []byte) error {
 	path := strings.TrimSpace(options.AuthSnapshotOutputFile)
 	if path == "" {
 		path = strings.TrimSpace(options.AuthSnapshotFile)
@@ -479,20 +559,34 @@ func saveCarrierAuthSnapshot(options CarrierOptions, cfg *carrierconfig.ClientCo
 	if path == "" {
 		return nil
 	}
-	data, err := carrierengine.ExportAuthSnapshotJSON(*cfg)
-	if err != nil {
-		return fmt.Errorf("export auth snapshot: %w", err)
-	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create auth snapshot directory: %w", err)
 		}
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".wlt-auth-snapshot-*")
+	if err != nil {
+		return fmt.Errorf("create auth snapshot file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("protect auth snapshot file: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
 		return fmt.Errorf("write auth snapshot file: %w", err)
 	}
-	if logf != nil {
-		logf("WLT carrier auth snapshot saved")
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("sync auth snapshot file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close auth snapshot file: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("install auth snapshot file: %w", err)
 	}
 	return nil
 }
