@@ -18,6 +18,9 @@ type WLTServiceOptions struct {
 	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
 	AuthSnapshot      string `json:"auth_snapshot,omitempty"`
 	AuthSnapshotFile  string `json:"auth_snapshot_file,omitempty"`
+	// AuthSnapshotURL optionally refreshes the local auth snapshot before carrier start.
+	AuthSnapshotURL          string             `json:"auth_snapshot_url,omitempty"`
+	AuthSnapshotFetchTimeout badoption.Duration `json:"auth_snapshot_fetch_timeout,omitempty"`
 	// AuthSnapshotOutputFile is updated after successful carrier auth.
 	AuthSnapshotOutputFile string `json:"auth_snapshot_output_file,omitempty"`
 	// Deprecated: use carrier_config.
@@ -65,6 +68,7 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	o.CarrierConfigFile = strings.TrimSpace(o.CarrierConfigFile)
 	o.AuthSnapshot = strings.TrimSpace(o.AuthSnapshot)
 	o.AuthSnapshotFile = strings.TrimSpace(o.AuthSnapshotFile)
+	o.AuthSnapshotURL = strings.TrimSpace(o.AuthSnapshotURL)
 	o.AuthSnapshotOutputFile = strings.TrimSpace(o.AuthSnapshotOutputFile)
 	o.TurnableConfig = strings.TrimSpace(o.TurnableConfig)
 	o.TurnableConfigFile = strings.TrimSpace(o.TurnableConfigFile)

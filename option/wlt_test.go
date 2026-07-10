@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
@@ -23,6 +24,8 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"transport": "wlt",
 				"carrier_config": "{}",
 				"auth_snapshot_file": "/tmp/wlt-auth.json",
+				"auth_snapshot_url": "https://example.com/wlt-auth-snapshot",
+				"auth_snapshot_fetch_timeout": "4s",
 				"auth_snapshot_output_file": "/tmp/wlt-auth-next.json",
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
@@ -84,6 +87,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.AuthSnapshotFile != "/tmp/wlt-auth.json" || serviceOptions.AuthSnapshotOutputFile != "/tmp/wlt-auth-next.json" {
 		t.Fatalf("auth snapshot options=%+v", serviceOptions)
+	}
+	if serviceOptions.AuthSnapshotURL != "https://example.com/wlt-auth-snapshot" || time.Duration(serviceOptions.AuthSnapshotFetchTimeout) != 4*time.Second {
+		t.Fatalf("remote auth snapshot options=%+v", serviceOptions)
 	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))
