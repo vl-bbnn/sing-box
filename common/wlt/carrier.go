@@ -108,6 +108,11 @@ const (
 
 	carrierConnectRetryInitial = 250 * time.Millisecond
 	carrierConnectRetryMax     = 2 * time.Second
+	// A platform signaling close can leave one carrier Connect call waiting for
+	// its outer deadline even though the underlying attempt is already dead.
+	// Keep attempts short so a transient close gets another bounded chance while
+	// preserving the configured total startup budget.
+	carrierConnectAttemptMax = 8 * time.Second
 
 	carrierReconnectRetryInitial = 20 * time.Millisecond
 	carrierReconnectRetryMax     = 250 * time.Millisecond
@@ -364,6 +369,11 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 			logf("WLT carrier connect attempt started attempt=%d timeout=%s routes=%d peers=%d elapsed=%s", attempt, timeout, len(cfg.Routes), cfg.Peers, time.Since(startedAt))
 		}
 
+		attemptTimeout := timeout
+		if attemptTimeout > carrierConnectAttemptMax {
+			attemptTimeout = carrierConnectAttemptMax
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(connectCtx, attemptTimeout)
 		connectDone := make(chan error, 1)
 		pendingTimer := time.AfterFunc(3*time.Second, func() {
 			if logf != nil {
@@ -376,6 +386,7 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 
 		select {
 		case err := <-connectDone:
+			attemptCancel()
 			pendingTimer.Stop()
 			if err == nil {
 				if logf != nil {
@@ -394,9 +405,17 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 				}
 				return nil, fmt.Errorf("connect WLT carrier: %w", err)
 			}
-		case <-connectCtx.Done():
+		case <-attemptCtx.Done():
 			pendingTimer.Stop()
 			_ = runtimeClient.Stop()
+			attemptCancel()
+			if connectCtx.Err() == nil {
+				lastErr = fmt.Errorf("carrier connect attempt timed out after %s", attemptTimeout)
+				if logf != nil {
+					logf("WLT carrier connect attempt timed out attempt=%d timeout=%s total_elapsed=%s", attempt, attemptTimeout, time.Since(startedAt))
+				}
+				break
+			}
 			if lastErr != nil {
 				return nil, fmt.Errorf("connect WLT carrier: %w; last error: %v", connectCtx.Err(), lastErr)
 			}
