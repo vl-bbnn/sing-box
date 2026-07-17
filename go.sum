@@ -379,6 +379,8 @@ github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717163624-a533fc689159 h1:RufXZ5nMW
 github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717163624-a533fc689159/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
 github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717164417-8c5033e0265c h1:FUE3aEcFNte22gDGcAHpl3kd+87xlHjC6M3poTRJy5A=
 github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717164417-8c5033e0265c/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
+github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717165134-3dba77b6c38d h1:wm4hCBcHl5NAaWLU3wnZoj7XOpzKPxTgpoiuJsLFCvY=
+github.com/vl-bbnn/wlt-carrier v0.1.7-0.20260717165134-3dba77b6c38d/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
 github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
 github.com/wlynxg/anet v0.0.5/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
