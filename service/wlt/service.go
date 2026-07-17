@@ -109,6 +109,7 @@ func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
 		TinyMuxPingTimeout:           time.Duration(s.options.TinyMuxPingTimeout),
 		PeerIncomingBuffer:           s.options.PeerIncomingBuffer,
 		PeerWriteBuffer:              s.options.PeerWriteBuffer,
+		RedundantPeerData:            s.options.RedundantPeerData,
 		AdaptivePeerData:             s.options.AdaptivePeerData,
 		AdaptivePeerThresholdBytes:   s.options.AdaptivePeerThresholdBytes,
 		AdaptivePeerIdleTimeout:      time.Duration(s.options.AdaptivePeerIdleTimeout),

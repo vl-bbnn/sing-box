@@ -180,6 +180,7 @@ func TestCarrierRuntimeOptionsAreBounded(t *testing.T) {
 		BufferSize:                   64 * 1024,
 		TinyMuxRateBurstBytes:        512 * 1024,
 		TinyMuxPingTimeout:           25 * time.Second,
+		RedundantPeerData:            true,
 		RelayBandwidthBytesPerSecond: 5 * 1024 * 1024,
 	})
 	if transportOptions.TinyMuxFlowBuffer != 256 ||
@@ -187,6 +188,7 @@ func TestCarrierRuntimeOptionsAreBounded(t *testing.T) {
 		transportOptions.TinyMuxRateBurstBytes != 512*1024 ||
 		transportOptions.TinyMuxPingTimeoutMillis != 25000 ||
 		transportOptions.PeerIncomingBuffer != 256 ||
+		!transportOptions.RedundantPeerData ||
 		transportOptions.SRTPPacketBuffer != 512 ||
 		transportOptions.KCPWindowSize != 768 ||
 		transportOptions.KCPReadWriteBuffer != 1024*1024 ||

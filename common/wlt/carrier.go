@@ -146,6 +146,7 @@ type CarrierOptions struct {
 	TinyMuxPingTimeout           time.Duration
 	PeerIncomingBuffer           int
 	PeerWriteBuffer              int
+	RedundantPeerData            bool
 	AdaptivePeerData             bool
 	AdaptivePeerThresholdBytes   int
 	AdaptivePeerIdleTimeout      time.Duration
@@ -271,7 +272,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	runCtx, cancel := context.WithCancel(ctx)
 	transportOptions := applyCarrierRuntimeOptions(options)
 	if logf != nil {
-		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
+		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d redundant_peer_data=%t srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
 			options.MaxActiveStreams,
 			options.MaxOpenAttempts,
 			options.MaxPendingDials,
@@ -285,6 +286,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			transportOptions.TinyMuxRateBurstBytes,
 			transportOptions.PeerIncomingBuffer,
 			transportOptions.PeerWriteBuffer,
+			transportOptions.RedundantPeerData,
 			transportOptions.SRTPPacketBuffer,
 			transportOptions.KCPWindowSize,
 			transportOptions.KCPReadWriteBuffer,
@@ -327,7 +329,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		<-runCtx.Done()
 		_ = carrier.Close()
 	}()
-	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
+	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d redundant_peer_data=%t adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
 		len(cfg.Routes),
 		strings.Join(carrierRouteClasses(carrier.routeByClass), ","),
 		options.MaxActiveStreams,
@@ -345,6 +347,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		transportOptions.TinyMuxPingTimeoutMillis,
 		transportOptions.PeerIncomingBuffer,
 		transportOptions.PeerWriteBuffer,
+		transportOptions.RedundantPeerData,
 		transportOptions.AdaptivePeerData,
 		transportOptions.AdaptivePeerThresholdBytes,
 		transportOptions.AdaptivePeerIdleMillis,
@@ -1016,6 +1019,7 @@ func applyCarrierRuntimeOptions(options CarrierOptions) carrierconfig.TransportO
 		TinyMuxPingTimeoutMillis:     int(defaultCarrierTinyMuxPingTimeout / time.Millisecond),
 		PeerIncomingBuffer:           clampInt(bufferSize/256, 64, 256),
 		PeerWriteBuffer:              clampInt(bufferSize/1024, 16, 64),
+		RedundantPeerData:            options.RedundantPeerData,
 		AdaptivePeerData:             options.AdaptivePeerData,
 		AdaptivePeerThresholdBytes:   options.AdaptivePeerThresholdBytes,
 		AdaptivePeerIdleMillis:       int(options.AdaptivePeerIdleTimeout / time.Millisecond),

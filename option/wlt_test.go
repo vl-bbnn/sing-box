@@ -41,6 +41,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"tiny_mux_ping_timeout": "25s",
 				"peer_incoming_buffer": 512,
 				"peer_write_buffer": 128,
+				"redundant_peer_data": true,
 				"adaptive_peer_data": true,
 				"adaptive_peer_threshold_bytes_per_second": 2097152,
 				"adaptive_peer_idle_timeout": "8s",
@@ -79,7 +80,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	if serviceOptions.TinyMuxFlowBuffer != 512 || serviceOptions.KCPReadWriteBuffer != 2097152 {
 		t.Fatalf("debug transport options=%+v", serviceOptions)
 	}
-	if !serviceOptions.AdaptivePeerData || serviceOptions.AdaptivePeerThresholdBytes != 2097152 {
+	if !serviceOptions.RedundantPeerData || !serviceOptions.AdaptivePeerData || serviceOptions.AdaptivePeerThresholdBytes != 2097152 {
 		t.Fatalf("adaptive peer options=%+v", serviceOptions)
 	}
 	if serviceOptions.CarrierConfig != "{}" {
