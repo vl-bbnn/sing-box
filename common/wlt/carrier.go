@@ -775,12 +775,16 @@ reconnectLoop:
 		c.logf("WLT stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d backoff=%s", routeClass, target, dialElapsed, reconnectAttempts, reconnectBackoffTotal)
 	}
 	c.openedStreams.Add(1)
-	return &carrierConn{
+	stream := &carrierConn{
 		Conn:          conn,
 		carrier:       c,
 		releaseActive: releaseActive,
 		idleTimeout:   c.idleTimeout,
-	}, nil
+		closed:        make(chan struct{}),
+	}
+	stream.markActivity()
+	stream.startIdleMonitor()
+	return stream, nil
 }
 
 func (c *Carrier) Close() error {
@@ -1154,38 +1158,94 @@ type carrierConn struct {
 	releaseActive func()
 	idleTimeout   time.Duration
 	closeOnce     sync.Once
+	closed        chan struct{}
+	closeErr      error
+	lastActivity  atomic.Int64
+	idleExpired   atomic.Bool
 }
 
 func (c *carrierConn) Read(p []byte) (int, error) {
-	c.refreshDeadline()
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		c.refreshDeadline()
+		c.markActivity()
+	}
+	if n == 0 && err != nil && c.idleExpired.Load() {
+		return 0, carrierIdleTimeoutError("read")
 	}
 	return n, err
 }
 
 func (c *carrierConn) Write(p []byte) (int, error) {
-	c.refreshDeadline()
 	n, err := c.Conn.Write(p)
 	if n > 0 {
-		c.refreshDeadline()
+		c.markActivity()
+	}
+	if n == 0 && err != nil && c.idleExpired.Load() {
+		return 0, carrierIdleTimeoutError("write")
 	}
 	return n, err
 }
 
 func (c *carrierConn) Close() error {
-	err := c.Conn.Close()
 	c.closeOnce.Do(func() {
+		if c.closed != nil {
+			close(c.closed)
+		}
+		c.closeErr = c.Conn.Close()
 		c.releaseActive()
 		c.carrier.closedStreams.Add(1)
 	})
-	return err
+	return c.closeErr
 }
 
-func (c *carrierConn) refreshDeadline() {
+func (c *carrierConn) markActivity() {
+	c.lastActivity.Store(time.Now().UnixNano())
+}
+
+func (c *carrierConn) startIdleMonitor() {
 	if c.idleTimeout <= 0 {
 		return
 	}
-	_ = c.Conn.SetDeadline(time.Now().Add(c.idleTimeout))
+	interval := c.idleTimeout / 4
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if c.hasRecentActivity() {
+					continue
+				}
+				c.idleExpired.Store(true)
+				if c.carrier != nil && c.carrier.logf != nil {
+					c.carrier.logf("WLT stream idle close idle_timeout=%s", c.idleTimeout)
+				}
+				_ = c.Close()
+				return
+			case <-c.closed:
+				return
+			}
+		}
+	}()
+}
+
+func (c *carrierConn) hasRecentActivity() bool {
+	cutoff := time.Now().Add(-c.idleTimeout).UnixNano()
+	if c.lastActivity.Load() >= cutoff {
+		return true
+	}
+	if activity, ok := c.Conn.(interface{ HasRecentActivity(time.Duration) bool }); ok {
+		return activity.HasRecentActivity(c.idleTimeout)
+	}
+	return false
+}
+
+func carrierIdleTimeoutError(operation string) error {
+	return &net.OpError{Op: operation, Net: "wlt", Err: os.ErrDeadlineExceeded}
 }

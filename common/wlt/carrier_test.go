@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -573,7 +574,10 @@ func TestCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
 		carrier:       carrier,
 		releaseActive: func() {},
 		idleTimeout:   30 * time.Millisecond,
+		closed:        make(chan struct{}),
 	}
+	conn.markActivity()
+	conn.startIdleMonitor()
 	defer conn.Close()
 
 	_, err := conn.Read(make([]byte, 1))
@@ -584,6 +588,57 @@ func TestCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
 	if !ok || !netErr.Timeout() {
 		t.Fatalf("read error=%v, want timeout", err)
 	}
+}
+
+func TestCarrierIdleTimeoutAllowsActiveTransportRecovery(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	tracked := &testRecentActivityConn{Conn: left}
+	tracked.active.Store(true)
+	conn := &carrierConn{
+		Conn:          tracked,
+		carrier:       carrier,
+		releaseActive: func() {},
+		idleTimeout:   30 * time.Millisecond,
+		closed:        make(chan struct{}),
+	}
+	conn.markActivity()
+	conn.startIdleMonitor()
+	defer conn.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case err := <-readDone:
+		t.Fatalf("active transport recovery was closed as idle: %v", err)
+	default:
+	}
+
+	tracked.active.Store(false)
+	select {
+	case err := <-readDone:
+		netErr, ok := err.(net.Error)
+		if !ok || !netErr.Timeout() {
+			t.Fatalf("read error=%v, want timeout after transport becomes idle", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("idle transport was not closed")
+	}
+}
+
+type testRecentActivityConn struct {
+	net.Conn
+	active atomic.Bool
+}
+
+func (c *testRecentActivityConn) HasRecentActivity(time.Duration) bool {
+	return c.active.Load()
 }
 
 type ioResult struct {
