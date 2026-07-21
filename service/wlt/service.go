@@ -16,6 +16,8 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/service"
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 )
 
 const (
@@ -32,13 +34,16 @@ func RegisterService(registry *boxService.Registry) {
 
 type Service struct {
 	boxService.Adapter
-	ctx         context.Context
-	logger      log.ContextLogger
-	options     option.WLTServiceOptions
-	access      sync.RWMutex
-	restart     sync.Mutex
-	carrier     *wltpkg.Carrier
-	statsCancel context.CancelFunc
+	ctx          context.Context
+	logger       log.ContextLogger
+	options      option.WLTServiceOptions
+	network      adapter.NetworkManager
+	access       sync.RWMutex
+	restart      sync.Mutex
+	carrier      *wltpkg.Carrier
+	carrierReady chan struct{}
+	stopped      bool
+	statsCancel  context.CancelFunc
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
@@ -51,10 +56,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		return nil, E.New("unsupported wlt service transport: ", options.Transport)
 	}
 	return &Service{
-		Adapter: boxService.NewAdapter(C.TypeWLT, tag),
-		ctx:     ctx,
-		logger:  logger,
-		options: options,
+		Adapter:      boxService.NewAdapter(C.TypeWLT, tag),
+		ctx:          ctx,
+		logger:       logger,
+		options:      options,
+		network:      service.FromContext[adapter.NetworkManager](ctx),
+		carrierReady: make(chan struct{}),
 	}, nil
 }
 
@@ -64,12 +71,16 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	}
 	s.restart.Lock()
 	defer s.restart.Unlock()
-	s.access.RLock()
+	s.access.Lock()
 	if s.carrier != nil {
-		s.access.RUnlock()
+		s.access.Unlock()
 		return nil
 	}
-	s.access.RUnlock()
+	if s.stopped {
+		s.stopped = false
+		s.carrierReady = make(chan struct{})
+	}
+	s.access.Unlock()
 
 	startedAt := time.Now()
 	s.logger.Info("wlt service starting transport=", s.options.Transport)
@@ -80,6 +91,8 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	}
 	s.access.Lock()
 	s.carrier = carrier
+	s.stopped = false
+	close(s.carrierReady)
 	s.access.Unlock()
 	s.startStatsHeartbeat(carrier)
 	s.logger.Info("wlt service started elapsed=", time.Since(startedAt).String())
@@ -87,6 +100,12 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
+	var socketControl carriercommon.SocketControlFunc
+	if s.network != nil {
+		if protectFunc := s.network.ProtectFunc(); protectFunc != nil {
+			socketControl = carriercommon.SocketControlFunc(protectFunc)
+		}
+	}
 	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
@@ -116,6 +135,7 @@ func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
 		KCPWindowSize:                s.options.KCPWindowSize,
 		KCPReadWriteBuffer:           s.options.KCPReadWriteBuffer,
 		RelayBandwidthBytesPerSecond: s.options.RelayBandwidthBytesPerSecond,
+		SocketControl:                socketControl,
 		Logger: func(format string, args ...any) {
 			s.logger.InfoContext(s.ctx, fmt.Sprintf(format, args...))
 		},
@@ -130,6 +150,12 @@ func (s *Service) Close() error {
 	s.access.Lock()
 	carrier := s.carrier
 	s.carrier = nil
+	s.stopped = true
+	select {
+	case <-s.carrierReady:
+	default:
+		close(s.carrierReady)
+	}
 	s.access.Unlock()
 	if carrier == nil {
 		return nil
@@ -144,6 +170,37 @@ func (s *Service) Carrier() *wltpkg.Carrier {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return s.carrier
+}
+
+func (s *Service) WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error) {
+	for {
+		s.access.RLock()
+		carrier := s.carrier
+		ready := s.carrierReady
+		stopped := s.stopped
+		s.access.RUnlock()
+		if carrier != nil {
+			return carrier, nil
+		}
+		if stopped {
+			return nil, E.New("wlt service is stopped")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		case <-ready:
+		}
+	}
+}
+
+func (s *Service) InterfaceUpdated() {
+	carrier := s.Carrier()
+	if carrier == nil {
+		return
+	}
+	go s.restartCarrier(carrier, "default interface changed")
 }
 
 func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
@@ -213,12 +270,14 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	s.restart.Lock()
 	defer s.restart.Unlock()
 
-	s.access.RLock()
-	current := s.carrier
-	s.access.RUnlock()
-	if current != expected {
+	s.access.Lock()
+	if s.carrier != expected {
+		s.access.Unlock()
 		return
 	}
+	s.carrier = nil
+	s.carrierReady = make(chan struct{})
+	s.access.Unlock()
 
 	if s.statsCancel != nil {
 		s.statsCancel()
@@ -226,9 +285,6 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	}
 
 	s.logger.Warn("wlt service restarting carrier reason=", reason)
-	s.access.Lock()
-	s.carrier = nil
-	s.access.Unlock()
 
 	if expected != nil {
 		stats := expected.Stats()
@@ -239,7 +295,10 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	}
 
 	for attempt := 1; ; attempt++ {
-		if s.ctx.Err() != nil {
+		s.access.RLock()
+		stopped := s.stopped
+		s.access.RUnlock()
+		if stopped || s.ctx.Err() != nil {
 			return
 		}
 		startedAt := time.Now()
@@ -247,7 +306,13 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		carrier, err := s.startCarrier()
 		if err == nil {
 			s.access.Lock()
+			if s.stopped {
+				s.access.Unlock()
+				_ = carrier.Close()
+				return
+			}
 			s.carrier = carrier
+			close(s.carrierReady)
 			s.access.Unlock()
 			s.startStatsHeartbeat(carrier)
 			s.logger.Info("wlt service carrier restarted elapsed=", time.Since(startedAt).String(), " attempts=", attempt)

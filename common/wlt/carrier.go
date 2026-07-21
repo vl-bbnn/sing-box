@@ -153,6 +153,7 @@ type CarrierOptions struct {
 	KCPWindowSize                int
 	KCPReadWriteBuffer           int
 	RelayBandwidthBytesPerSecond int
+	SocketControl                carriercommon.SocketControlFunc
 
 	Logger func(string, ...any)
 }
@@ -188,8 +189,9 @@ type CarrierStats struct {
 }
 
 type Carrier struct {
-	client *carrierengine.Client
-	cancel context.CancelFunc
+	client               *carrierengine.Client
+	cancel               context.CancelFunc
+	restoreSocketControl func()
 
 	dialRoute func(context.Context, string) (net.Conn, error)
 	waitReady func(context.Context) error
@@ -269,6 +271,10 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 	options = withCarrierDefaults(options)
 	runCtx, cancel := context.WithCancel(ctx)
+	var restoreSocketControl func()
+	if options.SocketControl != nil {
+		restoreSocketControl = carriercommon.SetSocketControl(options.SocketControl)
+	}
 	transportOptions := applyCarrierRuntimeOptions(options)
 	if logf != nil {
 		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
@@ -299,6 +305,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			logf("WLT carrier auth snapshot save after failed connect failed error=%v", snapshotErr)
 		}
 		cancel()
+		if restoreSocketControl != nil {
+			restoreSocketControl()
+		}
 		if logf != nil {
 			logf("WLT carrier start failed phase=connect elapsed=%s error=%v", time.Since(startedAt), err)
 		}
@@ -309,19 +318,20 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	carrier := &Carrier{
-		client:           runtimeClient,
-		cancel:           cancel,
-		dialRoute:        runtimeClient.DialRouteContext,
-		waitReady:        runtimeClient.WaitReady,
-		logf:             logf,
-		connectTimeout:   options.ConnectTimeout,
-		dialQueueTimeout: options.DialQueueTimeout,
-		idleTimeout:      options.IdleTimeout,
-		bufferSize:       options.BufferSize,
-		activeSlots:      make(chan struct{}, options.MaxActiveStreams),
-		openSlots:        make(chan struct{}, options.MaxOpenAttempts),
-		pendingSlots:     make(chan struct{}, options.MaxPendingDials),
-		routeByClass:     carrierRouteMap(cfg),
+		client:               runtimeClient,
+		cancel:               cancel,
+		restoreSocketControl: restoreSocketControl,
+		dialRoute:            runtimeClient.DialRouteContext,
+		waitReady:            runtimeClient.WaitReady,
+		logf:                 logf,
+		connectTimeout:       options.ConnectTimeout,
+		dialQueueTimeout:     options.DialQueueTimeout,
+		idleTimeout:          options.IdleTimeout,
+		bufferSize:           options.BufferSize,
+		activeSlots:          make(chan struct{}, options.MaxActiveStreams),
+		openSlots:            make(chan struct{}, options.MaxOpenAttempts),
+		pendingSlots:         make(chan struct{}, options.MaxPendingDials),
+		routeByClass:         carrierRouteMap(cfg),
 	}
 	go func() {
 		<-runCtx.Done()
@@ -792,6 +802,9 @@ func (c *Carrier) Close() error {
 			if err := c.client.Stop(); err != nil && !strings.Contains(err.Error(), "not running") {
 				c.closeErr = err
 			}
+		}
+		if c.restoreSocketControl != nil {
+			c.restoreSocketControl()
 		}
 	})
 	return c.closeErr

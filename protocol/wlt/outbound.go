@@ -22,7 +22,11 @@ import (
 
 type carrierService interface {
 	Carrier() *wltpkg.Carrier
+	WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error)
+	InterfaceUpdated()
 }
+
+var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.WLTOutboundOptions](registry, C.TypeWLT, NewOutbound)
@@ -99,9 +103,9 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, err
 	}
-	carrier := carrierService.Carrier()
-	if carrier == nil {
-		return nil, E.New("wlt carrier is not started")
+	carrier, err := carrierService.WaitCarrier(ctx)
+	if err != nil {
+		return nil, E.Cause(err, "wait for wlt carrier")
 	}
 	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
 	stream, err := carrier.DialStream(ctx, h.route, destination.String())
@@ -114,6 +118,15 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.New("wlt carrier returned non-network stream")
 	}
 	return conn, nil
+}
+
+func (h *Outbound) InterfaceUpdated() {
+	carrierService, err := h.resolveCarrier()
+	if err != nil {
+		h.logger.Warn("notify WLT carrier about interface update: ", err)
+		return
+	}
+	carrierService.InterfaceUpdated()
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
