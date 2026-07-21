@@ -359,6 +359,8 @@ github.com/useflyent/fhttp v0.0.0-20211004035111-333f430cfbbf/go.mod h1:GTDLTqqi
 github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae/go.mod h1:DD4vA1DwXk04H54A1oHXtwZmA0grkVMdPxx/VGLCah0=
 github.com/vishvananda/netns v0.0.5 h1:DfiHV+j8bA32MFM7bfEunvT8IAqQ/NzSJHtcmW5zdEY=
 github.com/vishvananda/netns v0.0.5/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
+github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1 h1:XmjntW9riXvB2Nh9uYKW2x8iuxxHCtyd5xicpFVsklE=
+github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
 github.com/vl-bbnn/wlt-carrier v0.1.4 h1:jgFy5PMGg4367lKyOIPdnsrkaJruxdH6sY7/oIJK30U=
 github.com/vl-bbnn/wlt-carrier v0.1.4/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
 github.com/vl-bbnn/wlt-carrier v0.1.5 h1:wBOs3ZjlQq8xCU3cZhlFrsFKFoyBbj0+ZOvS4TE8rSk=
@@ -385,6 +387,8 @@ github.com/vl-bbnn/wlt-carrier v0.1.15 h1:/iE0Av7SgawHF2gOHHd1tC+So7RoFdULZ1njJY
 github.com/vl-bbnn/wlt-carrier v0.1.15/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
 github.com/vl-bbnn/wlt-carrier v0.1.16 h1:RB91aqjoV5t4G5PGiSl9q5xME79/+oRjCdrk/ponzOc=
 github.com/vl-bbnn/wlt-carrier v0.1.16/go.mod h1:GTlCazVOE1b0DB1J64LpPZs5HM3GRFlPflF1vZGJJvI=
+github.com/vl-bbnn/wlt-carrier v0.1.17 h1:V22cruyfWNgZZC+WNtkzq+1XGU+4jeqO/5AXMSHPgpA=
+github.com/vl-bbnn/wlt-carrier v0.1.17/go.mod h1:yog9+x5bx4OshyHRks20MJu2y8hlZ1U8MnDsktiwwK8=
 github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
 github.com/wlynxg/anet v0.0.5/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
