@@ -30,6 +30,7 @@ type WLTServiceOptions struct {
 	ConnectTimeout     badoption.Duration `json:"connect_timeout,omitempty"`
 	MaxActiveStreams   int                `json:"max_active_streams,omitempty"`
 	MaxOpenAttempts    int                `json:"max_open_attempts,omitempty"`
+	DNSOpenReserve     int                `json:"dns_open_reserve,omitempty"`
 	MaxPendingDials    int                `json:"max_pending_dials,omitempty"`
 	DialQueueTimeout   badoption.Duration `json:"dial_queue_timeout,omitempty"`
 	IdleTimeout        badoption.Duration `json:"idle_timeout,omitempty"`
@@ -90,6 +91,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if o.MaxOpenAttempts < 0 {
 		return E.New("wlt service max_open_attempts must be non-negative")
+	}
+	if o.DNSOpenReserve < 0 {
+		return E.New("wlt service dns_open_reserve must be non-negative")
 	}
 	if o.MaxPendingDials < 0 {
 		return E.New("wlt service max_pending_dials must be non-negative")

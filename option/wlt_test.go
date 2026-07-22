@@ -30,6 +30,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
 				"max_open_attempts": 16,
+				"dns_open_reserve": 4,
 				"max_pending_dials": 24,
 				"dial_queue_timeout": "1500ms",
 				"idle_timeout": "20s",
@@ -73,6 +74,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.MaxPendingDials != 24 {
 		t.Fatalf("max pending=%d, want 24", serviceOptions.MaxPendingDials)
+	}
+	if serviceOptions.DNSOpenReserve != 4 {
+		t.Fatalf("DNS open reserve=%d, want 4", serviceOptions.DNSOpenReserve)
 	}
 	if time.Duration(serviceOptions.PressureIdleTimeout) != 10*time.Second {
 		t.Fatalf("pressure idle timeout=%s, want 10s", time.Duration(serviceOptions.PressureIdleTimeout))
@@ -167,6 +171,25 @@ func TestWLTServiceUnmarshalRejectsNegativePressureIdleTimeout(t *testing.T) {
 	}`), &options)
 	if err == nil || !strings.Contains(err.Error(), "pressure_idle_timeout") {
 		t.Fatalf("err=%v, want negative pressure_idle_timeout rejection", err)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativeDNSOpenReserve(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
+				"dns_open_reserve": -1
+			}
+		]
+	}`), &options)
+	if err == nil || !strings.Contains(err.Error(), "dns_open_reserve") {
+		t.Fatalf("err=%v, want negative dns_open_reserve rejection", err)
 	}
 }
 

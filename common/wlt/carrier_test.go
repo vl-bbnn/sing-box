@@ -629,6 +629,98 @@ func TestCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
 	_ = second.conn.Close()
 }
 
+func TestCarrierDNSReserveGetsNextOpenSlotUnderNormalPressure(t *testing.T) {
+	carrier := newTestCarrier(4, 2, 4, time.Second, time.Second)
+	carrier.openGate = newPrioritySlotGate(2, 1)
+
+	releaseFirst, err := carrier.acquireOpenSlot(context.Background(), "eu", "one.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond, err := carrier.acquireOpenSlot(context.Background(), "eu", "two.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normalDone := make(chan error, 1)
+	var releaseNormal func()
+	go func() {
+		var acquireErr error
+		releaseNormal, acquireErr = carrier.acquireOpenSlot(context.Background(), "eu", "three.example:443")
+		normalDone <- acquireErr
+	}()
+	waitForCarrierStat(t, carrier, func(stats CarrierStats) bool {
+		return stats.PendingDials == 1
+	})
+
+	dnsDone := make(chan error, 1)
+	var releaseDNS func()
+	go func() {
+		var acquireErr error
+		releaseDNS, acquireErr = carrier.acquireOpenSlot(context.Background(), "eu", "10.0.0.53:53")
+		dnsDone <- acquireErr
+	}()
+	waitForCarrierStat(t, carrier, func(stats CarrierStats) bool {
+		return stats.PendingDials == 2 && stats.DNSOpenQueued == 1
+	})
+
+	releaseFirst()
+	select {
+	case acquireErr := <-dnsDone:
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DNS waiter did not receive the reserved slot")
+	}
+	select {
+	case <-normalDone:
+		t.Fatal("normal waiter acquired before DNS reclaimed its reserve")
+	default:
+	}
+
+	releaseDNS()
+	select {
+	case acquireErr := <-normalDone:
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("normal waiter starved after DNS released its slot")
+	}
+
+	releaseNormal()
+	releaseSecond()
+	stats := carrier.Stats()
+	if stats.DNSOpenRequests != 1 || stats.DNSOpenQueued != 1 || stats.DNSOpenRejected != 0 {
+		t.Fatalf("DNS open stats=%+v, want one queued request without rejection", stats)
+	}
+}
+
+func TestCarrierDNSReserveTracksQueueTimeout(t *testing.T) {
+	carrier := newTestCarrier(3, 2, 2, time.Second, 20*time.Millisecond)
+	carrier.openGate = newPrioritySlotGate(2, 1)
+
+	releaseFirst, err := carrier.acquireOpenSlot(context.Background(), "eu", "one.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseSecond, err := carrier.acquireOpenSlot(context.Background(), "eu", "two.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = carrier.acquireOpenSlot(context.Background(), "eu", "10.0.0.53:853"); err == nil {
+		t.Fatal("expected DNS open queue timeout")
+	}
+	releaseFirst()
+	releaseSecond()
+
+	stats := carrier.Stats()
+	if stats.DNSOpenRequests != 1 || stats.DNSOpenQueued != 1 || stats.DNSOpenRejected != 1 || stats.RejectedOpen != 1 {
+		t.Fatalf("DNS timeout stats=%+v, want one rejected queued request", stats)
+	}
+}
+
 func TestCarrierDialStreamCancelsOpen(t *testing.T) {
 	carrier := newTestCarrier(1, 1, 1, 30*time.Millisecond, time.Second)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {

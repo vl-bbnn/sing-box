@@ -139,6 +139,7 @@ type CarrierOptions struct {
 	ConnectTimeout      time.Duration
 	MaxActiveStreams    int
 	MaxOpenAttempts     int
+	DNSOpenReserve      int
 	MaxPendingDials     int
 	DialQueueTimeout    time.Duration
 	IdleTimeout         time.Duration
@@ -175,6 +176,9 @@ type CarrierStats struct {
 	PendingDials         int64
 	PeakPendingDials     int64
 	OpenAttempts         int64
+	DNSOpenRequests      int64
+	DNSOpenQueued        int64
+	DNSOpenRejected      int64
 	OpenedStreams        int64
 	ClosedStreams        int64
 	QueuedDials          int64
@@ -211,6 +215,7 @@ type Carrier struct {
 	bufferSize          int
 	activeSlots         chan struct{}
 	openSlots           chan struct{}
+	openGate            *prioritySlotGate
 	pendingSlots        chan struct{}
 	routeByClass        map[string]string
 
@@ -219,6 +224,9 @@ type Carrier struct {
 	pendingDials         atomic.Int64
 	peakPendingDials     atomic.Int64
 	openAttempts         atomic.Int64
+	dnsOpenRequests      atomic.Int64
+	dnsOpenQueued        atomic.Int64
+	dnsOpenRejected      atomic.Int64
 	openedStreams        atomic.Int64
 	closedStreams        atomic.Int64
 	queuedDials          atomic.Int64
@@ -281,6 +289,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		return nil, err
 	}
 	options = withCarrierDefaults(options)
+	if options.DNSOpenReserve < 0 || options.DNSOpenReserve >= options.MaxOpenAttempts {
+		return nil, fmt.Errorf("dns_open_reserve must be between 0 and max_open_attempts-1 (reserve=%d max_open=%d)", options.DNSOpenReserve, options.MaxOpenAttempts)
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	var restoreSocketControl func()
 	if options.SocketControl != nil {
@@ -288,9 +299,10 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 	transportOptions := applyCarrierRuntimeOptions(options)
 	if logf != nil {
-		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
+		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d dns_open_reserve=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
 			options.MaxActiveStreams,
 			options.MaxOpenAttempts,
+			options.DNSOpenReserve,
 			options.MaxPendingDials,
 			options.DialQueueTimeout,
 			options.ConnectTimeout,
@@ -347,15 +359,19 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		streams:              make(map[*carrierConn]struct{}),
 		routeByClass:         carrierRouteMap(cfg),
 	}
+	if options.DNSOpenReserve > 0 {
+		carrier.openGate = newPrioritySlotGate(options.MaxOpenAttempts, options.DNSOpenReserve)
+	}
 	go func() {
 		<-runCtx.Done()
 		_ = carrier.Close()
 	}()
-	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
+	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d dns_open_reserve=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
 		len(cfg.Routes),
 		strings.Join(carrierRouteClasses(carrier.routeByClass), ","),
 		options.MaxActiveStreams,
 		options.MaxOpenAttempts,
+		options.DNSOpenReserve,
 		options.MaxPendingDials,
 		options.DialQueueTimeout,
 		options.ConnectTimeout,
@@ -887,6 +903,9 @@ func (c *Carrier) Stats() CarrierStats {
 		PendingDials:         c.pendingDials.Load(),
 		PeakPendingDials:     c.peakPendingDials.Load(),
 		OpenAttempts:         c.openAttempts.Load(),
+		DNSOpenRequests:      c.dnsOpenRequests.Load(),
+		DNSOpenQueued:        c.dnsOpenQueued.Load(),
+		DNSOpenRejected:      c.dnsOpenRejected.Load(),
 		OpenedStreams:        c.openedStreams.Load(),
 		ClosedStreams:        c.closedStreams.Load(),
 		QueuedDials:          c.queuedDials.Load(),
@@ -968,9 +987,13 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 }
 
 func (c *Carrier) acquireOpenSlot(ctx context.Context, routeClass string, target string) (func(), error) {
-	if tryAcquire(c.openSlots) {
+	priority := isDNSOpenTarget(target)
+	if priority {
+		c.dnsOpenRequests.Add(1)
+	}
+	if c.tryAcquireOpenSlot(priority) {
 		return func() {
-			release(c.openSlots)
+			c.releaseOpenSlot(priority)
 		}, nil
 	}
 	if !tryAcquire(c.pendingSlots) {
@@ -979,6 +1002,9 @@ func (c *Carrier) acquireOpenSlot(ctx context.Context, routeClass string, target
 		return nil, fmt.Errorf("WLT carrier pending dial limit reached route=%s target=%s", routeClass, target)
 	}
 	c.queuedDials.Add(1)
+	if priority {
+		c.dnsOpenQueued.Add(1)
+	}
 	c.pendingDials.Add(1)
 	c.updatePeakPendingDials()
 	defer func() {
@@ -995,16 +1021,52 @@ func (c *Carrier) acquireOpenSlot(ctx context.Context, routeClass string, target
 	}
 	defer cancel()
 
+	if err := c.acquireQueuedOpenSlot(waitCtx, priority); err == nil {
+		return func() {
+			c.releaseOpenSlot(priority)
+		}, nil
+	}
+	if priority {
+		c.dnsOpenRejected.Add(1)
+	}
+	c.rejectedOpen.Add(1)
+	c.rejectedStreams.Add(1)
+	return nil, fmt.Errorf("WLT carrier open attempt limit reached route=%s target=%s: %w", routeClass, target, waitCtx.Err())
+}
+
+func (c *Carrier) tryAcquireOpenSlot(priority bool) bool {
+	if c.openGate != nil {
+		return c.openGate.tryAcquire(priority)
+	}
+	return tryAcquire(c.openSlots)
+}
+
+func (c *Carrier) acquireQueuedOpenSlot(ctx context.Context, priority bool) error {
+	if c.openGate != nil {
+		return c.openGate.acquire(ctx, priority)
+	}
 	select {
 	case c.openSlots <- struct{}{}:
-		return func() {
-			release(c.openSlots)
-		}, nil
-	case <-waitCtx.Done():
-		c.rejectedOpen.Add(1)
-		c.rejectedStreams.Add(1)
-		return nil, fmt.Errorf("WLT carrier open attempt limit reached route=%s target=%s: %w", routeClass, target, waitCtx.Err())
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+func (c *Carrier) releaseOpenSlot(priority bool) {
+	if c.openGate != nil {
+		c.openGate.release(priority)
+		return
+	}
+	release(c.openSlots)
+}
+
+func isDNSOpenTarget(target string) bool {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil {
+		return false
+	}
+	return port == "53" || port == "853"
 }
 
 func (c *Carrier) updatePeakActiveStreams() {
