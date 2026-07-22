@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -30,10 +31,13 @@ func RegisterTCP(registry *dns.TransportRegistry) {
 
 type TCPTransport struct {
 	dns.TransportAdapter
-	dialer      N.Dialer
-	serverAddr  M.Socksaddr
-	multiplexer *queryMultiplexer
+	dialer       N.Dialer
+	serverAddr   M.Socksaddr
+	multiplexers []*queryMultiplexer
+	next         atomic.Uint32
 }
+
+const tcpMultiplexerCount = 2
 
 func NewTCP(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteDNSServerOptions) (adapter.DNSTransport, error) {
 	transportDialer, err := dns.NewRemoteDialer(ctx, options)
@@ -56,7 +60,7 @@ func NewTCPRaw(adapter dns.TransportAdapter, dialer N.Dialer, serverAddr M.Socks
 		dialer:           dialer,
 		serverAddr:       serverAddr,
 	}
-	t.multiplexer = newQueryMultiplexer(queryMultiplexerOptions{
+	multiplexerOptions := queryMultiplexerOptions{
 		dial: func(ctx context.Context) (net.Conn, error) {
 			conn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
 			if err != nil {
@@ -70,7 +74,11 @@ func NewTCPRaw(adapter dns.TransportAdapter, dialer N.Dialer, serverAddr M.Socks
 		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
 			return ReadMessage(conn)
 		},
-	})
+	}
+	t.multiplexers = make([]*queryMultiplexer, tcpMultiplexerCount)
+	for index := range t.multiplexers {
+		t.multiplexers[index] = newQueryMultiplexer(multiplexerOptions)
+	}
 	return t
 }
 
@@ -82,19 +90,30 @@ func (t *TCPTransport) Start(stage adapter.StartStage) error {
 }
 
 func (t *TCPTransport) Close() error {
-	return t.multiplexer.Close()
+	errors := make([]error, 0, len(t.multiplexers))
+	for _, multiplexer := range t.multiplexers {
+		errors = append(errors, multiplexer.Close())
+	}
+	return E.Errors(errors...)
 }
 
 func (t *TCPTransport) Reset() {
-	t.multiplexer.Reset()
+	for _, multiplexer := range t.multiplexers {
+		multiplexer.Reset()
+	}
 }
 
 func (t *TCPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	return t.multiplexer.Exchange(ctx, message)
+	return t.nextMultiplexer().Exchange(ctx, message)
 }
 
 func (t *TCPTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	t.multiplexer.ExchangeAsync(ctx, message, callback)
+	t.nextMultiplexer().ExchangeAsync(ctx, message, callback)
+}
+
+func (t *TCPTransport) nextMultiplexer() *queryMultiplexer {
+	index := (t.next.Add(1) - 1) % uint32(len(t.multiplexers))
+	return t.multiplexers[index]
 }
 
 func setConnDeadline(ctx context.Context, conn net.Conn, needClose bool) func() {
