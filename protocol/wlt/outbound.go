@@ -93,6 +93,7 @@ func (h *Outbound) resolveCarrier() (carrierService, error) {
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	streamTarget := wltStreamTarget(ctx, destination)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -107,8 +108,8 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, E.Cause(err, "wait for wlt carrier")
 	}
-	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
-	stream, err := carrier.DialStream(ctx, h.route, destination.String())
+	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination, " stream_target=", streamTarget)
+	stream, err := carrier.DialStream(ctx, h.route, streamTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +119,13 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.New("wlt carrier returned non-network stream")
 	}
 	return conn, nil
+}
+
+func wltStreamTarget(ctx context.Context, fallback M.Socksaddr) string {
+	if inherited := adapter.ContextFrom(ctx); inherited != nil && inherited.Destination.IsValid() {
+		return inherited.Destination.String()
+	}
+	return fallback.String()
 }
 
 func (h *Outbound) InterfaceUpdated() {
