@@ -33,6 +33,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"max_pending_dials": 24,
 				"dial_queue_timeout": "1500ms",
 				"idle_timeout": "20s",
+				"pressure_idle_timeout": "10s",
 				"buffer_size": 32768,
 				"tiny_mux_flow_buffer": 512,
 				"tiny_mux_send_buffer": 128,
@@ -72,6 +73,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.MaxPendingDials != 24 {
 		t.Fatalf("max pending=%d, want 24", serviceOptions.MaxPendingDials)
+	}
+	if time.Duration(serviceOptions.PressureIdleTimeout) != 10*time.Second {
+		t.Fatalf("pressure idle timeout=%s, want 10s", time.Duration(serviceOptions.PressureIdleTimeout))
 	}
 	if serviceOptions.RelayBandwidthBytesPerSecond != 5242880 {
 		t.Fatalf("relay bandwidth=%d, want 5242880", serviceOptions.RelayBandwidthBytesPerSecond)
@@ -144,6 +148,25 @@ func TestWLTServiceUnmarshalRejectsNegativePendingDials(t *testing.T) {
 	}`), &options)
 	if err == nil || !strings.Contains(err.Error(), "max_pending_dials") {
 		t.Fatalf("err=%v, want negative max_pending_dials rejection", err)
+	}
+}
+
+func TestWLTServiceUnmarshalRejectsNegativePressureIdleTimeout(t *testing.T) {
+	ctx := include.Context(context.Background())
+	var options option.Options
+	err := json.UnmarshalContext(ctx, []byte(`{
+		"services": [
+			{
+				"type": "wlt",
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}",
+				"pressure_idle_timeout": "-1s"
+			}
+		]
+	}`), &options)
+	if err == nil || !strings.Contains(err.Error(), "pressure_idle_timeout") {
+		t.Fatalf("err=%v, want negative pressure_idle_timeout rejection", err)
 	}
 }
 

@@ -289,6 +289,64 @@ func TestCarrierRejectsActiveQueueTimeout(t *testing.T) {
 	}
 }
 
+func TestCarrierReclaimsPressureIdleStream(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, 20*time.Millisecond)
+	carrier.pressureIdleTimeout = 10 * time.Millisecond
+	var rights []net.Conn
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
+		_ = routeID
+		left, right := net.Pipe()
+		rights = append(rights, right)
+		return left, nil
+	}
+	defer func() {
+		for _, right := range rights {
+			_ = right.Close()
+		}
+	}()
+
+	first, err := carrier.DialStream(context.Background(), "direct", "one.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	second, err := carrier.DialStream(context.Background(), "eu", "two.example:443")
+	if err != nil {
+		t.Fatalf("pressure reclaim should admit second stream: %v", err)
+	}
+	defer second.Close()
+	_ = first.Close()
+	stats := carrier.Stats()
+	if stats.PressureIdleReclaims != 1 || stats.RejectedStreams != 0 || stats.ActiveStreams != 1 {
+		t.Fatalf("stats=%+v, want one pressure reclaim and no rejection", stats)
+	}
+}
+
+func TestCarrierDoesNotReclaimRecentStream(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, 20*time.Millisecond)
+	carrier.pressureIdleTimeout = time.Second
+	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
+		_ = ctx
+		_ = routeID
+		left, right := net.Pipe()
+		_ = right.Close()
+		return left, nil
+	}
+	first, err := carrier.DialStream(context.Background(), "direct", "one.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := carrier.DialStream(context.Background(), "eu", "two.example:443"); err == nil {
+		t.Fatal("expected recent stream to remain protected")
+	}
+	stats := carrier.Stats()
+	if stats.PressureIdleReclaims != 0 || stats.RejectedActive != 1 {
+		t.Fatalf("stats=%+v, want no reclaim and one active rejection", stats)
+	}
+}
+
 func TestCarrierRejectsOverPendingLimit(t *testing.T) {
 	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
@@ -594,6 +652,7 @@ func newTestCarrier(maxActive int, maxOpen int, maxPending int, connectTimeout t
 		connectTimeout:   connectTimeout,
 		dialQueueTimeout: queueTimeout,
 		idleTimeout:      defaultCarrierIdleTimeout,
+		streams:          make(map[*carrierConn]struct{}),
 		bufferSize:       defaultCarrierBufferSize,
 		activeSlots:      make(chan struct{}, maxActive),
 		openSlots:        make(chan struct{}, maxOpen),

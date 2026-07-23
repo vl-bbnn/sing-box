@@ -26,13 +26,17 @@ type WLTServiceOptions struct {
 	// Deprecated: use carrier_config.
 	TurnableConfig string `json:"turnable_config,omitempty"`
 	// Deprecated: use carrier_config_file.
-	TurnableConfigFile           string             `json:"turnable_config_file,omitempty"`
-	ConnectTimeout               badoption.Duration `json:"connect_timeout,omitempty"`
-	MaxActiveStreams             int                `json:"max_active_streams,omitempty"`
-	MaxOpenAttempts              int                `json:"max_open_attempts,omitempty"`
-	MaxPendingDials              int                `json:"max_pending_dials,omitempty"`
-	DialQueueTimeout             badoption.Duration `json:"dial_queue_timeout,omitempty"`
-	IdleTimeout                  badoption.Duration `json:"idle_timeout,omitempty"`
+	TurnableConfigFile string             `json:"turnable_config_file,omitempty"`
+	ConnectTimeout     badoption.Duration `json:"connect_timeout,omitempty"`
+	MaxActiveStreams   int                `json:"max_active_streams,omitempty"`
+	MaxOpenAttempts    int                `json:"max_open_attempts,omitempty"`
+	MaxPendingDials    int                `json:"max_pending_dials,omitempty"`
+	DialQueueTimeout   badoption.Duration `json:"dial_queue_timeout,omitempty"`
+	IdleTimeout        badoption.Duration `json:"idle_timeout,omitempty"`
+	// PressureIdleTimeout enables reclaiming long-idle streams only when the
+	// active-stream limit is saturated. It never changes the normal idle
+	// timeout used by media and long-lived connections.
+	PressureIdleTimeout          badoption.Duration `json:"pressure_idle_timeout,omitempty"`
 	BufferSize                   int                `json:"buffer_size,omitempty"`
 	TinyMuxFlowBuffer            int                `json:"tiny_mux_flow_buffer,omitempty"`
 	TinyMuxFlowSendBuffer        int                `json:"tiny_mux_send_buffer,omitempty"`
@@ -92,6 +96,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if o.BufferSize < 0 {
 		return E.New("wlt service buffer_size must be non-negative")
+	}
+	if o.PressureIdleTimeout < 0 {
+		return E.New("wlt service pressure_idle_timeout must be non-negative")
 	}
 	if o.TinyMuxFlowBuffer < 0 {
 		return E.New("wlt service tiny_mux_flow_buffer must be non-negative")

@@ -131,13 +131,14 @@ type CarrierOptions struct {
 	AuthSnapshotFetchTimeout time.Duration
 	AuthSnapshotOutputFile   string
 
-	ConnectTimeout   time.Duration
-	MaxActiveStreams int
-	MaxOpenAttempts  int
-	MaxPendingDials  int
-	DialQueueTimeout time.Duration
-	IdleTimeout      time.Duration
-	BufferSize       int
+	ConnectTimeout      time.Duration
+	MaxActiveStreams    int
+	MaxOpenAttempts     int
+	MaxPendingDials     int
+	DialQueueTimeout    time.Duration
+	IdleTimeout         time.Duration
+	PressureIdleTimeout time.Duration
+	BufferSize          int
 
 	TinyMuxFlowBuffer            int
 	TinyMuxFlowSendBuffer        int
@@ -176,6 +177,7 @@ type CarrierStats struct {
 	RejectedQueue        int64
 	RejectedActive       int64
 	RejectedOpen         int64
+	PressureIdleReclaims int64
 	FailedStreams        int64
 	LastActiveWaitMillis int64
 	MaxActiveWaitMillis  int64
@@ -197,38 +199,42 @@ type Carrier struct {
 	waitReady func(context.Context) error
 	logf      func(string, ...any)
 
-	connectTimeout   time.Duration
-	dialQueueTimeout time.Duration
-	idleTimeout      time.Duration
-	bufferSize       int
-	activeSlots      chan struct{}
-	openSlots        chan struct{}
-	pendingSlots     chan struct{}
-	routeByClass     map[string]string
+	connectTimeout      time.Duration
+	dialQueueTimeout    time.Duration
+	idleTimeout         time.Duration
+	pressureIdleTimeout time.Duration
+	bufferSize          int
+	activeSlots         chan struct{}
+	openSlots           chan struct{}
+	pendingSlots        chan struct{}
+	routeByClass        map[string]string
 
-	activeStreams     atomic.Int64
-	peakActiveStreams atomic.Int64
-	pendingDials      atomic.Int64
-	peakPendingDials  atomic.Int64
-	openAttempts      atomic.Int64
-	openedStreams     atomic.Int64
-	closedStreams     atomic.Int64
-	queuedDials       atomic.Int64
-	rejectedStreams   atomic.Int64
-	rejectedQueue     atomic.Int64
-	rejectedActive    atomic.Int64
-	rejectedOpen      atomic.Int64
-	failedStreams     atomic.Int64
-	lastActiveWait    atomic.Int64
-	maxActiveWait     atomic.Int64
-	lastOpenWait      atomic.Int64
-	maxOpenWait       atomic.Int64
-	lastDialDuration  atomic.Int64
-	maxDialDuration   atomic.Int64
-	reconnectRetries  atomic.Int64
-	reconnectWait     atomic.Int64
-	closeOnce         sync.Once
-	closeErr          error
+	activeStreams        atomic.Int64
+	peakActiveStreams    atomic.Int64
+	pendingDials         atomic.Int64
+	peakPendingDials     atomic.Int64
+	openAttempts         atomic.Int64
+	openedStreams        atomic.Int64
+	closedStreams        atomic.Int64
+	queuedDials          atomic.Int64
+	rejectedStreams      atomic.Int64
+	rejectedQueue        atomic.Int64
+	rejectedActive       atomic.Int64
+	rejectedOpen         atomic.Int64
+	failedStreams        atomic.Int64
+	lastActiveWait       atomic.Int64
+	maxActiveWait        atomic.Int64
+	lastOpenWait         atomic.Int64
+	maxOpenWait          atomic.Int64
+	lastDialDuration     atomic.Int64
+	maxDialDuration      atomic.Int64
+	reconnectRetries     atomic.Int64
+	reconnectWait        atomic.Int64
+	closeOnce            sync.Once
+	closeErr             error
+	streamsMu            sync.Mutex
+	streams              map[*carrierConn]struct{}
+	pressureIdleReclaims atomic.Int64
 }
 
 func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error) {
@@ -277,13 +283,14 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 	transportOptions := applyCarrierRuntimeOptions(options)
 	if logf != nil {
-		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
+		logf("WLT carrier start phase=runtime_options max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d peer_incoming_buffer=%d peer_write_buffer=%d srtp_packet_buffer=%d kcp_window=%d kcp_buffer=%d relay_bandwidth=%d elapsed=%s",
 			options.MaxActiveStreams,
 			options.MaxOpenAttempts,
 			options.MaxPendingDials,
 			options.DialQueueTimeout,
 			options.ConnectTimeout,
 			options.IdleTimeout,
+			options.PressureIdleTimeout,
 			options.BufferSize,
 			transportOptions.TinyMuxFlowBuffer,
 			transportOptions.TinyMuxFlowSendBuffer,
@@ -327,24 +334,28 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		connectTimeout:       options.ConnectTimeout,
 		dialQueueTimeout:     options.DialQueueTimeout,
 		idleTimeout:          options.IdleTimeout,
+		pressureIdleTimeout:  options.PressureIdleTimeout,
 		bufferSize:           options.BufferSize,
 		activeSlots:          make(chan struct{}, options.MaxActiveStreams),
 		openSlots:            make(chan struct{}, options.MaxOpenAttempts),
 		pendingSlots:         make(chan struct{}, options.MaxPendingDials),
+		streams:              make(map[*carrierConn]struct{}),
 		routeByClass:         carrierRouteMap(cfg),
 	}
 	go func() {
 		<-runCtx.Done()
 		_ = carrier.Close()
 	}()
-	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
+	logf("WLT carrier started routes=%d classes=%s max_active=%d max_open=%d max_pending=%d queue_timeout=%s connect_timeout=%s idle_timeout=%s pressure_idle_timeout=%s buffer_size=%d kcp_window=%d kcp_buffer=%d mux_flow_buffer=%d mux_send_buffer=%d mux_control_buffer=%d mux_burst=%d mux_ping_timeout_ms=%d peer_incoming_buffer=%d peer_write_buffer=%d adaptive_peer_data=%t adaptive_peer_threshold=%d adaptive_peer_idle_ms=%d srtp_packet_buffer=%d relay_bandwidth=%d",
 		len(cfg.Routes),
 		strings.Join(carrierRouteClasses(carrier.routeByClass), ","),
 		options.MaxActiveStreams,
 		options.MaxOpenAttempts,
 		options.MaxPendingDials,
 		options.DialQueueTimeout,
+		options.ConnectTimeout,
 		options.IdleTimeout,
+		options.PressureIdleTimeout,
 		options.BufferSize,
 		transportOptions.KCPWindowSize,
 		transportOptions.KCPReadWriteBuffer,
@@ -782,12 +793,15 @@ reconnectLoop:
 		c.logf("WLT stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d backoff=%s", routeClass, target, dialElapsed, reconnectAttempts, reconnectBackoffTotal)
 	}
 	c.openedStreams.Add(1)
-	return &carrierConn{
+	stream := &carrierConn{
 		Conn:          conn,
 		carrier:       c,
 		releaseActive: releaseActive,
 		idleTimeout:   c.idleTimeout,
-	}, nil
+		routeClass:    normalizeCarrierRouteClass(routeClass),
+	}
+	c.registerStream(stream)
+	return stream, nil
 }
 
 func (c *Carrier) Close() error {
@@ -827,6 +841,7 @@ func (c *Carrier) Stats() CarrierStats {
 		RejectedQueue:        c.rejectedQueue.Load(),
 		RejectedActive:       c.rejectedActive.Load(),
 		RejectedOpen:         c.rejectedOpen.Load(),
+		PressureIdleReclaims: c.pressureIdleReclaims.Load(),
 		FailedStreams:        c.failedStreams.Load(),
 		LastActiveWaitMillis: nanosToMillis(c.lastActiveWait.Load()),
 		MaxActiveWaitMillis:  nanosToMillis(c.maxActiveWait.Load()),
@@ -845,6 +860,14 @@ func (c *Carrier) Stats() CarrierStats {
 
 func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, target string) (func(), error) {
 	acquired := tryAcquire(c.activeSlots)
+	if !acquired {
+		// Under saturation, reclaim only connections that have been idle for a
+		// separately configured pressure interval. The normal idle timeout is
+		// deliberately left untouched so long-lived media is not shortened.
+		if c.reclaimPressureIdleStream(routeClass) {
+			acquired = tryAcquire(c.activeSlots)
+		}
+	}
 	if !acquired {
 		if !tryAcquire(c.pendingSlots) {
 			c.rejectedQueue.Add(1)
@@ -1162,22 +1185,28 @@ type carrierConn struct {
 	carrier       *Carrier
 	releaseActive func()
 	idleTimeout   time.Duration
+	routeClass    string
+	lastActivity  atomic.Int64
 	closeOnce     sync.Once
 }
 
 func (c *carrierConn) Read(p []byte) (int, error) {
+	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Read(p)
 	if n > 0 {
+		c.markActivity()
 		c.refreshDeadline()
 	}
 	return n, err
 }
 
 func (c *carrierConn) Write(p []byte) (int, error) {
+	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Write(p)
 	if n > 0 {
+		c.markActivity()
 		c.refreshDeadline()
 	}
 	return n, err
@@ -1186,6 +1215,7 @@ func (c *carrierConn) Write(p []byte) (int, error) {
 func (c *carrierConn) Close() error {
 	err := c.Conn.Close()
 	c.closeOnce.Do(func() {
+		c.carrier.unregisterStream(c)
 		c.releaseActive()
 		c.carrier.closedStreams.Add(1)
 	})
@@ -1197,4 +1227,72 @@ func (c *carrierConn) refreshDeadline() {
 		return
 	}
 	_ = c.Conn.SetDeadline(time.Now().Add(c.idleTimeout))
+}
+
+func (c *carrierConn) markActivity() {
+	c.lastActivity.Store(time.Now().UnixNano())
+}
+
+func (c *Carrier) registerStream(stream *carrierConn) {
+	if stream == nil {
+		return
+	}
+	stream.markActivity()
+	c.streamsMu.Lock()
+	if c.streams == nil {
+		c.streams = make(map[*carrierConn]struct{})
+	}
+	c.streams[stream] = struct{}{}
+	c.streamsMu.Unlock()
+}
+
+func (c *Carrier) unregisterStream(stream *carrierConn) {
+	if c == nil || stream == nil {
+		return
+	}
+	c.streamsMu.Lock()
+	delete(c.streams, stream)
+	c.streamsMu.Unlock()
+}
+
+func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
+	if c == nil || c.pressureIdleTimeout <= 0 {
+		return false
+	}
+	cutoff := time.Now().Add(-c.pressureIdleTimeout).UnixNano()
+	routeClass = normalizeCarrierRouteClass(routeClass)
+	var candidate *carrierConn
+	var sameRouteCandidate *carrierConn
+	c.streamsMu.Lock()
+	for stream := range c.streams {
+		lastActivity := stream.lastActivity.Load()
+		if lastActivity == 0 || lastActivity > cutoff {
+			continue
+		}
+		if stream.routeClass != routeClass {
+			if candidate == nil || stream.lastActivity.Load() < candidate.lastActivity.Load() {
+				candidate = stream
+			}
+		} else if sameRouteCandidate == nil || stream.lastActivity.Load() < sameRouteCandidate.lastActivity.Load() {
+			sameRouteCandidate = stream
+		}
+	}
+	if candidate == nil {
+		candidate = sameRouteCandidate
+	}
+	if candidate != nil {
+		// Remove it before closing so concurrent admission attempts cannot pick
+		// the same stream while Close is releasing its active slot.
+		delete(c.streams, candidate)
+	}
+	c.streamsMu.Unlock()
+	if candidate == nil {
+		return false
+	}
+	c.pressureIdleReclaims.Add(1)
+	if c.logf != nil {
+		c.logf("WLT carrier pressure idle reclaim stream route=%s requested_route=%s idle_ms=%d", candidate.routeClass, routeClass, time.Since(time.Unix(0, candidate.lastActivity.Load())).Milliseconds())
+	}
+	_ = candidate.Close()
+	return true
 }
