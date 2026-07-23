@@ -642,6 +642,66 @@ func TestCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
 	}
 }
 
+func TestCarrierPressureReclaimSkipsStreamWithActiveRead(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.pressureIdleTimeout = time.Millisecond
+	conn := &carrierConn{
+		Conn:          left,
+		carrier:       carrier,
+		releaseActive: func() {},
+		idleTimeout:   time.Minute,
+		routeClass:    "eu",
+	}
+	carrier.registerStream(conn)
+	defer conn.Close()
+
+	readStarted := make(chan struct{})
+	original := conn.Conn
+	conn.Conn = &readStartConn{Conn: original, started: readStarted}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocking read")
+	}
+	// Make the stream eligible while Read still owns ioMu.RLock.
+	conn.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	if carrier.reclaimPressureIdleStream("eu") {
+		t.Fatal("pressure reclaim closed a stream with an active read")
+	}
+
+	if _, err := right.Write([]byte{'x'}); err != nil {
+		t.Fatalf("release blocked read: %v", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatalf("blocked read failed: %v", err)
+	}
+	conn.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	if !carrier.reclaimPressureIdleStream("eu") {
+		t.Fatal("pressure reclaim did not close an idle stream after read completed")
+	}
+}
+
+type readStartConn struct {
+	net.Conn
+	started chan<- struct{}
+}
+
+func (c *readStartConn) Read(p []byte) (int, error) {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	return c.Conn.Read(p)
+}
+
 type ioResult struct {
 	conn io.ReadWriteCloser
 	err  error

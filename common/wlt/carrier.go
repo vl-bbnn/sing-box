@@ -1187,10 +1187,13 @@ type carrierConn struct {
 	idleTimeout   time.Duration
 	routeClass    string
 	lastActivity  atomic.Int64
+	ioMu          sync.RWMutex
 	closeOnce     sync.Once
 }
 
 func (c *carrierConn) Read(p []byte) (int, error) {
+	c.ioMu.RLock()
+	defer c.ioMu.RUnlock()
 	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Read(p)
@@ -1202,6 +1205,8 @@ func (c *carrierConn) Read(p []byte) (int, error) {
 }
 
 func (c *carrierConn) Write(p []byte) (int, error) {
+	c.ioMu.RLock()
+	defer c.ioMu.RUnlock()
 	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Write(p)
@@ -1270,15 +1275,31 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 			continue
 		}
 		if stream.routeClass != routeClass {
-			if candidate == nil || stream.lastActivity.Load() < candidate.lastActivity.Load() {
+			if candidate == nil || lastActivity < candidate.lastActivity.Load() {
+				if !stream.ioMu.TryLock() {
+					continue
+				}
+				if candidate != nil {
+					candidate.ioMu.Unlock()
+				}
 				candidate = stream
 			}
-		} else if sameRouteCandidate == nil || stream.lastActivity.Load() < sameRouteCandidate.lastActivity.Load() {
+		} else if sameRouteCandidate == nil || lastActivity < sameRouteCandidate.lastActivity.Load() {
+			if !stream.ioMu.TryLock() {
+				continue
+			}
+			if sameRouteCandidate != nil {
+				sameRouteCandidate.ioMu.Unlock()
+			}
 			sameRouteCandidate = stream
 		}
 	}
 	if candidate == nil {
 		candidate = sameRouteCandidate
+		sameRouteCandidate = nil
+	}
+	if sameRouteCandidate != nil {
+		sameRouteCandidate.ioMu.Unlock()
 	}
 	if candidate != nil {
 		// Remove it before closing so concurrent admission attempts cannot pick
@@ -1294,5 +1315,6 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 		c.logf("WLT carrier pressure idle reclaim stream route=%s requested_route=%s idle_ms=%d", candidate.routeClass, routeClass, time.Since(time.Unix(0, candidate.lastActivity.Load())).Milliseconds())
 	}
 	_ = candidate.Close()
+	candidate.ioMu.Unlock()
 	return true
 }
