@@ -24,24 +24,30 @@ import (
 // stream-down branch, which never pairs with a stream-up POST, so the response
 // body carries non-VLESS bytes and the VLESS layer fails with "unknown version".
 func (c *Client) dialStreamOne(ctx context.Context, sessionID string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	_ = sessionID // intentionally unused: stream-one sends no sessionId on the wire
 	u, err := c.requestURL()
 	if err != nil {
 		return nil, err
 	}
+	connCtx, connCancel := context.WithCancel(c.ctx)
 	pipeReader, pipeWriter := io.Pipe()
-	request := c.newRequest(ctx, http.MethodPost, u, pipeReader)
+	request := c.newRequest(connCtx, http.MethodPost, u, pipeReader)
 
-	conn := newStreamConn(pipeWriter, c.serverAddr)
+	conn := newStreamConn(pipeWriter, c.serverAddr, connCancel)
 	go func() {
 		response, err := c.transport.RoundTrip(request)
 		if err != nil {
 			conn.setupReader(nil, err)
+			connCancel()
 			return
 		}
 		if response.StatusCode != http.StatusOK {
 			response.Body.Close()
 			conn.setupReader(nil, E.New("v2ray-xhttp: unexpected status: ", response.Status))
+			connCancel()
 			return
 		}
 		conn.setupReader(response.Body, nil)
@@ -61,25 +67,38 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string) (net.Conn, 
 		return nil, err
 	}
 
-	// Download: GET response body.
-	downReq := c.newRequest(ctx, http.MethodGet, downURL, nil)
+	connCtx, connCancel := context.WithCancel(c.ctx)
+	stopDialCancel := context.AfterFunc(ctx, connCancel)
+
+	// Download: GET response body. The caller's context controls only this
+	// synchronous setup phase; the returned connection has its own lifetime.
+	downReq := c.newRequest(connCtx, http.MethodGet, downURL, nil)
 	downResp, err := c.transport.RoundTrip(downReq)
+	stopDialCancel()
 	if err != nil {
+		connCancel()
 		return nil, E.Cause(err, "open download")
+	}
+	if err := ctx.Err(); err != nil {
+		downResp.Body.Close()
+		connCancel()
+		return nil, err
 	}
 	if downResp.StatusCode != http.StatusOK {
 		downResp.Body.Close()
+		connCancel()
 		return nil, E.New("v2ray-xhttp: unexpected download status: ", downResp.Status)
 	}
 
 	// Upload: streamed POST request body.
 	pipeReader, pipeWriter := io.Pipe()
-	upReq := c.newRequest(ctx, http.MethodPost, upURL, pipeReader)
-	conn := newSplitConn(downResp.Body, pipeWriter, c.serverAddr)
+	upReq := c.newRequest(connCtx, http.MethodPost, upURL, pipeReader)
+	conn := newSplitConn(downResp.Body, pipeWriter, c.serverAddr, connCancel)
 	go func() {
 		upResp, err := c.transport.RoundTrip(upReq)
 		if err != nil {
 			conn.uploadFailed(err)
+			connCancel()
 			return
 		}
 		drainAndClose(upResp.Body)
@@ -94,17 +113,28 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	downReq := c.newRequest(ctx, http.MethodGet, downURL, nil)
+	connCtx, connCancel := context.WithCancel(c.ctx)
+	stopDialCancel := context.AfterFunc(ctx, connCancel)
+	downReq := c.newRequest(connCtx, http.MethodGet, downURL, nil)
 	downResp, err := c.transport.RoundTrip(downReq)
+	stopDialCancel()
 	if err != nil {
+		connCancel()
 		return nil, E.Cause(err, "open download")
+	}
+	if err := ctx.Err(); err != nil {
+		downResp.Body.Close()
+		connCancel()
+		return nil, err
 	}
 	if downResp.StatusCode != http.StatusOK {
 		downResp.Body.Close()
+		connCancel()
 		return nil, E.New("v2ray-xhttp: unexpected download status: ", downResp.Status)
 	}
 	return &packetConn{
-		ctx:        ctx,
+		ctx:        connCtx,
+		cancel:     connCancel,
 		client:     c,
 		sessionID:  sessionID,
 		reader:     downResp.Body,
@@ -121,14 +151,16 @@ type streamConn struct {
 	created    chan struct{}
 	readerErr  error
 	serverAddr M.Socksaddr
+	cancel     context.CancelFunc
 	closeOnce  sync.Once
 }
 
-func newStreamConn(writer *io.PipeWriter, serverAddr M.Socksaddr) *streamConn {
+func newStreamConn(writer *io.PipeWriter, serverAddr M.Socksaddr, cancel context.CancelFunc) *streamConn {
 	return &streamConn{
 		writer:     writer,
 		created:    make(chan struct{}),
 		serverAddr: serverAddr,
+		cancel:     cancel,
 	}
 }
 
@@ -154,6 +186,7 @@ func (c *streamConn) Write(b []byte) (int, error) {
 
 func (c *streamConn) Close() error {
 	c.closeOnce.Do(func() {
+		c.cancel()
 		c.writer.Close()
 		select {
 		case <-c.created:
@@ -180,14 +213,16 @@ type splitConn struct {
 	reader     io.ReadCloser
 	writer     *io.PipeWriter
 	serverAddr M.Socksaddr
+	cancel     context.CancelFunc
 	closeOnce  sync.Once
 }
 
-func newSplitConn(reader io.ReadCloser, writer *io.PipeWriter, serverAddr M.Socksaddr) *splitConn {
+func newSplitConn(reader io.ReadCloser, writer *io.PipeWriter, serverAddr M.Socksaddr, cancel context.CancelFunc) *splitConn {
 	return &splitConn{
 		reader:     reader,
 		writer:     writer,
 		serverAddr: serverAddr,
+		cancel:     cancel,
 	}
 }
 
@@ -200,6 +235,7 @@ func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
 
 func (c *splitConn) Close() error {
 	c.closeOnce.Do(func() {
+		c.cancel()
 		c.writer.Close()
 		c.reader.Close()
 	})
@@ -217,6 +253,7 @@ func (c *splitConn) NeedAdditionalReadDeadline() bool   { return true }
 // is delivered as a sequential POST to "<path>/<sessionId>/<seq>".
 type packetConn struct {
 	ctx        context.Context
+	cancel     context.CancelFunc
 	client     *Client
 	sessionID  string
 	reader     io.ReadCloser
@@ -266,6 +303,7 @@ func (c *packetConn) Close() error {
 	c.access.Lock()
 	c.closed = true
 	c.access.Unlock()
+	c.cancel()
 	return c.reader.Close()
 }
 
