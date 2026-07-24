@@ -25,6 +25,11 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
 	if options.Type == "" {
 		return nil, nil
 	}
+	// lx:begin xhttp
+	if constructor, loaded := lookupServerTransport(options.Type); loaded {
+		return constructor(ctx, logger, options, tlsConfig, handler)
+	}
+	// lx:end xhttp
 	switch options.Type {
 	case C.V2RayTransportTypeHTTP:
 		return v2rayhttp.NewServer(ctx, logger, options.HTTPOptions, tlsConfig, handler)

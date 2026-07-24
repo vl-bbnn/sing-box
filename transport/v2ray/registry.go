@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing-box/transport/v2rayhttpupgrade"
 	"github.com/sagernet/sing-box/transport/v2raywebsocket"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -27,7 +28,13 @@ import (
 // V2RayTransportOptions (each transport reads its own sub-options field).
 type ClientTransportConstructor func(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayTransportOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error)
 
+// ServerTransportConstructor builds a server transport from the full
+// V2RayTransportOptions. Built-in server transports remain in the upstream
+// switch; this registry is only a build-tagged downstream extension point.
+type ServerTransportConstructor func(ctx context.Context, logger logger.ContextLogger, options option.V2RayTransportOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (adapter.V2RayServerTransport, error)
+
 var clientTransportRegistry = make(map[string]ClientTransportConstructor)
+var serverTransportRegistry = make(map[string]ServerTransportConstructor)
 
 // RegisterClient registers a client transport constructor for the given type.
 // Built-in types are registered below; downstream types (xhttp) register from
@@ -39,6 +46,16 @@ func RegisterClient(transportType string, constructor ClientTransportConstructor
 // lookupClientTransport returns the constructor for a transport type, if any.
 func lookupClientTransport(transportType string) (ClientTransportConstructor, bool) {
 	constructor, loaded := clientTransportRegistry[transportType]
+	return constructor, loaded
+}
+
+// RegisterServer registers a downstream server transport constructor.
+func RegisterServer(transportType string, constructor ServerTransportConstructor) {
+	serverTransportRegistry[transportType] = constructor
+}
+
+func lookupServerTransport(transportType string) (ServerTransportConstructor, bool) {
+	constructor, loaded := serverTransportRegistry[transportType]
 	return constructor, loaded
 }
 
