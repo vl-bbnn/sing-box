@@ -44,6 +44,28 @@ func TestUploadQueueIsBounded(t *testing.T) {
 	}
 }
 
+func TestUploadQueueAcceptsExpectedPacketWhenReorderBufferIsFull(t *testing.T) {
+	queue := newUploadQueue(3)
+	for seq := uint64(1); seq <= 3; seq++ {
+		if err := queue.Push(seq, []byte{byte(seq)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// HTTP/2 streams may complete out of order.  If the next expected packet is
+	// rejected just because later packets filled the reorder buffer, the reader
+	// can never advance and the whole XHTTP connection stalls permanently.
+	if err := queue.Push(0, []byte{0}); err != nil {
+		t.Fatalf("expected packet must unblock a full reorder buffer: %v", err)
+	}
+	buffer := make([]byte, 4)
+	if _, err := io.ReadFull(queue, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer, []byte{0, 1, 2, 3}) {
+		t.Fatalf("unexpected ordered output: %v", buffer)
+	}
+}
+
 func TestUploadQueueRejectsConsumedAndDuplicatePackets(t *testing.T) {
 	queue := newUploadQueue(4)
 	if err := queue.Push(0, []byte("first")); err != nil {

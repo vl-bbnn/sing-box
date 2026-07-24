@@ -39,7 +39,12 @@ func (q *uploadQueue) Push(seq uint64, payload []byte) error {
 	if _, loaded := q.packets[seq]; loaded {
 		return errUploadSequenceDuplicate
 	}
-	if len(q.packets) >= q.maxBuffered {
+	// Always accept the next expected packet. HTTP/2 request streams can finish
+	// out of order; later packets may fill the reorder buffer while this packet
+	// is still in flight. Rejecting it would leave an unfillable sequence gap
+	// and permanently stall the byte stream. The temporary +1 entry remains
+	// bounded and is consumed as soon as the waiting reader acquires the lock.
+	if seq != q.expectedSeq && len(q.packets) >= q.maxBuffered {
 		return errUploadQueueFull
 	}
 	q.packets[seq] = payload
