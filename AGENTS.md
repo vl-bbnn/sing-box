@@ -2,7 +2,8 @@
 
 `sing-box-lx` — **тонкий downstream** апстрима [SagerNet/sing-box](https://github.com/SagerNet/sing-box): upstream **плюс ровно две фичи** и ничего больше:
 
-1. **XHTTP** — клиентский v2ray-транспорт (совместимость с Xray XHTTP).
+1. **XHTTP** — v2ray-транспорт (клиент и изолированная server-side реализация
+   packet-up; совместимость с Xray XHTTP wire protocol).
 2. **AmneziaWG 2.0 (AWG2)** — клиентский endpoint поверх WireGuard.
 
 Главная ценность проекта — **согласованность с upstream**. Любое изменение оценивается по тому, насколько легко оно переживёт ребейз на следующий тег upstream.
@@ -29,7 +30,8 @@
 - **Правки upstream-файлов** — только помеченными `// lx:` блоками, атомарными коммитами.
 - **Никаких merge с upstream — только rebase.** `origin/lx` всегда ребейзится на тег.
 - **Имя бинаря — `sing-box`** (drop-in для лаунчера); идентичность `-lx` — в версии.
-- **Scope — client-only**: outbound/endpoint. Server/inbound отложены.
+- **Scope — client-first**: AWG остаётся endpoint-only; XHTTP server/inbound
+  допускается только через отдельный Spec Kit и за `with_xhttp`.
 
 ---
 

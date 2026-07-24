@@ -1,10 +1,10 @@
 # sing-box-lx — configuration of the downstream features
 
-`sing-box-lx` is upstream [sing-box](https://github.com/SagerNet/sing-box) plus a small set of **client-side** features (currently two), each gated behind a build tag:
+`sing-box-lx` is upstream [sing-box](https://github.com/SagerNet/sing-box) plus a small set of isolated downstream features (currently two), each gated behind a build tag:
 
 | Feature | Build tag | Where it lives in config |
 |---------|-----------|--------------------------|
-| **XHTTP** transport (Xray-compatible) | `with_xhttp` | `transport.type: "xhttp"` on a VLESS / VMess / Trojan outbound |
+| **XHTTP** transport (Xray-compatible) | `with_xhttp` | `transport.type: "xhttp"` on VLESS / VMess / Trojan; server supports packet-up |
 | **AmneziaWG 2.0** (AWG2) | `with_awg` | extra fields on a `wireguard` **endpoint** |
 
 Build the binary with both: `make -f Makefile.lx lx-build` (output `sing-box`, version `…-lx.N`).
@@ -23,7 +23,7 @@ XHTTP (Xray "splithttp"/"xhttp") is a v2ray transport that tunnels the proxy ove
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `type` | string | — | must be `"xhttp"` |
-| `mode` | string | `auto` | `auto` \| `packet-up` \| `stream-up` \| `stream-one`. **`auto` uses `packet-up`** (live-validated against Xray/3x-ui). `stream-one` has a known downlink-framing bug — select it explicitly only if you know the server needs it. |
+| `mode` | string | `auto` | Client: `auto` \| `packet-up` \| `stream-up` \| `stream-one`; `auto` selects stream-one with Reality and packet-up otherwise. Server: explicit `packet-up` only. |
 | `host` | string | TLS SNI / server | overrides the HTTP `Host` header |
 | `path` | string | `/` | request path prefix; the random session id (and, for `packet-up`, the upload sequence number) are appended |
 | `headers` | object | — | extra request headers sent on every XHTTP request |
@@ -51,6 +51,41 @@ XHTTP (Xray "splithttp"/"xhttp") is a v2ray transport that tunnels the proxy ove
     "type": "xhttp",
     "mode": "stream-one",
     "host": "example.com",
+    "path": "/xhttp",
+    "x_padding_bytes": "100-1000"
+  }
+}
+```
+
+### Example — VLESS + Reality + XHTTP packet-up inbound
+
+The server implementation is intentionally narrow: it accepts packet-up over
+HTTP/2 or h2c, uses the normal sing-box TLS/Reality and VLESS handlers, and
+rejects stream-up, stream-one, HTTP/3 and xmux.
+
+```jsonc
+{
+  "type": "vless",
+  "tag": "xhttp-packet-in",
+  "listen": "127.0.0.1",
+  "listen_port": 18443,
+  "users": [
+    { "name": "stage-device", "uuid": "00000000-0000-0000-0000-000000000000" }
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "www.example.com",
+    "reality": {
+      "enabled": true,
+      "handshake": { "server": "www.example.com", "server_port": 443 },
+      "private_key": "<reality-private-key-base64>",
+      "short_id": ["0123abcd"]
+    }
+  },
+  "transport": {
+    "type": "xhttp",
+    "mode": "packet-up",
+    "host": "www.example.com",
     "path": "/xhttp",
     "x_padding_bytes": "100-1000"
   }

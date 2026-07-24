@@ -1,8 +1,9 @@
-// Package v2rayxhttp implements the client side of the Xray "XHTTP"
-// (a.k.a. "splithttp") v2ray transport for sing-box-lx. It is a lean-native
-// implementation written on sing-box/sing primitives and the in-tree
-// v2rayhttp HTTP/2 conn helpers, rather than vendoring Xray internals.
-// See SPECS/002-XHTTP_CLIENT_TRANSPORT.
+// Package v2rayxhttp implements the Xray "XHTTP" (a.k.a. "splithttp")
+// v2ray transport for sing-box-lx. It provides the client modes from
+// SPECS/002-XHTTP_CLIENT_TRANSPORT and the bounded packet-up server from
+// SPECS/014-XHTTP_SERVER_PACKET_UP. The implementation is lean-native and uses
+// sing-box/sing primitives plus the in-tree v2rayhttp HTTP/2 conn helpers
+// instead of vendoring Xray internals.
 //
 // Wire protocol (mirrors Xray-core transport/internet/splithttp):
 //
@@ -284,6 +285,9 @@ func parsePaddingRange(raw string) (int, int, error) {
 		if err != nil {
 			return 0, 0, E.Cause(err, "parse x_padding_bytes")
 		}
+		if v < 0 {
+			return 0, 0, E.New("x_padding_bytes must be non-negative")
+		}
 		return v, v, nil
 	}
 	parts := strings.SplitN(raw, "-", 2)
@@ -294,6 +298,9 @@ func parsePaddingRange(raw string) (int, int, error) {
 	maxV, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil {
 		return 0, 0, E.Cause(err, "parse x_padding_bytes max")
+	}
+	if minV < 0 || maxV < 0 {
+		return 0, 0, E.New("x_padding_bytes must be non-negative")
 	}
 	if maxV < minV {
 		minV, maxV = maxV, minV

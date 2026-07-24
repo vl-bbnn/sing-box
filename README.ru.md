@@ -3,7 +3,7 @@
 # sing-box-lx
 
 > **Тонкий downstream-форк [SagerNet/sing-box](https://github.com/SagerNet/sing-box).**
-> Небольшой набор клиентских фич поверх upstream — сейчас **XHTTP** и **AmneziaWG 2.0** — каждая за своим build-tag.
+> Небольшой набор изолированных фич поверх upstream — сейчас **XHTTP** и **AmneziaWG 2.0** — каждая за своим build-tag.
 > Набор может расти, философия — нет: жить ребейзом на каждый upstream-тег, а не отдельной жизнью.
 
 > 📄 README самого upstream sing-box — **[на GitHub](https://github.com/SagerNet/sing-box/blob/main/README.md)** (всегда актуальный).
@@ -38,7 +38,7 @@
 
 | # | Фича | Что это | Статус |
 |---|------|---------|--------|
-| **XHTTP** | клиентский транспорт | Xray-совместимый «splithttp» (режимы `auto`/`packet-up`/`stream-up`/`stream-one`) поверх Reality/TLS/h2c | ✅ **проверен живым Xray (3x-ui) сервером** (packet-up/auto): handshake + DNS + HTTPS + скачивание. `stream-one` — известный баг framing |
+| **XHTTP** | клиентский транспорт + packet-up сервер | Xray-совместимый «splithttp» поверх Reality/TLS/h2c; все клиентские режимы и bounded packet-up inbound | Клиент проверен с живым Xray; нативный packet-up сервер проходит sing-box↔sing-box VLESS+Reality гейты HTTP 204 и 128 КиБ. Stage/iPhone-приёмка ведётся в **SPECS/014** |
 | **AmneziaWG 2.0** | клиентский endpoint | обфускация WireGuard: `Jc/Jmin/Jmax`, `S1–S4`, `H1–H4` + **2.0**: `I1–I5` (CPS — кастомные пакеты-приманки) | ✅ собирается, проходит `check`; зависимость **активирована** ([Leadaxe/wireguard-go-awg2-lx](https://github.com/Leadaxe/wireguard-go-awg2-lx) — sagernet-база + обфускация); **проверено живым AWG2-сервером**: handshake + keepalive + трафик наружу |
 | **Маскировка `id/ip/ib`** | сахар над AWG | WireSock-стиль: декларативная маскировка поверх `I1` — домен (`id`) + протокол (`ip`: `quic`/`dns`/`stun`/`sip`) + браузер (`ib`), ядро строит клиент-инициированную `I1`-приманку: `quic` = out-of-order фрагментированный Initial (i1+i2), `dns`/`stun`/`sip` = query/Binding-Request/INVITE | ✅ **`ip=quic` device-проверен на реальном LTE/WARP DPI** (~330 мс, упрощает Cloudflare WARP); `dns`/`stun`/`sip` собираются и проходят `check`, но режутся как класс протокола к WARP-edge — для других провайдеров |
 
@@ -149,7 +149,7 @@ upstream tag (vX.Y.Z)
         │
         └─►  ветка lx = upstream + N атомарных // lx-коммитов
                  ├─ FORK_BOOTSTRAP (Makefile.lx, CI, версия)
-                 ├─ XHTTP client transport
+                 ├─ XHTTP client + packet-up server transport
                  ├─ AWG2 client endpoint
                  └─ … (новые фичи — такими же атомарными // lx-коммитами)
 ```
@@ -176,7 +176,7 @@ upstream  https://github.com/SagerNet/sing-box.git
 | `.github/workflows/lx-release.yml` | релиз на `v*-lx.*`: desktop ×6 + `libbox.aar` → GitHub Release |
 | `SPECS/` | Spec Kit (конституция, задачи, отчёты) |
 | `lx-test/config/` | примеры конфигов для `sing-box check` |
-| `transport/v2rayxhttp/` | XHTTP-клиент (новый пакет) |
+| `transport/v2rayxhttp/` | XHTTP-клиент + bounded packet-up сервер (новый пакет) |
 | `transport/wireguard/device_awg.go` | AWG IpcSet-параметры (за `with_awg`) |
 | `submodules/wireguard-go` | submodule: merged-форк AmneziaWG-рантайма ([Leadaxe/wireguard-go-awg2-lx](https://github.com/Leadaxe/wireguard-go-awg2-lx)) |
 | `option/v2ray_xhttp.go`, `option/wireguard_awg.go` | опции фич |

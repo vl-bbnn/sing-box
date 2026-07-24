@@ -2,16 +2,19 @@ package option
 
 import "github.com/sagernet/sing/common/json/badoption"
 
-// V2RayXHTTPOptions configures the XHTTP (Xray "splithttp"/"xhttp") client
-// transport. It is a sing-box-lx downstream addition; see SPECS/002. JSON keys
-// are snake_case to match Xray's stream settings and the rest of sing-box.
+// V2RayXHTTPOptions configures the XHTTP (Xray "splithttp"/"xhttp")
+// transport. It is a sing-box-lx downstream addition; see SPECS/002 and
+// SPECS/014. JSON keys are snake_case to match Xray's stream settings and the
+// rest of sing-box.
 //
 // Modes (Xray-compatible):
-//   - "auto"       : pick a mode automatically (currently behaves as stream-one).
+//   - "auto"       : pick stream-one for Reality clients, packet-up otherwise.
 //   - "packet-up"  : separate GET download stream + sequential POST upload packets.
 //   - "stream-up"  : single streamed POST upload + separate GET download stream.
 //   - "stream-one" : a single bidirectional HTTP stream (request body up,
 //     response body down) — the closest analogue to httpupgrade.
+//
+// The server transport currently accepts packet-up only.
 type V2RayXHTTPOptions struct {
 	// Host overrides the HTTP Host header (defaults to the TLS SNI or the
 	// server address when empty).

@@ -1,0 +1,47 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "xhttp-packet-in",
+      "listen": "127.0.0.1",
+      "listen_port": 18443,
+      "users": [
+        {
+          "name": "integration",
+          "uuid": "96d12120-15fc-4edb-b3e6-36e0db6186c5"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.example.com",
+            "server_port": 443
+          },
+          "private_key": "gAlRhJTmzVKliXwEgIXe7H1wwndzx6qXCAIfG92qWkc",
+          "short_id": [
+            "0123456789abcdef"
+          ]
+        }
+      },
+      "transport": {
+        "type": "xhttp",
+        "host": "www.example.com",
+        "path": "/xhttp-packet",
+        "mode": "packet-up",
+        "x_padding_bytes": "100-1000"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 # sing-box-lx
 
 > **A thin downstream fork of [SagerNet/sing-box](https://github.com/SagerNet/sing-box).**
-> A small set of client-side features on top of upstream — currently **XHTTP** and **AmneziaWG 2.0** — each behind its own build tag.
+> A small set of isolated features on top of upstream — currently **XHTTP** and **AmneziaWG 2.0** — each behind its own build tag.
 > The set may grow; the philosophy doesn't: live by rebasing onto every upstream tag, not by drifting into a separate life.
 
 > 📄 The upstream sing-box README — **[on GitHub](https://github.com/SagerNet/sing-box/blob/main/README.md)** (always current).
@@ -38,7 +38,7 @@ In the sing-box ecosystem, forks that add XHTTP / AmneziaWG fall into two camps 
 
 | # | Feature | What it is | Status |
 |---|---------|------------|--------|
-| **XHTTP** | client transport | Xray-compatible "splithttp" (modes `auto`/`packet-up`/`stream-up`/`stream-one`) over Reality/TLS/h2c | ✅ **live-validated** against a real Xray (3x-ui) server (packet-up/auto): handshake + DNS + HTTPS + download. `stream-one` has a known framing bug |
+| **XHTTP** | client transport + packet-up server | Xray-compatible "splithttp" over Reality/TLS/h2c; all client modes and a bounded packet-up inbound | Client is live-validated against Xray; the native packet-up server passes sing-box↔sing-box VLESS+Reality HTTP 204 and 128 KiB gates. Stage/iPhone acceptance is tracked in **SPECS/014** |
 | **AmneziaWG 2.0** | client endpoint | WireGuard obfuscation: `Jc/Jmin/Jmax`, `S1–S4`, `H1–H4` + **2.0**: `I1–I5` (CPS — decoy packets) | ✅ builds, passes `check`; dependency **activated** ([Leadaxe/wireguard-go-awg2-lx](https://github.com/Leadaxe/wireguard-go-awg2-lx) — sagernet base + obfuscation); **validated against a real AWG2 server**: handshake + keepalive + outbound traffic |
 | **Masquerade `id/ip/ib`** | AWG sugar | WireSock-style declarative masquerade over `I1`: name a domain (`id`) + protocol (`ip`: `quic`/`dns`/`stun`/`sip`) + browser (`ib`) and the core builds the client-initiated `I1` decoy for you — `quic` = out-of-order fragmented Initial (i1+i2), `dns`/`stun`/`sip` = query/Binding-Request/INVITE | ✅ **`ip=quic` device-proven against a real LTE/WARP DPI** (~330 ms, eases Cloudflare WARP); `dns`/`stun`/`sip` build & pass `check` but are blocked as a protocol class to the WARP edge — for other providers |
 
@@ -150,7 +150,7 @@ upstream tag (vX.Y.Z)
         │
         └─►  branch lx = upstream + N atomic // lx commits
                  ├─ FORK_BOOTSTRAP (Makefile.lx, CI, version)
-                 ├─ XHTTP client transport
+                 ├─ XHTTP client + packet-up server transport
                  ├─ AWG2 client endpoint
                  └─ … (future features — same atomic // lx commits)
 ```
@@ -177,7 +177,7 @@ upstream  https://github.com/SagerNet/sing-box.git
 | `.github/workflows/lx-release.yml` | release on `v*-lx.*`: desktop ×6 + `libbox.aar` → GitHub Release |
 | `SPECS/` | Spec Kit (constitution, tasks, reports) |
 | `lx-test/config/` | sample configs for `sing-box check` |
-| `transport/v2rayxhttp/` | XHTTP client (new package) |
+| `transport/v2rayxhttp/` | XHTTP client + bounded packet-up server (new package) |
 | `transport/wireguard/device_awg.go` | AWG IpcSet parameters (behind `with_awg`) |
 | `submodules/wireguard-go` | submodule: merged AmneziaWG runtime fork ([Leadaxe/wireguard-go-awg2-lx](https://github.com/Leadaxe/wireguard-go-awg2-lx)) |
 | `option/v2ray_xhttp.go`, `option/wireguard_awg.go` | feature options |
