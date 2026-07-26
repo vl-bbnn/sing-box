@@ -198,6 +198,10 @@ func (r *httpRequest) SetContentString(content string) {
 
 func (r *httpRequest) Execute() (HTTPResponse, error) {
 	response, err := r.client.Do(&r.request)
+	if shouldRetryHTTPRequest(&r.request, err) {
+		retryRequest := r.request.Clone(r.request.Context())
+		response, err = r.client.Do(retryRequest)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +210,17 @@ func (r *httpRequest) Execute() (HTTPResponse, error) {
 		return nil, errors.New(httpResp.errorString())
 	}
 	return httpResp, nil
+}
+
+func shouldRetryHTTPRequest(request *http.Request, err error) bool {
+	if err == nil || request.Context().Err() != nil || request.Body != nil {
+		return false
+	}
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		return false
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
 }
 
 type httpResponse struct {
