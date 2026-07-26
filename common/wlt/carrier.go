@@ -825,6 +825,17 @@ reconnectLoop:
 }
 
 func (c *Carrier) Close() error {
+	return c.close(false)
+}
+
+// Abort immediately closes the carrier without waiting for a graceful mux/KCP
+// drain. A caller should use it only when the current underlay is already
+// obsolete, such as after the default network interface changes.
+func (c *Carrier) Abort() error {
+	return c.close(true)
+}
+
+func (c *Carrier) close(immediate bool) error {
 	if c == nil {
 		return nil
 	}
@@ -833,7 +844,13 @@ func (c *Carrier) Close() error {
 			c.cancel()
 		}
 		if c.client != nil {
-			if err := c.client.Stop(); err != nil && !strings.Contains(err.Error(), "not running") {
+			var err error
+			if immediate {
+				err = c.client.Abort()
+			} else {
+				err = c.client.Stop()
+			}
+			if err != nil && !strings.Contains(err.Error(), "not running") {
 				c.closeErr = err
 			}
 		}

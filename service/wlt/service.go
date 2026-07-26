@@ -291,21 +291,17 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 
 	if expected != nil {
 		stats := expected.Stats()
-		// An interface change makes the old UDP/TURN underlay unusable. Its KCP
-		// close path intentionally drains pending writes for up to ten seconds,
-		// but waiting for that drain here extends every Wi-Fi/cellular handover by
-		// the same amount. Detach the obsolete carrier first and let it drain in
-		// the background while the replacement binds to the new default network.
-		// Carrier socket-control registrations are independently removable, so an
-		// older close cannot unregister the replacement's newer registration.
-		s.logger.Info("wlt service old carrier close started active=", stats.ActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " failed=", stats.FailedStreams, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
-		go func() {
-			startedAt := time.Now()
-			if err := expected.Close(); err != nil {
-				s.logger.Warn("wlt service old carrier close error: ", err)
-			}
-			s.logger.Info("wlt service old carrier closed elapsed=", time.Since(startedAt).String())
-		}()
+		// The old UDP/TURN underlay is already unusable after an interface
+		// change. A graceful mux/KCP drain retains its TURN allocations for up to
+		// ten seconds; starting the replacement concurrently can then exceed the
+		// provider's per-user allocation quota. Abort the obsolete carrier first,
+		// which releases sockets and allocations without waiting for that drain.
+		startedAt := time.Now()
+		s.logger.Info("wlt service old carrier abort started active=", stats.ActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " failed=", stats.FailedStreams, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
+		if err := expected.Abort(); err != nil {
+			s.logger.Warn("wlt service old carrier abort error: ", err)
+		}
+		s.logger.Info("wlt service old carrier aborted elapsed=", time.Since(startedAt).String())
 	}
 
 	for attempt := 1; ; attempt++ {
