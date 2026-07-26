@@ -84,7 +84,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 
 	startedAt := time.Now()
 	s.logger.Info("wlt service starting transport=", s.options.Transport)
-	carrier, err := s.startCarrier()
+	carrier, err := s.startCarrier(false)
 	if err != nil {
 		s.logger.Error("wlt service start failed elapsed=", time.Since(startedAt).String(), " error=", err)
 		return err
@@ -99,7 +99,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
+func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error) {
 	var socketControl carriercommon.SocketControlFunc
 	if s.network != nil {
 		if protectFunc := s.network.ProtectFunc(); protectFunc != nil {
@@ -114,6 +114,8 @@ func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
 		AuthSnapshotURL:              s.options.AuthSnapshotURL,
 		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
 		AuthSnapshotOutputFile:       s.options.AuthSnapshotOutputFile,
+		AuthSnapshotPreferFile:       preferPersistedAuth,
+		AuthSnapshotSkipRemote:       preferPersistedAuth,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,
 		MaxOpenAttempts:              s.options.MaxOpenAttempts,
@@ -315,7 +317,7 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		}
 		startedAt := time.Now()
 		s.logger.Info("wlt service carrier restart attempt=", attempt, " reason=", reason)
-		carrier, err := s.startCarrier()
+		carrier, err := s.startCarrier(true)
 		if err == nil {
 			s.access.Lock()
 			if s.stopped {

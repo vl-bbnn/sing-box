@@ -130,6 +130,8 @@ type CarrierOptions struct {
 	AuthSnapshotURL          string
 	AuthSnapshotFetchTimeout time.Duration
 	AuthSnapshotOutputFile   string
+	AuthSnapshotPreferFile   bool
+	AuthSnapshotSkipRemote   bool
 
 	ConnectTimeout      time.Duration
 	MaxActiveStreams    int
@@ -479,7 +481,16 @@ func isFatalCarrierConnectError(err error) bool {
 }
 
 func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf func(string, ...any)) error {
-	if snapshotURL := strings.TrimSpace(options.AuthSnapshotURL); snapshotURL != "" {
+	if options.AuthSnapshotPreferFile {
+		loaded, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
+		if err != nil {
+			return err
+		}
+		if loaded {
+			return nil
+		}
+	}
+	if snapshotURL := strings.TrimSpace(options.AuthSnapshotURL); snapshotURL != "" && !options.AuthSnapshotSkipRemote {
 		if raw, err := fetchCarrierAuthSnapshot(ctx, snapshotURL, options.AuthSnapshotFetchTimeout); err != nil {
 			if logf != nil {
 				logf("WLT carrier auth snapshot remote refresh unavailable error=%v", err)
@@ -499,42 +510,51 @@ func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf f
 		}
 	}
 	raw := strings.TrimSpace(options.AuthSnapshot)
-	source := ""
 	if raw != "" {
-		source = "inline"
-	} else if path := strings.TrimSpace(options.AuthSnapshotFile); path != "" {
-		content, err := os.ReadFile(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				if logf != nil {
-					logf("WLT carrier start phase=auth_snapshot_missing source=file")
-				}
-				return nil
-			}
-			return fmt.Errorf("read auth snapshot file: %w", err)
+		if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
+			return fmt.Errorf("import auth snapshot: %w", err)
 		}
-		raw = strings.TrimSpace(string(content))
-		source = "file"
-	}
-	if raw == "" {
-		if source == "file" && logf != nil {
-			logf("WLT carrier start phase=auth_snapshot_empty source=file")
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_loaded source=inline")
 		}
 		return nil
 	}
-	if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
-		if source == "file" {
+	_, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
+	return err
+}
+
+func loadCarrierAuthSnapshotFile(path string, logf func(string, ...any)) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			if logf != nil {
-				logf("WLT carrier start phase=auth_snapshot_ignored source=file error=%v", err)
+				logf("WLT carrier start phase=auth_snapshot_missing source=file")
 			}
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("import auth snapshot: %w", err)
+		return false, fmt.Errorf("read auth snapshot file: %w", err)
+	}
+	raw := strings.TrimSpace(string(content))
+	if raw == "" {
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_empty source=file")
+		}
+		return false, nil
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_ignored source=file error=%v", err)
+		}
+		return false, nil
 	}
 	if logf != nil {
-		logf("WLT carrier start phase=auth_snapshot_loaded source=%s", source)
+		logf("WLT carrier start phase=auth_snapshot_loaded source=file")
 	}
-	return nil
+	return true, nil
 }
 
 func fetchCarrierAuthSnapshot(ctx context.Context, rawURL string, timeout time.Duration) ([]byte, error) {

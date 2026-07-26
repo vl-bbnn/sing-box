@@ -109,6 +109,80 @@ func TestLoadCarrierAuthSnapshotRejectsCorruptInlineSnapshot(t *testing.T) {
 	}
 }
 
+func TestLoadCarrierAuthSnapshotPrefersPersistedFileOnRestart(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshot("persisted-token")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{
+		AuthSnapshot:           testCarrierAuthSnapshot("inline-token"),
+		AuthSnapshotFile:       path,
+		AuthSnapshotURL:        "https://127.0.0.1:1/unreachable",
+		AuthSnapshotPreferFile: true,
+		AuthSnapshotSkipRemote: true,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := carrierengine.ExportAuthSnapshotJSON(carrierconfig.ClientConfig{
+		PlatformID: "vk.com",
+		CallID:     "restart-snapshot-test",
+		Username:   "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported), `"anonym_token":"persisted-token"`) || strings.Contains(string(exported), "inline-token") {
+		t.Fatalf("persisted snapshot was not preferred: %s", exported)
+	}
+}
+
+func TestLoadCarrierAuthSnapshotFallsBackFromCorruptPreferredFile(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{
+		AuthSnapshot:           testCarrierAuthSnapshot("inline-fallback-token"),
+		AuthSnapshotFile:       path,
+		AuthSnapshotPreferFile: true,
+		AuthSnapshotSkipRemote: true,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := carrierengine.ExportAuthSnapshotJSON(carrierconfig.ClientConfig{
+		PlatformID: "vk.com",
+		CallID:     "restart-snapshot-test",
+		Username:   "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported), `"anonym_token":"inline-fallback-token"`) {
+		t.Fatalf("inline fallback snapshot was not imported: %s", exported)
+	}
+}
+
+func testCarrierAuthSnapshot(token string) string {
+	return fmt.Sprintf(`{
+		"version":1,
+		"platform_id":"vk.com",
+		"call_id":"restart-snapshot-test",
+		"username":"tester",
+		"expires_at":%q,
+		"vk":{
+			"messages_access_token":"messages",
+			"anonym_token":%q,
+			"session_key":"session",
+			"device_id":"device",
+			"endpoint":"wss://example.invalid/ws",
+			"turn_user":"turn-user",
+			"turn_pass":"turn-pass",
+			"turn_addr":"turn:one.example.invalid",
+			"turn_addrs":["turn:one.example.invalid"]
+		}
+	}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), token)
+}
+
 func TestFetchCarrierAuthSnapshotUsesHTTPSAndBoundsPayload(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
