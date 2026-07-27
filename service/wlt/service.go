@@ -5,6 +5,7 @@ package wlt
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,13 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error) {
+	if cacheFile := persistentDNSCacheFile(s.options); cacheFile != "" {
+		if err := carriercommon.SetDNSCacheFile(cacheFile); err != nil {
+			s.logger.Warn("wlt carrier persistent DNS cache unavailable path=", cacheFile, " error=", err)
+		} else {
+			s.logger.Info("wlt carrier persistent DNS cache configured path=", cacheFile)
+		}
+	}
 	var socketControl carriercommon.SocketControlFunc
 	if s.network != nil {
 		if protectFunc := s.network.ProtectFunc(); protectFunc != nil {
@@ -143,6 +151,17 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 			s.logger.InfoContext(s.ctx, fmt.Sprintf(format, args...))
 		},
 	})
+}
+
+func persistentDNSCacheFile(options option.WLTServiceOptions) string {
+	path := strings.TrimSpace(options.AuthSnapshotOutputFile)
+	if path == "" {
+		path = strings.TrimSpace(options.AuthSnapshotFile)
+	}
+	if path == "" || !filepath.IsAbs(path) {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(path), "wlt-dns-cache.json")
 }
 
 func (s *Service) Close() error {

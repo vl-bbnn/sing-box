@@ -5,12 +5,35 @@ package wlt
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	wltpkg "github.com/sagernet/sing-box/common/wlt"
+	"github.com/sagernet/sing-box/option"
 )
+
+func TestPersistentDNSCacheFileUsesWritableAuthDirectory(t *testing.T) {
+	authPath := filepath.Join(t.TempDir(), "wlt-auth.json")
+	got := persistentDNSCacheFile(option.WLTServiceOptions{
+		AuthSnapshotOutputFile: authPath,
+	})
+	want := filepath.Join(filepath.Dir(authPath), "wlt-dns-cache.json")
+	if got != want {
+		t.Fatalf("persistentDNSCacheFile=%q, want %q", got, want)
+	}
+}
+
+func TestPersistentDNSCacheFileFallsBackToInputAndRejectsRelativePath(t *testing.T) {
+	authPath := filepath.Join(t.TempDir(), "wlt-auth.json")
+	if got := persistentDNSCacheFile(option.WLTServiceOptions{AuthSnapshotFile: authPath}); got != filepath.Join(filepath.Dir(authPath), "wlt-dns-cache.json") {
+		t.Fatalf("persistentDNSCacheFile fallback=%q", got)
+	}
+	if got := persistentDNSCacheFile(option.WLTServiceOptions{AuthSnapshotOutputFile: "relative.json"}); got != "" {
+		t.Fatalf("persistentDNSCacheFile accepted relative path %q", got)
+	}
+}
 
 func TestWaitCarrierWaitsForReplacement(t *testing.T) {
 	serviceContext, cancelService := context.WithCancel(context.Background())
