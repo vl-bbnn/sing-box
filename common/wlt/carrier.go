@@ -112,7 +112,10 @@ const (
 	// its outer deadline even though the underlying attempt is already dead.
 	// Keep attempts short so a transient close gets another bounded chance while
 	// preserving the configured total startup budget.
-	carrierConnectAttemptMax = 8 * time.Second
+	// One carrier attempt must outlive the carrier's ten-second mobile
+	// underlay budget. Otherwise the adapter cancels a healthy DTLS/SRTP
+	// exchange before its own bounded timeout can make the decision.
+	carrierConnectAttemptMax = 20 * time.Second
 
 	carrierReconnectRetryInitial = 20 * time.Millisecond
 	carrierReconnectRetryMax     = 250 * time.Millisecond
@@ -490,6 +493,30 @@ func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf f
 			return nil
 		}
 	}
+	raw := strings.TrimSpace(options.AuthSnapshot)
+	if raw != "" {
+		// A WLT profile must remain bootstrappable when its control-plane host is
+		// unreachable on the unprotected network. Import the snapshot delivered
+		// with the profile before attempting an optional remote refresh; waiting
+		// for that refresh here otherwise adds its full timeout to every mobile
+		// startup and can create a control-plane/VPN dependency cycle.
+		if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
+			return fmt.Errorf("import auth snapshot: %w", err)
+		}
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_loaded source=inline")
+		}
+		return nil
+	}
+	if !options.AuthSnapshotPreferFile {
+		loaded, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
+		if err != nil {
+			return err
+		}
+		if loaded {
+			return nil
+		}
+	}
 	if snapshotURL := strings.TrimSpace(options.AuthSnapshotURL); snapshotURL != "" && !options.AuthSnapshotSkipRemote {
 		if raw, err := fetchCarrierAuthSnapshot(ctx, snapshotURL, options.AuthSnapshotFetchTimeout); err != nil {
 			if logf != nil {
@@ -509,18 +536,7 @@ func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf f
 			return nil
 		}
 	}
-	raw := strings.TrimSpace(options.AuthSnapshot)
-	if raw != "" {
-		if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
-			return fmt.Errorf("import auth snapshot: %w", err)
-		}
-		if logf != nil {
-			logf("WLT carrier start phase=auth_snapshot_loaded source=inline")
-		}
-		return nil
-	}
-	_, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
-	return err
+	return nil
 }
 
 func loadCarrierAuthSnapshotFile(path string, logf func(string, ...any)) (bool, error) {

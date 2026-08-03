@@ -22,6 +22,12 @@ import (
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
+func TestCarrierConnectAttemptBudgetCoversMobileUnderlay(t *testing.T) {
+	if carrierConnectAttemptMax < 20*time.Second {
+		t.Fatalf("carrier attempt timeout=%s, want at least 20s", carrierConnectAttemptMax)
+	}
+}
+
 func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {
 	cfg := &carrierconfig.ClientConfig{Routes: []carrierconfig.ClientRoute{
 		{RouteID: "vless-reality-main", Socket: "tcp", Transport: "srtp"},
@@ -83,6 +89,26 @@ func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(string(exported), `"anonym_token":"anonymous"`) {
 		t.Fatalf("exported snapshot does not contain imported token: %s", exported)
+	}
+}
+
+func TestLoadCarrierAuthSnapshotDoesNotBlockInlineSnapshotOnRemoteRefresh(t *testing.T) {
+	var logs []string
+	if err := loadCarrierAuthSnapshot(context.Background(), CarrierOptions{
+		AuthSnapshot:             testCarrierAuthSnapshot("inline-token"),
+		AuthSnapshotURL:          "https://127.0.0.1:1/unreachable",
+		AuthSnapshotFetchTimeout: time.Second,
+	}, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(logs, "\n")
+	if strings.Contains(joined, "remote refresh") {
+		t.Fatalf("remote refresh ran before inline snapshot:\n%s", joined)
+	}
+	if !strings.Contains(joined, "source=inline") {
+		t.Fatalf("inline snapshot was not loaded:\n%s", joined)
 	}
 }
 
