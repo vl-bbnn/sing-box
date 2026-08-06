@@ -93,6 +93,7 @@ func (h *Outbound) resolveCarrier() (carrierService, error) {
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	admissionTarget := wltAdmissionTarget(ctx, destination)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -108,7 +109,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.Cause(err, "wait for wlt carrier")
 	}
 	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
-	stream, err := carrier.DialStream(ctx, h.route, destination.String())
+	stream, err := carrier.DialStream(ctx, h.route, admissionTarget.String())
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +119,18 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.New("wlt carrier returned non-network stream")
 	}
 	return conn, nil
+}
+
+// wltAdmissionTarget preserves the destination that caused a nested outbound
+// (normally VLESS) to dial its WLT detour. The immediate destination passed to
+// this outbound is the proxy endpoint, which hides DNS :53/:853 traffic from
+// class-aware carrier admission and makes every open look like ordinary HTTPS.
+func wltAdmissionTarget(ctx context.Context, immediate M.Socksaddr) M.Socksaddr {
+	metadata := adapter.ContextFrom(ctx)
+	if metadata != nil && metadata.Destination.IsValid() {
+		return metadata.Destination
+	}
+	return immediate
 }
 
 func (h *Outbound) InterfaceUpdated() {
