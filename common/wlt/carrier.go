@@ -331,6 +331,18 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	runtimeClient, err := connectCarrierClient(runCtx, cfg, options.ConnectTimeout, logf)
+	if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+		if logf != nil {
+			logf("WLT carrier start phase=turn_auth_recovery")
+		}
+		if refreshErr := refreshCarrierAuthSnapshotAfterRejection(runCtx, cfg, options, logf); refreshErr != nil {
+			if logf != nil {
+				logf("WLT carrier start phase=turn_auth_recovery_unavailable error=%v", refreshErr)
+			}
+		} else {
+			runtimeClient, err = connectCarrierClient(runCtx, cfg, options.ConnectTimeout, logf)
+		}
+	}
 	if err != nil {
 		cancel()
 		if restoreSocketControl != nil {
@@ -514,7 +526,52 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 }
 
 func isFatalCarrierConnectError(err error) bool {
-	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
+	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable) ||
+		errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired)
+}
+
+func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
+	if cfg == nil {
+		return errors.New("carrier config is required for auth snapshot recovery")
+	}
+	var (
+		raw    []byte
+		source string
+	)
+	if path := strings.TrimSpace(options.AuthSnapshotFile); path != "" {
+		content, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(content)) != "" {
+			raw = content
+			source = "file"
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("read rejected auth snapshot: %w", err)
+		}
+	}
+	if len(raw) == 0 {
+		if inline := strings.TrimSpace(options.AuthSnapshot); inline != "" {
+			raw = []byte(inline)
+			source = "inline"
+		}
+	}
+	if len(raw) == 0 {
+		return errors.New("auth snapshot is unavailable for TURN recovery")
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
+	defer cancel()
+	refreshed, err := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+	if err != nil {
+		return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w", source, err)
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
+		return fmt.Errorf("import recovered TURN auth snapshot source=%s: %w", source, err)
+	}
+	if err := writeCarrierAuthSnapshot(options, refreshed); err != nil {
+		return fmt.Errorf("persist recovered TURN auth snapshot source=%s: %w", source, err)
+	}
+	if logf != nil {
+		logf("WLT carrier start phase=turn_auth_recovered source=%s", source)
+	}
+	return nil
 }
 
 func loadCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {

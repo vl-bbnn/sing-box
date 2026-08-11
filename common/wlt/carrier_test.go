@@ -56,6 +56,13 @@ func TestFatalCarrierConnectErrorIncludesManualCaptchaUnavailable(t *testing.T) 
 	}
 }
 
+func TestFatalCarrierConnectErrorIncludesRejectedAuthSnapshot(t *testing.T) {
+	err := errors.Join(errors.New("connect failed"), carriercommon.ErrAuthSnapshotReauthorizationRequired)
+	if !isFatalCarrierConnectError(err) {
+		t.Fatal("rejected TURN auth snapshot should stop blind connect retries")
+	}
+}
+
 func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
 	expiresAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
 	snapshot := fmt.Sprintf(`{
@@ -275,6 +282,35 @@ func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T
 	joinedLogs := strings.Join(logs, "\n")
 	if !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "phase=auth_snapshot_refresh_unavailable") || !strings.Contains(joinedLogs, "fallback=saved_snapshot") {
 		t.Fatalf("saved snapshot fallback was not preserved; logs=%v", logs)
+	}
+}
+
+func TestRefreshCarrierAuthSnapshotAfterRejectionPersistsReplacement(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshot("stale-token")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousRefresh := refreshCarrierAuthSnapshot
+	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+		return []byte(testCarrierAuthSnapshot("fresh-token")), nil
+	}
+	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	var logs []string
+	err := refreshCarrierAuthSnapshotAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
+	}, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "fresh-token") || !strings.Contains(strings.Join(logs, "\n"), "phase=turn_auth_recovered") {
+		t.Fatalf("TURN auth replacement was not persisted; logs=%v", logs)
 	}
 }
 
