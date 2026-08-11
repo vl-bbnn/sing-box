@@ -120,9 +120,13 @@ const (
 	carrierReconnectRetryInitial = 20 * time.Millisecond
 	carrierReconnectRetryMax     = 250 * time.Millisecond
 
-	defaultAuthSnapshotFetchTimeout = 5 * time.Second
-	maxAuthSnapshotBytes            = 256 * 1024
+	defaultAuthSnapshotFetchTimeout   = 5 * time.Second
+	defaultAuthSnapshotRefreshTimeout = 15 * time.Second
+	authSnapshotRefreshBeforeExpiry   = 5 * time.Minute
+	maxAuthSnapshotBytes              = 256 * 1024
 )
+
+var refreshCarrierAuthSnapshot = carrierengine.RefreshAuthSnapshotContext
 
 type CarrierOptions struct {
 	Config     string
@@ -282,7 +286,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			time.Since(startedAt),
 		)
 	}
-	if err := loadCarrierAuthSnapshot(ctx, options, logf); err != nil {
+	if err := loadCarrierAuthSnapshot(ctx, cfg, options, logf); err != nil {
 		if logf != nil {
 			logf("WLT carrier start failed phase=auth_snapshot elapsed=%s error=%v", time.Since(startedAt), err)
 		}
@@ -499,9 +503,9 @@ func isFatalCarrierConnectError(err error) bool {
 	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
 }
 
-func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf func(string, ...any)) error {
+func loadCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
 	if options.AuthSnapshotPreferFile {
-		loaded, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
+		loaded, err := loadCarrierAuthSnapshotFile(ctx, cfg, options, options.AuthSnapshotFile, logf)
 		if err != nil {
 			return err
 		}
@@ -516,16 +520,10 @@ func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf f
 		// with the profile before attempting an optional remote refresh; waiting
 		// for that refresh here otherwise adds its full timeout to every mobile
 		// startup and can create a control-plane/VPN dependency cycle.
-		if err := carrierengine.ImportAuthSnapshotJSON([]byte(raw)); err != nil {
-			return fmt.Errorf("import auth snapshot: %w", err)
-		}
-		if logf != nil {
-			logf("WLT carrier start phase=auth_snapshot_loaded source=inline")
-		}
-		return nil
+		return prepareCarrierAuthSnapshot(ctx, cfg, options, []byte(raw), "inline", logf)
 	}
 	if !options.AuthSnapshotPreferFile {
-		loaded, err := loadCarrierAuthSnapshotFile(options.AuthSnapshotFile, logf)
+		loaded, err := loadCarrierAuthSnapshotFile(ctx, cfg, options, options.AuthSnapshotFile, logf)
 		if err != nil {
 			return err
 		}
@@ -538,24 +536,19 @@ func loadCarrierAuthSnapshot(ctx context.Context, options CarrierOptions, logf f
 			if logf != nil {
 				logf("WLT carrier auth snapshot remote refresh unavailable error=%v", err)
 			}
-		} else if err := carrierengine.ImportAuthSnapshotJSON(raw); err != nil {
+		} else if err := prepareCarrierAuthSnapshot(ctx, cfg, options, raw, "remote", logf); err != nil {
 			if logf != nil {
-				logf("WLT carrier auth snapshot remote refresh ignored error=%v", err)
+				logf("WLT carrier auth snapshot remote refresh rejected error=%v", err)
 			}
+			return err
 		} else {
-			if err := writeCarrierAuthSnapshot(options, raw); err != nil && logf != nil {
-				logf("WLT carrier auth snapshot remote cache write failed error=%v", err)
-			}
-			if logf != nil {
-				logf("WLT carrier start phase=auth_snapshot_loaded source=remote")
-			}
 			return nil
 		}
 	}
 	return nil
 }
 
-func loadCarrierAuthSnapshotFile(path string, logf func(string, ...any)) (bool, error) {
+func loadCarrierAuthSnapshotFile(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, path string, logf func(string, ...any)) (bool, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return false, nil
@@ -583,10 +576,48 @@ func loadCarrierAuthSnapshotFile(path string, logf func(string, ...any)) (bool, 
 		}
 		return false, nil
 	}
-	if logf != nil {
-		logf("WLT carrier start phase=auth_snapshot_loaded source=file")
+	if err := prepareCarrierAuthSnapshot(ctx, cfg, options, []byte(raw), "file", logf); err != nil {
+		return false, err
 	}
 	return true, nil
+}
+
+func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, raw []byte, source string, logf func(string, ...any)) error {
+	if cfg == nil {
+		return errors.New("carrier config is required for auth snapshot")
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON(raw); err != nil {
+		return fmt.Errorf("import auth snapshot source=%s: %w", source, err)
+	}
+	needsRefresh, err := carrierengine.AuthSnapshotNeedsRefresh(*cfg, raw, authSnapshotRefreshBeforeExpiry)
+	if err != nil {
+		return fmt.Errorf("inspect auth snapshot source=%s: %w", source, err)
+	}
+	if needsRefresh {
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_refresh source=%s", source)
+		}
+		refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
+		refreshed, refreshErr := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+		cancel()
+		if refreshErr != nil {
+			return fmt.Errorf("refresh auth snapshot source=%s: %w", source, refreshErr)
+		}
+		if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
+			return fmt.Errorf("import refreshed auth snapshot source=%s: %w", source, err)
+		}
+		raw = refreshed
+		if logf != nil {
+			logf("WLT carrier start phase=auth_snapshot_refreshed source=%s", source)
+		}
+	}
+	if err := writeCarrierAuthSnapshot(options, raw); err != nil {
+		return fmt.Errorf("persist auth snapshot source=%s: %w", source, err)
+	}
+	if logf != nil {
+		logf("WLT carrier start phase=auth_snapshot_loaded source=%s", source)
+	}
+	return nil
 }
 
 func fetchCarrierAuthSnapshot(ctx context.Context, rawURL string, timeout time.Duration) ([]byte, error) {

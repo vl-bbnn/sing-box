@@ -62,6 +62,8 @@ require (
 	howett.net/plist v1.0.1
 )
 
+replace github.com/vl-bbnn/wlt-carrier => /Users/vl.bbnn/projects/2b2n-stack/sing-box-workspace/wlt-carrier/.worktrees/wlt-auth-autorefresh-20260811
+
 require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/klauspost/reedsolomon v1.13.3 // indirect
