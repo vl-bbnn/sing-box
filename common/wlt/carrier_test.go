@@ -247,7 +247,7 @@ func TestLoadCarrierAuthSnapshotRefreshesExpiredPersistedIdentity(t *testing.T) 
 	}
 }
 
-func TestLoadCarrierAuthSnapshotStopsBeforeAnonymousAuthWhenRefreshFails(t *testing.T) {
+func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T) {
 	path := t.TempDir() + "/auth-snapshot.json"
 	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshotAt("expired-token", time.Now().Add(-time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
@@ -257,13 +257,24 @@ func TestLoadCarrierAuthSnapshotStopsBeforeAnonymousAuthWhenRefreshFails(t *test
 		return nil, errors.New("provider unavailable")
 	}
 	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	var logs []string
 	err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotPreferFile: true,
 		AuthSnapshotSkipRemote: true,
-	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "refresh auth snapshot source=file") {
-		t.Fatalf("error=%v", err)
+	}, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedLogs := strings.Join(logs, "\n")
+	if !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "phase=auth_snapshot_refresh_unavailable") || !strings.Contains(joinedLogs, "fallback=saved_snapshot") {
+		t.Fatalf("saved snapshot fallback was not preserved; logs=%v", logs)
 	}
 }
 

@@ -126,7 +126,10 @@ const (
 	maxAuthSnapshotBytes              = 256 * 1024
 )
 
-var refreshCarrierAuthSnapshot = carrierengine.RefreshAuthSnapshotContext
+var (
+	refreshCarrierAuthSnapshot = carrierengine.RefreshAuthSnapshotContext
+	promoteCarrierAuthSnapshot = carrierengine.PromoteAuthSnapshot
+)
 
 type CarrierOptions struct {
 	Config     string
@@ -329,9 +332,6 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 
 	runtimeClient, err := connectCarrierClient(runCtx, cfg, options.ConnectTimeout, logf)
 	if err != nil {
-		if snapshotErr := saveCarrierAuthSnapshot(options, cfg, logf); snapshotErr != nil && logf != nil {
-			logf("WLT carrier auth snapshot save after failed connect failed error=%v", snapshotErr)
-		}
 		cancel()
 		if restoreSocketControl != nil {
 			restoreSocketControl()
@@ -340,6 +340,20 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			logf("WLT carrier start failed phase=connect elapsed=%s error=%v", time.Since(startedAt), err)
 		}
 		return nil, err
+	}
+	if err := promoteCarrierAuthSnapshot(*cfg); err != nil {
+		_ = runtimeClient.Stop()
+		cancel()
+		if restoreSocketControl != nil {
+			restoreSocketControl()
+		}
+		if logf != nil {
+			logf("WLT carrier start failed phase=auth_snapshot_promotion elapsed=%s error=%v", time.Since(startedAt), err)
+		}
+		return nil, fmt.Errorf("promote WLT carrier auth snapshot: %w", err)
+	}
+	if logf != nil {
+		logf("WLT carrier auth snapshot promoted after successful connect")
 	}
 	if err := saveCarrierAuthSnapshot(options, cfg, logf); err != nil && logf != nil {
 		logf("WLT carrier auth snapshot save failed error=%v", err)
@@ -601,14 +615,23 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		refreshed, refreshErr := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
 		cancel()
 		if refreshErr != nil {
-			return fmt.Errorf("refresh auth snapshot source=%s: %w", source, refreshErr)
-		}
-		if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
-			return fmt.Errorf("import refreshed auth snapshot source=%s: %w", source, err)
-		}
-		raw = refreshed
-		if logf != nil {
-			logf("WLT carrier start phase=auth_snapshot_refreshed source=%s", source)
+			// expires_at is a local refresh policy, not proof that the provider
+			// revoked the saved signaling/TURN credentials. Restricted mobile
+			// networks may also make refresh impossible before the tunnel exists.
+			// Continue with the already imported snapshot; Authorize uses its
+			// bounded offline reuse window and never enters anonymous/CAPTCHA for
+			// this startup. Only a successful carrier connect may promote it.
+			if logf != nil {
+				logf("WLT carrier start phase=auth_snapshot_refresh_unavailable source=%s fallback=saved_snapshot error=%v", source, refreshErr)
+			}
+		} else {
+			if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
+				return fmt.Errorf("import refreshed auth snapshot source=%s: %w", source, err)
+			}
+			raw = refreshed
+			if logf != nil {
+				logf("WLT carrier start phase=auth_snapshot_refreshed source=%s", source)
+			}
 		}
 	}
 	if err := writeCarrierAuthSnapshot(options, raw); err != nil {
