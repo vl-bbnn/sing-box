@@ -127,8 +127,9 @@ const (
 )
 
 var (
-	refreshCarrierAuthSnapshot = carrierengine.RefreshAuthSnapshotContext
-	promoteCarrierAuthSnapshot = carrierengine.PromoteAuthSnapshot
+	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
+	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
+	fetchCarrierAuthSnapshotForRecovery = fetchCarrierAuthSnapshot
 )
 
 type CarrierOptions struct {
@@ -560,7 +561,16 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 	defer cancel()
 	refreshed, err := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
 	if err != nil {
-		return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w", source, err)
+		snapshotURL := strings.TrimSpace(options.AuthSnapshotURL)
+		if snapshotURL == "" || options.AuthSnapshotSkipRemote {
+			return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w", source, err)
+		}
+		remote, fetchErr := fetchCarrierAuthSnapshotForRecovery(refreshCtx, snapshotURL, options.AuthSnapshotFetchTimeout)
+		if fetchErr != nil {
+			return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w; remote recovery: %v", source, err, fetchErr)
+		}
+		refreshed = remote
+		source = "remote"
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
 		return fmt.Errorf("import recovered TURN auth snapshot source=%s: %w", source, err)

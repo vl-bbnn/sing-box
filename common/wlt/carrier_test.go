@@ -314,6 +314,51 @@ func TestRefreshCarrierAuthSnapshotAfterRejectionPersistsReplacement(t *testing.
 	}
 }
 
+func TestRefreshCarrierAuthSnapshotAfterRejectionFallsBackToRemote(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshot("stale-token")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousRefresh := refreshCarrierAuthSnapshot
+	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+	}
+	previousFetch := fetchCarrierAuthSnapshotForRecovery
+	fetchCarrierAuthSnapshotForRecovery = func(_ context.Context, rawURL string, timeout time.Duration) ([]byte, error) {
+		if rawURL != "https://control.example.com/auth-snapshot" {
+			t.Fatalf("snapshot URL=%q", rawURL)
+		}
+		if timeout != time.Second {
+			t.Fatalf("fetch timeout=%s", timeout)
+		}
+		return []byte(testCarrierAuthSnapshot("remote-token")), nil
+	}
+	t.Cleanup(func() {
+		refreshCarrierAuthSnapshot = previousRefresh
+		fetchCarrierAuthSnapshotForRecovery = previousFetch
+	})
+	var logs []string
+	err := refreshCarrierAuthSnapshotAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshotFile:         path,
+		AuthSnapshotOutputFile:   path,
+		AuthSnapshotURL:          "https://control.example.com/auth-snapshot",
+		AuthSnapshotFetchTimeout: time.Second,
+	}, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedLogs := strings.Join(logs, "\n")
+	if !strings.Contains(string(content), "remote-token") || !strings.Contains(joinedLogs, "phase=turn_auth_recovered source=remote") {
+		t.Fatalf("remote TURN auth replacement was not persisted; logs=%v", logs)
+	}
+}
+
 func TestFetchCarrierAuthSnapshotUsesHTTPSAndBoundsPayload(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
