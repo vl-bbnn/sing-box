@@ -122,6 +122,9 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 			socketControl = carriercommon.SocketControlFunc(protectFunc)
 		}
 	}
+	// PreferFile already prevents a speculative control-plane request during
+	// normal startup. Leave remote recovery enabled so a proven TURN 401 can
+	// replace rejected short-lived credentials without refreshing the profile.
 	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
@@ -131,7 +134,6 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
 		AuthSnapshotOutputFile:       s.options.AuthSnapshotOutputFile,
 		AuthSnapshotPreferFile:       preferPersistedAuth,
-		AuthSnapshotSkipRemote:       preferPersistedAuth,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,
 		MaxOpenAttempts:              s.options.MaxOpenAttempts,
