@@ -5,6 +5,7 @@ package wlt
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,7 +88,11 @@ func (s *Service) Start(stage adapter.StartStage) error {
 
 	startedAt := time.Now()
 	s.logger.Info("wlt service starting transport=", s.options.Transport)
-	carrier, err := s.startCarrier(false)
+	// A persisted snapshot is the durable provider identity for unattended
+	// restarts. Prefer it even on the first service start; otherwise an expired
+	// inline profile snapshot sends the client into anonymous authorization
+	// before the core can perform the identity-only refresh.
+	carrier, err := s.startCarrier(persistentAuthSnapshotAvailable(s.options))
 	if err != nil {
 		s.logger.Error("wlt service start failed elapsed=", time.Since(startedAt).String(), " error=", err)
 		return err
@@ -166,6 +171,18 @@ func persistentDNSCacheFile(options option.WLTServiceOptions) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(path), "wlt-dns-cache.json")
+}
+
+func persistentAuthSnapshotAvailable(options option.WLTServiceOptions) bool {
+	path := strings.TrimSpace(options.AuthSnapshotOutputFile)
+	if path == "" {
+		path = strings.TrimSpace(options.AuthSnapshotFile)
+	}
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 func (s *Service) Close() error {

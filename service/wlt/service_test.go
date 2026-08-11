@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +62,30 @@ func TestPersistentDNSCacheFileFallsBackToInputAndRejectsRelativePath(t *testing
 	}
 	if got := persistentDNSCacheFile(option.WLTServiceOptions{AuthSnapshotOutputFile: "relative.json"}); got != "" {
 		t.Fatalf("persistentDNSCacheFile accepted relative path %q", got)
+	}
+}
+
+func TestPersistentAuthSnapshotAvailableRequiresAbsoluteNonEmptyRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wlt-auth.json")
+	options := option.WLTServiceOptions{AuthSnapshotOutputFile: path}
+	if persistentAuthSnapshotAvailable(options) {
+		t.Fatal("missing snapshot reported as available")
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if persistentAuthSnapshotAvailable(options) {
+		t.Fatal("empty snapshot reported as available")
+	}
+	if err := os.WriteFile(path, []byte("snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !persistentAuthSnapshotAvailable(options) {
+		t.Fatal("non-empty snapshot was not detected")
+	}
+	if persistentAuthSnapshotAvailable(option.WLTServiceOptions{AuthSnapshotFile: "relative.json"}) {
+		t.Fatal("relative snapshot path reported as available")
 	}
 }
 
