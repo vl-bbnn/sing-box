@@ -127,6 +127,23 @@ func PrewarmWLTAuth(carrierConfig string, carrierConfigFile string, snapshotOutp
 	return nil
 }
 
+// ValidateWLTAuthSnapshot checks that a control-plane snapshot belongs to the
+// configured carrier identity and remains usable long enough to install.
+func ValidateWLTAuthSnapshot(carrierConfig string, carrierConfigFile string, snapshot string) error {
+	cfg, err := loadPrewarmCarrierConfig(carrierConfig, carrierConfigFile)
+	if err != nil {
+		return err
+	}
+	needsRefresh, err := carrierengine.AuthSnapshotNeedsRefresh(*cfg, []byte(snapshot), 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("validate auth snapshot: %w", err)
+	}
+	if needsRefresh {
+		return fmt.Errorf("validate auth snapshot: snapshot expires too soon")
+	}
+	return nil
+}
+
 func loadPrewarmCarrierConfig(configContent string, configFile string) (*carrierconfig.ClientConfig, error) {
 	raw := strings.TrimSpace(configContent)
 	if raw == "" && strings.TrimSpace(configFile) != "" {

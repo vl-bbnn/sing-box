@@ -38,3 +38,10 @@ func TestPrewarmWLTAuthRejectsMissingCarrierConfig(t *testing.T) {
 		t.Fatal("expected missing carrier config error")
 	}
 }
+
+func TestValidateWLTAuthSnapshotRejectsMissingCarrierConfig(t *testing.T) {
+	err := ValidateWLTAuthSnapshot("", "", `{}`)
+	if err == nil {
+		t.Fatal("expected missing carrier config error")
+	}
+}
