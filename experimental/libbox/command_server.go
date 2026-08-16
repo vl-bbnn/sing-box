@@ -151,11 +151,22 @@ func (s *CommandServer) Start() error {
 	}
 	s.grpcServer = grpc.NewServer(serverOptions...)
 	daemon.RegisterStartedServiceServer(s.grpcServer, s.StartedService)
-	go s.grpcServer.Serve(listener)
+	log.Info("command server listener started")
+	go func() {
+		serveErr := s.grpcServer.Serve(listener)
+		if serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped) {
+			log.Info("command server serve returned after stop")
+			return
+		}
+		serveErr = E.Cause(serveErr, "command server serve returned")
+		log.Error(serveErr)
+		s.StartedService.WriteMessage(log.LevelError, serveErr.Error())
+	}()
 	return nil
 }
 
 func (s *CommandServer) Close() {
+	log.Info("command server close requested")
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
 	}
