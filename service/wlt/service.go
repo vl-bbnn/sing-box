@@ -25,6 +25,7 @@ const (
 	wltStatsHeartbeatInterval    = 30 * time.Second
 	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
+	wltInterfaceRecoveryGrace    = 15 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMaxLog = 4
 )
@@ -45,6 +46,7 @@ type Service struct {
 	carrierReady chan struct{}
 	stopped      bool
 	statsCancel  context.CancelFunc
+	interfaceKey string
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
@@ -93,6 +95,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	s.access.Lock()
 	s.carrier = carrier
 	s.stopped = false
+	s.interfaceKey = s.currentInterfaceKey()
 	close(s.carrierReady)
 	s.access.Unlock()
 	s.startStatsHeartbeat(carrier)
@@ -223,7 +226,77 @@ func (s *Service) InterfaceUpdated() {
 	if carrier == nil {
 		return
 	}
-	go s.restartCarrier(carrier, "default interface changed")
+	currentInterfaceKey := s.currentInterfaceKey()
+	s.access.Lock()
+	previousInterfaceKey := s.interfaceKey
+	if currentInterfaceKey != "" {
+		s.interfaceKey = currentInterfaceKey
+	}
+	s.access.Unlock()
+	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
+		// A real default-interface or address change invalidates the UDP/TURN
+		// sockets even while their peer goroutines still look online.  Waiting
+		// for peer_online to reach zero leaves TinyMux opens hanging for the
+		// full connect timeout after LTE <-> Wi-Fi handover.  Abort the stale
+		// underlay immediately; restartCarrier reuses the persisted auth
+		// snapshot and serializes duplicate notifications.
+		s.logger.Warn("wlt service default interface identity changed; replacing carrier immediately")
+		go s.restartCarrier(carrier, "default interface identity changed")
+		return
+	}
+	// An iOS default-interface notification does not prove that the existing
+	// TURN underlay is dead.  It can arrive while LTE remains usable, and the
+	// old break-before-make path aborted every TinyMux flow immediately.  Give
+	// per-peer reconnect and the carrier's own full reconnect a bounded grace
+	// period, then replace only a carrier which has actually lost every peer.
+	s.logger.Info("wlt service default interface changed; preserving active carrier during recovery grace")
+	go func(expected *wltpkg.Carrier) {
+		timer := time.NewTimer(wltInterfaceRecoveryGrace)
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if s.Carrier() != expected {
+			return
+		}
+		stats := expected.Stats()
+		if !interfaceUpdateNeedsCarrierRestart(stats) {
+			s.logger.Info("wlt service interface recovery retained carrier peer_online=", stats.Runtime.Peer.OnlinePeers, " reconnecting=", stats.Runtime.Reconnecting)
+			return
+		}
+		s.logger.Warn("wlt service interface recovery lost all peers; replacing carrier after grace=", wltInterfaceRecoveryGrace.String())
+		s.restartCarrier(expected, "default interface changed with no peers after grace")
+	}(carrier)
+}
+
+func (s *Service) currentInterfaceKey() string {
+	if s.network == nil {
+		return ""
+	}
+	return networkInterfaceKey(s.network.DefaultNetworkInterface())
+}
+
+func networkInterfaceKey(networkInterface *adapter.NetworkInterface) string {
+	if networkInterface == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%d|%s|%s|%v",
+		networkInterface.Index,
+		networkInterface.Name,
+		networkInterface.Type,
+		networkInterface.Addresses,
+	)
+}
+
+func interfaceIdentityChanged(previous string, current string) bool {
+	return previous != "" && current != "" && previous != current
+}
+
+func interfaceUpdateNeedsCarrierRestart(stats wltpkg.CarrierStats) bool {
+	return stats.Runtime.Peer.OnlinePeers == 0
 }
 
 func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
@@ -342,6 +415,7 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 				return
 			}
 			s.carrier = carrier
+			s.interfaceKey = s.currentInterfaceKey()
 			close(s.carrierReady)
 			s.access.Unlock()
 			s.startStatsHeartbeat(carrier)

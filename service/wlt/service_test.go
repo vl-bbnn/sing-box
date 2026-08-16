@@ -5,14 +5,43 @@ package wlt
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	wltpkg "github.com/sagernet/sing-box/common/wlt"
 	"github.com/sagernet/sing-box/option"
 )
+
+func TestNetworkInterfaceIdentityDetectsHandoverAndAddressChange(t *testing.T) {
+	lte := &adapter.NetworkInterface{}
+	lte.Index = 10
+	lte.Name = "cellular0"
+	lte.Addresses = []netip.Prefix{netip.MustParsePrefix("192.0.2.2/32")}
+	wifi := &adapter.NetworkInterface{}
+	wifi.Index = 11
+	wifi.Name = "wifi0"
+	wifi.Addresses = []netip.Prefix{netip.MustParsePrefix("198.51.100.2/24")}
+
+	lteKey := networkInterfaceKey(lte)
+	if interfaceIdentityChanged(lteKey, lteKey) {
+		t.Fatal("unchanged interface was classified as a handover")
+	}
+	if !interfaceIdentityChanged(lteKey, networkInterfaceKey(wifi)) {
+		t.Fatal("LTE to Wi-Fi handover was not detected")
+	}
+
+	lte.Addresses = []netip.Prefix{netip.MustParsePrefix("192.0.2.3/32")}
+	if !interfaceIdentityChanged(lteKey, networkInterfaceKey(lte)) {
+		t.Fatal("same-interface address change was not detected")
+	}
+	if interfaceIdentityChanged("", networkInterfaceKey(lte)) {
+		t.Fatal("missing initial identity must not force an unsolicited restart")
+	}
+}
 
 func TestPersistentDNSCacheFileUsesWritableAuthDirectory(t *testing.T) {
 	authPath := filepath.Join(t.TempDir(), "wlt-auth.json")
@@ -97,6 +126,27 @@ func TestWaitCarrierRejectsStoppedService(t *testing.T) {
 	}
 	if _, err := service.WaitCarrier(context.Background()); err == nil || !strings.Contains(err.Error(), "stopped") {
 		t.Fatalf("WaitCarrier error = %v, want stopped service", err)
+	}
+}
+
+func TestInterfaceUpdatePreservesCarrierWithAnyOnlinePeer(t *testing.T) {
+	stats := wltpkg.CarrierStats{}
+	stats.Runtime.Peer.OnlinePeers = 2
+	if interfaceUpdateNeedsCarrierRestart(stats) {
+		t.Fatal("interface update would destroy a carrier with active peers")
+	}
+	stats.Runtime.Peer.OnlinePeers = 1
+	stats.Runtime.Reconnecting = true
+	if interfaceUpdateNeedsCarrierRestart(stats) {
+		t.Fatal("interface update would destroy the remaining live peer")
+	}
+}
+
+func TestInterfaceUpdateRestartsOnlyAfterEveryPeerIsGone(t *testing.T) {
+	stats := wltpkg.CarrierStats{}
+	stats.Runtime.Peer.OnlinePeers = 0
+	if !interfaceUpdateNeedsCarrierRestart(stats) {
+		t.Fatal("carrier with no peers must be recoverable after the grace period")
 	}
 }
 
