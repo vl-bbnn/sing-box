@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,21 @@ func (m *queryMultiplexer) Reset() {
 }
 
 func (m *queryMultiplexer) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	response, err := m.exchangeOnce(ctx, message)
+	if err == nil || ctx.Err() != nil || (!errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed)) {
+		return response, err
+	}
+
+	// A pooled TCP DNS connection can be closed by the resolver after the
+	// request was written but before its response is read. The receive loop has
+	// already invalidated that connection at this point. DNS queries are
+	// idempotent, so retry exactly once on the fresh connection instead of
+	// exposing the stale-pool EOF to the system resolver as a multi-second
+	// lookup failure. Context cancellation and protocol errors are not retried.
+	return m.exchangeOnce(ctx, message)
+}
+
+func (m *queryMultiplexer) exchangeOnce(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	done := make(chan struct{})
 	var (
 		response *mDNS.Msg
