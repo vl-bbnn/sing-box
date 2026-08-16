@@ -73,6 +73,73 @@ func TestMultiplexerTimeoutInvalidatesConn(t *testing.T) {
 	}
 }
 
+func TestMultiplexerRetriesEOFOnFreshConnection(t *testing.T) {
+	t.Parallel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		firstConn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		if _, readErr := ReadMessage(firstConn); readErr != nil {
+			firstConn.Close()
+			serverDone <- readErr
+			return
+		}
+		firstConn.Close()
+
+		secondConn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer secondConn.Close()
+		request, readErr := ReadMessage(secondConn)
+		if readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		response := new(mDNS.Msg)
+		response.SetReply(request)
+		serverDone <- WriteMessage(secondConn, request.Id, response)
+	}()
+
+	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
+		dial: func(ctx context.Context) (net.Conn, error) {
+			return net.Dial("tcp", listener.Addr().String())
+		},
+		write: func(conn net.Conn, message *mDNS.Msg, queryId uint16) error {
+			return WriteMessage(conn, queryId, message)
+		},
+		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
+			return ReadMessage(conn)
+		},
+	})
+	defer multiplexer.Close()
+
+	message := new(mDNS.Msg)
+	message.SetQuestion("example.com.", mDNS.TypeA)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	response, err := multiplexer.Exchange(ctx, message)
+	if err != nil {
+		t.Fatal("expected EOF retry to succeed, got ", err)
+	}
+	if response == nil || response.Id != message.Id {
+		t.Fatal("expected a valid response with the original query ID")
+	}
+	if err = <-serverDone; err != nil {
+		t.Fatal("server failed: ", err)
+	}
+}
+
 func TestMultiplexerSlowQueryKeepsActiveConn(t *testing.T) {
 	t.Parallel()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
