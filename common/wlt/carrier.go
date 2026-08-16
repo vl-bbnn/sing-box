@@ -844,6 +844,13 @@ reconnectLoop:
 	if reconnectAttempts > 0 && c.logf != nil {
 		c.logf("WLT stream open recovered after reconnect wait route=%s target=%s elapsed=%s retries=%d backoff=%s", routeClass, target, dialElapsed, reconnectAttempts, reconnectBackoffTotal)
 	}
+	if c.logf != nil {
+		flowID := uint16(0)
+		if flow, loaded := conn.(interface{ FlowID() uint16 }); loaded {
+			flowID = flow.FlowID()
+		}
+		c.logf("WLT stream opened route=%s target=%s flow_id=%d elapsed=%s", routeClass, target, flowID, dialElapsed)
+	}
 	c.openedStreams.Add(1)
 	stream := &carrierConn{
 		Conn:          conn,
@@ -1304,6 +1311,19 @@ type carrierConn struct {
 	lastActivity  atomic.Int64
 	ioMu          sync.RWMutex
 	closeOnce     sync.Once
+}
+
+// FlowID exposes the diagnostics-safe TinyMux flow identifier while retaining
+// the carrierConn lifecycle wrapper. It is zero for test transports that do
+// not provide a TinyMux flow.
+func (c *carrierConn) FlowID() uint16 {
+	if c == nil || c.Conn == nil {
+		return 0
+	}
+	if flow, loaded := c.Conn.(interface{ FlowID() uint16 }); loaded {
+		return flow.FlowID()
+	}
+	return 0
 }
 
 func (c *carrierConn) Read(p []byte) (int, error) {
