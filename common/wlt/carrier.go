@@ -202,6 +202,7 @@ type carrierStartupTelemetry struct {
 	carrierReady         sync.Once
 	singBoxReady         sync.Once
 	firstPacket          sync.Once
+	trafficReady         sync.Once
 }
 
 func newCarrierStartupTelemetry(startedAt time.Time, logf func(string, ...any)) *carrierStartupTelemetry {
@@ -286,6 +287,13 @@ func (t *carrierStartupTelemetry) markFirstPacket(direction string) {
 		return
 	}
 	t.mark(&t.firstPacket, "first_packet", "direction="+direction)
+}
+
+func (t *carrierStartupTelemetry) markTrafficReady() {
+	if t == nil {
+		return
+	}
+	t.mark(&t.trafficReady, "traffic_ready", "")
 }
 
 type CarrierConfigOptions struct {
@@ -1705,6 +1713,7 @@ func (c *carrierConn) Read(p []byte) (int, error) {
 		c.refreshDeadline()
 		if c.carrier != nil {
 			c.carrier.startup.markFirstPacket("read")
+			c.carrier.startup.markTrafficReady()
 		}
 	}
 	return n, err

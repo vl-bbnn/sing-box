@@ -46,6 +46,8 @@ func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
 	startup.markSingBoxReady()
 	startup.markFirstPacket("write")
 	startup.markFirstPacket("read")
+	startup.markTrafficReady()
+	startup.markTrafficReady()
 
 	var startupLogs []string
 	for _, line := range logs {
@@ -64,6 +66,7 @@ func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
 		"carrier_ready",
 		"sing_box_ready",
 		"first_packet",
+		"traffic_ready",
 	} {
 		if strings.Count(joined, "phase="+phase) != 1 {
 			t.Fatalf("startup phase %s is missing or duplicated:\n%s", phase, joined)
@@ -107,6 +110,9 @@ func TestCarrierConnMarksFirstPacketAfterSuccessfulIO(t *testing.T) {
 	}
 	if strings.Contains(joined, "private-payload") {
 		t.Fatalf("first packet telemetry contains payload data:\n%s", joined)
+	}
+	if strings.Count(joined, "phase=traffic_ready") != 1 {
+		t.Fatalf("first successful read did not mark traffic readiness once:\n%s", joined)
 	}
 }
 
