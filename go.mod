@@ -62,8 +62,6 @@ require (
 	howett.net/plist v1.0.1
 )
 
-replace github.com/vl-bbnn/wlt-carrier => /Users/vl.bbnn/projects/2b2n-stack/sing-box-workspace/wlt-carrier/.worktrees/wlt-auth-autorefresh-20260811
-
 require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/klauspost/reedsolomon v1.13.3 // indirect
@@ -173,7 +171,7 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
-	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260806141309-dccc96b05ca4
+	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260817114012-7fcd7af7ba81
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
