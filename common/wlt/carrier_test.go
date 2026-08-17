@@ -28,6 +28,88 @@ func TestCarrierConnectAttemptBudgetCoversMobileUnderlay(t *testing.T) {
 	}
 }
 
+func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
+	var logs []string
+	logf := func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}
+	startup := newCarrierStartupTelemetry(time.Now().Add(-time.Second), logf)
+	logger := newLogfSlogLoggerWithObserver(logf, startup.observe)
+
+	startup.markSnapshotChecked()
+	startup.markProviderRefreshStarted()
+	startup.markProviderRefreshReady("cached")
+	logger.Info("relay client session phase=platform_authorize_done", "token", "private-sentinel")
+	logger.Info("relay client session phase=signaling_turn_refresh_unavailable", "address", "private-sentinel")
+	logger.Info("relay client session connected", "session_uuid", "private-sentinel")
+	startup.markCarrierReady()
+	startup.markSingBoxReady()
+	startup.markFirstPacket("write")
+	startup.markFirstPacket("read")
+
+	var startupLogs []string
+	for _, line := range logs {
+		if strings.HasPrefix(line, "WLT startup ") {
+			startupLogs = append(startupLogs, line)
+		}
+	}
+	joined := strings.Join(startupLogs, "\n")
+	for _, phase := range []string{
+		"snapshot_checked",
+		"provider_refresh_started",
+		"provider_refresh_ready",
+		"provider_ready",
+		"turn_ready",
+		"peer_ready",
+		"carrier_ready",
+		"sing_box_ready",
+		"first_packet",
+	} {
+		if strings.Count(joined, "phase="+phase) != 1 {
+			t.Fatalf("startup phase %s is missing or duplicated:\n%s", phase, joined)
+		}
+	}
+	if strings.Contains(joined, "private-sentinel") {
+		t.Fatalf("startup telemetry copied a private carrier attribute:\n%s", joined)
+	}
+	if !strings.Contains(joined, "phase=first_packet") || !strings.Contains(joined, "direction=write") {
+		t.Fatalf("first packet milestone did not preserve its first direction:\n%s", joined)
+	}
+}
+
+func TestCarrierConnMarksFirstPacketAfterSuccessfulIO(t *testing.T) {
+	var logs []string
+	startup := newCarrierStartupTelemetry(time.Now(), func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	})
+	carrier := &Carrier{startup: startup}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	stream := &carrierConn{Conn: left, carrier: carrier, releaseActive: func() {}}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := right.Write([]byte("private-payload"))
+		writeDone <- err
+	}()
+	buffer := make([]byte, 32)
+	if _, err := stream.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(logs, "\n")
+	if strings.Count(joined, "phase=first_packet") != 1 || !strings.Contains(joined, "direction=read") {
+		t.Fatalf("first successful IO was not recorded once:\n%s", joined)
+	}
+	if strings.Contains(joined, "private-payload") {
+		t.Fatalf("first packet telemetry contains payload data:\n%s", joined)
+	}
+}
+
 func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {
 	cfg := &carrierconfig.ClientConfig{Routes: []carrierconfig.ClientRoute{
 		{RouteID: "vless-reality-main", Socket: "tcp", Transport: "srtp"},

@@ -28,16 +28,21 @@ import (
 )
 
 type logfSlogHandler struct {
-	logf  func(string, ...any)
-	attrs []slog.Attr
-	group string
+	logf     func(string, ...any)
+	observer func(slog.Record)
+	attrs    []slog.Attr
+	group    string
 }
 
 func newLogfSlogLogger(logf func(string, ...any)) *slog.Logger {
+	return newLogfSlogLoggerWithObserver(logf, nil)
+}
+
+func newLogfSlogLoggerWithObserver(logf func(string, ...any), observer func(slog.Record)) *slog.Logger {
 	if logf == nil {
 		logf = log.Printf
 	}
-	return slog.New(&logfSlogHandler{logf: logf})
+	return slog.New(&logfSlogHandler{logf: logf, observer: observer})
 }
 
 func (h *logfSlogHandler) Enabled(context.Context, slog.Level) bool {
@@ -50,6 +55,9 @@ func (h *logfSlogHandler) Handle(_ context.Context, record slog.Record) error {
 	}
 	if record.Level < slog.LevelInfo {
 		return nil
+	}
+	if h.observer != nil {
+		h.observer(record)
 	}
 	var b strings.Builder
 	b.WriteString("wlt-carrier ")
@@ -175,6 +183,109 @@ type CarrierOptions struct {
 	SocketControl                carriercommon.SocketControlFunc
 
 	Logger func(string, ...any)
+
+	startup *carrierStartupTelemetry
+}
+
+type carrierStartupContextKey struct{}
+
+type carrierStartupTelemetry struct {
+	startedAt time.Time
+	logf      func(string, ...any)
+
+	snapshotChecked      sync.Once
+	providerRefreshStart sync.Once
+	providerRefreshReady sync.Once
+	providerReady        sync.Once
+	turnReady            sync.Once
+	peerReady            sync.Once
+	carrierReady         sync.Once
+	singBoxReady         sync.Once
+	firstPacket          sync.Once
+}
+
+func newCarrierStartupTelemetry(startedAt time.Time, logf func(string, ...any)) *carrierStartupTelemetry {
+	return &carrierStartupTelemetry{startedAt: startedAt, logf: logf}
+}
+
+func contextWithCarrierStartup(ctx context.Context, startup *carrierStartupTelemetry) context.Context {
+	return context.WithValue(ctx, carrierStartupContextKey{}, startup)
+}
+
+func carrierStartupFromContext(ctx context.Context) *carrierStartupTelemetry {
+	startup, _ := ctx.Value(carrierStartupContextKey{}).(*carrierStartupTelemetry)
+	return startup
+}
+
+func (t *carrierStartupTelemetry) mark(once *sync.Once, phase string, detail string) {
+	if t == nil || t.logf == nil {
+		return
+	}
+	once.Do(func() {
+		if detail == "" {
+			t.logf("WLT startup phase=%s elapsed_ms=%d", phase, time.Since(t.startedAt).Milliseconds())
+			return
+		}
+		t.logf("WLT startup phase=%s elapsed_ms=%d %s", phase, time.Since(t.startedAt).Milliseconds(), detail)
+	})
+}
+
+func (t *carrierStartupTelemetry) observe(record slog.Record) {
+	if t == nil {
+		return
+	}
+	switch record.Message {
+	case "relay client session phase=platform_authorize_done":
+		t.mark(&t.providerReady, "provider_ready", "")
+	case "relay client session phase=signaling_turn_refresh_done":
+		t.mark(&t.turnReady, "turn_ready", "outcome=refreshed")
+	case "relay client session phase=signaling_turn_refresh_unavailable":
+		t.mark(&t.turnReady, "turn_ready", "outcome=cached")
+	case "relay client session connected":
+		t.mark(&t.peerReady, "peer_ready", "")
+	}
+}
+
+func (t *carrierStartupTelemetry) markSnapshotChecked() {
+	if t == nil {
+		return
+	}
+	t.mark(&t.snapshotChecked, "snapshot_checked", "")
+}
+
+func (t *carrierStartupTelemetry) markProviderRefreshStarted() {
+	if t == nil {
+		return
+	}
+	t.mark(&t.providerRefreshStart, "provider_refresh_started", "")
+}
+
+func (t *carrierStartupTelemetry) markProviderRefreshReady(outcome string) {
+	if t == nil {
+		return
+	}
+	t.mark(&t.providerRefreshReady, "provider_refresh_ready", "outcome="+outcome)
+}
+
+func (t *carrierStartupTelemetry) markCarrierReady() {
+	if t == nil {
+		return
+	}
+	t.mark(&t.carrierReady, "carrier_ready", "")
+}
+
+func (t *carrierStartupTelemetry) markSingBoxReady() {
+	if t == nil {
+		return
+	}
+	t.mark(&t.singBoxReady, "sing_box_ready", "")
+}
+
+func (t *carrierStartupTelemetry) markFirstPacket(direction string) {
+	if t == nil {
+		return
+	}
+	t.mark(&t.firstPacket, "first_packet", "direction="+direction)
 }
 
 type CarrierConfigOptions struct {
@@ -219,6 +330,7 @@ type Carrier struct {
 	dialRoute func(context.Context, string) (net.Conn, error)
 	waitReady func(context.Context) error
 	logf      func(string, ...any)
+	startup   *carrierStartupTelemetry
 
 	connectTimeout      time.Duration
 	dialQueueTimeout    time.Duration
@@ -268,6 +380,8 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		logf = log.Printf
 	}
 	startedAt := time.Now()
+	startup := newCarrierStartupTelemetry(startedAt, logf)
+	options.startup = startup
 	if logf != nil {
 		logf("WLT carrier start phase=load_config source=%s", carrierConfigSource(options))
 	}
@@ -300,11 +414,13 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		}
 		return nil, err
 	}
+	startup.markSnapshotChecked()
+	startup.markProviderRefreshReady("not_needed")
 	options = withCarrierDefaults(options)
 	if options.DNSOpenReserve < 0 || options.DNSOpenReserve >= options.MaxOpenAttempts {
 		return nil, fmt.Errorf("dns_open_reserve must be between 0 and max_open_attempts-1 (reserve=%d max_open=%d)", options.DNSOpenReserve, options.MaxOpenAttempts)
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(contextWithCarrierStartup(ctx, startup))
 	var restoreSocketControl func()
 	if options.SocketControl != nil {
 		restoreSocketControl = carriercommon.SetSocketControl(options.SocketControl)
@@ -408,6 +524,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		dialRoute:            runtimeClient.DialRouteContext,
 		waitReady:            runtimeClient.WaitReady,
 		logf:                 logf,
+		startup:              startup,
 		connectTimeout:       options.ConnectTimeout,
 		dialQueueTimeout:     options.DialQueueTimeout,
 		idleTimeout:          options.IdleTimeout,
@@ -453,6 +570,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		transportOptions.SRTPPacketBuffer,
 		transportOptions.RelayBandwidthBytesPerSecond,
 	)
+	startup.markCarrierReady()
 	return carrier, nil
 }
 
@@ -466,7 +584,11 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 	for attempt := 1; ; attempt++ {
 		attemptStartedAt := time.Now()
 		runtimeClient := carrierengine.NewClient(*cfg)
-		runtimeClient.SetLogger(newLogfSlogLogger(logf))
+		runtimeClient.SetLogger(newLogfSlogLoggerWithObserver(logf, func(record slog.Record) {
+			if startup := carrierStartupFromContext(ctx); startup != nil {
+				startup.observe(record)
+			}
+		}))
 		if logf != nil {
 			logf("WLT carrier connect attempt started attempt=%d timeout=%s routes=%d peers=%d elapsed=%s", attempt, timeout, len(cfg.Routes), cfg.Peers, time.Since(startedAt))
 		}
@@ -745,11 +867,13 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 	if err := carrierengine.ImportAuthSnapshotJSON(raw); err != nil {
 		return fmt.Errorf("import auth snapshot source=%s: %w", source, err)
 	}
+	options.startup.markSnapshotChecked()
 	needsRefresh, err := carrierengine.AuthSnapshotNeedsRefresh(*cfg, raw, authSnapshotRefreshBeforeExpiry)
 	if err != nil {
 		return fmt.Errorf("inspect auth snapshot source=%s: %w", source, err)
 	}
 	if needsRefresh {
+		options.startup.markProviderRefreshStarted()
 		if logf != nil {
 			remaining, _ := carrierAuthSnapshotRemainingTTL(raw)
 			logf("WLT carrier auth event=refresh_started source=%s remaining_ttl_seconds=%d", source, int64(remaining/time.Second))
@@ -770,6 +894,7 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 					logf("WLT carrier auth event=reauthorization_required source=%s", source)
 				}
 			}
+			options.startup.markProviderRefreshReady("cached")
 		} else {
 			if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
 				return fmt.Errorf("import refreshed auth snapshot source=%s: %w", source, err)
@@ -779,6 +904,7 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 				remaining, _ := carrierAuthSnapshotRemainingTTL(raw)
 				logf("WLT carrier auth event=refresh_succeeded source=%s remaining_ttl_seconds=%d", source, int64(remaining/time.Second))
 			}
+			options.startup.markProviderRefreshReady("refreshed")
 		}
 	}
 	if err := writeCarrierAuthSnapshot(options, raw, true); err != nil {
@@ -1098,6 +1224,15 @@ reconnectLoop:
 
 func (c *Carrier) Close() error {
 	return c.close(false)
+}
+
+// MarkSingBoxReady records the point where the owning sing-box service has
+// published this carrier to its outbounds. The startup log contains no profile,
+// provider, address, or credential values.
+func (c *Carrier) MarkSingBoxReady() {
+	if c != nil {
+		c.startup.markSingBoxReady()
+	}
 }
 
 // Abort immediately closes the carrier without waiting for a graceful mux/KCP
@@ -1568,6 +1703,9 @@ func (c *carrierConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.markActivity()
 		c.refreshDeadline()
+		if c.carrier != nil {
+			c.carrier.startup.markFirstPacket("read")
+		}
 	}
 	return n, err
 }
@@ -1581,6 +1719,9 @@ func (c *carrierConn) Write(p []byte) (int, error) {
 	if n > 0 {
 		c.markActivity()
 		c.refreshDeadline()
+		if c.carrier != nil {
+			c.carrier.startup.markFirstPacket("write")
+		}
 	}
 	return n, err
 }

@@ -103,6 +103,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	s.interfaceKey = s.currentInterfaceKey()
 	close(s.carrierReady)
 	s.access.Unlock()
+	carrier.MarkSingBoxReady()
 	s.startStatsHeartbeat(carrier)
 	s.logger.Info("wlt service started elapsed=", time.Since(startedAt).String())
 	return nil
