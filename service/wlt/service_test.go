@@ -175,6 +175,16 @@ func TestInterfaceUpdateRestartsOnlyAfterEveryPeerIsGone(t *testing.T) {
 	}
 }
 
+func TestFormatWLTStatsHeartbeatAcceptsVectorValues(t *testing.T) {
+	message := formatWLTStatsHeartbeat(
+		"peer_in_bytes_by_index=", []uint64{1, 2},
+		" peer_send_queue_by_index=", []int{3, 4},
+	)
+	if message != "peer_in_bytes_by_index=[1 2] peer_send_queue_by_index=[3 4]" {
+		t.Fatalf("unexpected heartbeat: %q", message)
+	}
+}
+
 func TestDescribeWLTIncident(t *testing.T) {
 	previous := wltpkg.CarrierStats{}
 	current := wltpkg.CarrierStats{
