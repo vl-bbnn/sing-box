@@ -136,6 +136,73 @@ func TestLoadCarrierAuthSnapshotIgnoresCorruptFile(t *testing.T) {
 	}
 }
 
+func TestLoadCarrierAuthSnapshotFallsBackToPreviousWhenCurrentIsCorrupt(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotPreviousSuffix, []byte(testCarrierAuthSnapshot("previous-token")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshotFile:       path,
+		AuthSnapshotPreferFile: true,
+		AuthSnapshotSkipRemote: true,
+	}, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := carrierengine.ExportAuthSnapshotJSON(carrierconfig.ClientConfig{
+		PlatformID: "vk.com",
+		CallID:     "restart-snapshot-test",
+		Username:   "tester",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported), `"anonym_token":"previous-token"`) {
+		t.Fatalf("previous snapshot was not imported: %s", exported)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "event=snapshot_loaded source=previous") {
+		t.Fatalf("previous source was not reported: %v", logs)
+	}
+}
+
+func TestWriteCarrierAuthSnapshotRotatesCurrentToProtectedPrevious(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	options := CarrierOptions{AuthSnapshotOutputFile: path}
+	current := []byte(testCarrierAuthSnapshot("current-token"))
+	next := []byte(testCarrierAuthSnapshot("next-token"))
+	if err := writeCarrierAuthSnapshot(options, current, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCarrierAuthSnapshot(options, next, true); err != nil {
+		t.Fatal(err)
+	}
+	currentContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousContent, err := os.ReadFile(path + authSnapshotPreviousSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(currentContent), "next-token") || !strings.Contains(string(previousContent), "current-token") {
+		t.Fatal("current/previous snapshot rotation lost the last-known-good state")
+	}
+	for _, protectedPath := range []string{path, path + authSnapshotPreviousSuffix} {
+		info, err := os.Stat(protectedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("mode for %s=%#o, want 0600", protectedPath, got)
+		}
+	}
+}
+
 func TestLoadCarrierAuthSnapshotRejectsCorruptInlineSnapshot(t *testing.T) {
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{AuthSnapshot: "{not-json"}, nil); err == nil {
 		t.Fatal("expected corrupt inline snapshot to fail")
@@ -249,7 +316,7 @@ func TestLoadCarrierAuthSnapshotRefreshesExpiredPersistedIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), "refreshed-token") || !strings.Contains(strings.Join(logs, "\n"), "phase=auth_snapshot_refreshed") {
+	if !strings.Contains(string(content), "refreshed-token") || !strings.Contains(strings.Join(logs, "\n"), "event=refresh_succeeded") {
 		t.Fatalf("refreshed snapshot was not persisted; logs=%v", logs)
 	}
 }
@@ -280,8 +347,11 @@ func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T
 		t.Fatal(err)
 	}
 	joinedLogs := strings.Join(logs, "\n")
-	if !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "phase=auth_snapshot_refresh_unavailable") || !strings.Contains(joinedLogs, "fallback=saved_snapshot") {
+	if !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "event=refresh_unavailable") || !strings.Contains(joinedLogs, "fallback=saved_snapshot") {
 		t.Fatalf("saved snapshot fallback was not preserved; logs=%v", logs)
+	}
+	if strings.Contains(joinedLogs, "expired-token") || strings.Contains(joinedLogs, "messages") || strings.Contains(joinedLogs, "turn-pass") {
+		t.Fatalf("auth telemetry leaked snapshot material: %s", joinedLogs)
 	}
 }
 
