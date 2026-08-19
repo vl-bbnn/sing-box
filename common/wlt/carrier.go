@@ -133,6 +133,7 @@ const (
 	defaultAuthSnapshotFetchTimeout   = 5 * time.Second
 	defaultAuthSnapshotRefreshTimeout = 15 * time.Second
 	authSnapshotRefreshBeforeExpiry   = 5 * time.Minute
+	configTrustFutureClockSkew        = 24 * time.Hour
 	maxAuthSnapshotBytes              = 256 * 1024
 	authSnapshotPreviousSuffix        = ".previous"
 )
@@ -153,6 +154,7 @@ type CarrierOptions struct {
 	AuthSnapshotURL          string
 	AuthSnapshotFetchTimeout time.Duration
 	AuthSnapshotOutputFile   string
+	ConfigTrustedAt          int64
 	AuthSnapshotPreferFile   bool
 	AuthSnapshotSkipRemote   bool
 
@@ -419,6 +421,12 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	if err := loadCarrierAuthSnapshot(ctx, cfg, options, logf); err != nil {
 		if logf != nil {
 			logf("WLT carrier start failed phase=auth_snapshot elapsed=%s error=%v", time.Since(startedAt), err)
+		}
+		return nil, err
+	}
+	if err := requireCarrierBootstrapTrust(cfg, options, logf); err != nil {
+		if logf != nil {
+			logf("WLT carrier start failed phase=config_trust elapsed=%s error=%v", time.Since(startedAt), err)
 		}
 		return nil, err
 	}
@@ -716,6 +724,14 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 	if len(raw) == 0 {
 		return errors.New("auth snapshot is unavailable for TURN recovery")
 	}
+	if trusted, status, age := carrierConfigTrust(options.ConfigTrustedAt, time.Now()); !trusted {
+		if logf != nil {
+			logf("WLT carrier auth event=config_trust status=%s age_seconds=%d", status, int64(age/time.Second))
+		}
+		return fmt.Errorf("local WLT config trust %s", status)
+	} else if logf != nil {
+		logf("WLT carrier auth event=config_trust status=valid age_seconds=%d window_months=6", int64(age/time.Second))
+	}
 	refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
 	defer cancel()
 	refreshed, err := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
@@ -723,16 +739,7 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 		if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) && logf != nil {
 			logf("WLT carrier auth event=reauthorization_required source=%s", source)
 		}
-		snapshotURL := strings.TrimSpace(options.AuthSnapshotURL)
-		if snapshotURL == "" || options.AuthSnapshotSkipRemote {
-			return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w", source, err)
-		}
-		remote, fetchErr := fetchCarrierAuthSnapshotForRecovery(refreshCtx, snapshotURL, options.AuthSnapshotFetchTimeout)
-		if fetchErr != nil {
-			return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w; remote recovery: %v", source, err, fetchErr)
-		}
-		refreshed = remote
-		source = "remote"
+		return fmt.Errorf("refresh rejected TURN auth snapshot source=%s: %w", source, err)
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
 		return fmt.Errorf("import recovered TURN auth snapshot source=%s: %w", source, err)
@@ -767,9 +774,9 @@ func loadCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientConfi
 	if raw != "" {
 		// A WLT profile must remain bootstrappable when its control-plane host is
 		// unreachable on the unprotected network. Import the snapshot delivered
-		// with the profile before attempting an optional remote refresh; waiting
-		// for that refresh here otherwise adds its full timeout to every mobile
-		// startup and can create a control-plane/VPN dependency cycle.
+		// with the profile. Remote synchronization is forbidden before the WLT
+		// carrier has established traffic because that would create a
+		// control-plane/VPN dependency cycle.
 		return prepareCarrierAuthSnapshot(ctx, cfg, options, []byte(raw), "inline", logf)
 	}
 	if !options.AuthSnapshotPreferFile {
@@ -788,19 +795,40 @@ func loadCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientConfi
 			return nil
 		}
 	}
-	if snapshotURL := strings.TrimSpace(options.AuthSnapshotURL); snapshotURL != "" && !options.AuthSnapshotSkipRemote {
-		if raw, err := fetchCarrierAuthSnapshot(ctx, snapshotURL, options.AuthSnapshotFetchTimeout); err != nil {
-			if logf != nil {
-				logf("WLT carrier auth snapshot remote refresh unavailable error=%v", err)
-			}
-		} else if err := prepareCarrierAuthSnapshot(ctx, cfg, options, raw, "remote", logf); err != nil {
-			if logf != nil {
-				logf("WLT carrier auth snapshot remote refresh rejected error=%v", err)
-			}
-			return err
-		} else {
-			return nil
-		}
+	return nil
+}
+
+func carrierConfigTrust(trustedAtUnix int64, now time.Time) (bool, string, time.Duration) {
+	if trustedAtUnix <= 0 {
+		return false, "missing", 0
+	}
+	trustedAt := time.Unix(trustedAtUnix, 0)
+	if trustedAt.After(now.Add(configTrustFutureClockSkew)) {
+		return false, "future", 0
+	}
+	age := now.Sub(trustedAt)
+	if age < 0 {
+		age = 0
+	}
+	if trustedAt.Before(now.AddDate(0, -6, 0)) {
+		return false, "expired", age
+	}
+	return true, "valid", age
+}
+
+func requireCarrierBootstrapTrust(cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
+	if cfg == nil {
+		return errors.New("carrier config is required for config trust")
+	}
+	if _, err := carrierengine.ExportAuthSnapshotJSON(*cfg); err == nil {
+		return nil
+	}
+	trusted, status, age := carrierConfigTrust(options.ConfigTrustedAt, time.Now())
+	if logf != nil {
+		logf("WLT carrier auth event=config_trust status=%s age_seconds=%d window_months=6 bootstrap=fresh", status, int64(age/time.Second))
+	}
+	if !trusted {
+		return fmt.Errorf("local WLT config trust %s", status)
 	}
 	return nil
 }
@@ -881,6 +909,17 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		return fmt.Errorf("inspect auth snapshot source=%s: %w", source, err)
 	}
 	if needsRefresh {
+		trusted, trustStatus, trustAge := carrierConfigTrust(options.ConfigTrustedAt, time.Now())
+		if !trusted {
+			if logf != nil {
+				logf("WLT carrier auth event=refresh_skipped source=%s reason=config_trust_%s age_seconds=%d fallback=saved_snapshot", source, trustStatus, int64(trustAge/time.Second))
+			}
+			options.startup.markProviderRefreshReady("cached")
+			return writePreparedCarrierAuthSnapshot(options, raw, source, logf)
+		}
+		if logf != nil {
+			logf("WLT carrier auth event=config_trust status=valid age_seconds=%d window_months=6", int64(trustAge/time.Second))
+		}
 		options.startup.markProviderRefreshStarted()
 		if logf != nil {
 			remaining, _ := carrierAuthSnapshotRemainingTTL(raw)
@@ -915,6 +954,10 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 			options.startup.markProviderRefreshReady("refreshed")
 		}
 	}
+	return writePreparedCarrierAuthSnapshot(options, raw, source, logf)
+}
+
+func writePreparedCarrierAuthSnapshot(options CarrierOptions, raw []byte, source string, logf func(string, ...any)) error {
 	if err := writeCarrierAuthSnapshot(options, raw, true); err != nil {
 		return fmt.Errorf("persist auth snapshot source=%s: %w", source, err)
 	}

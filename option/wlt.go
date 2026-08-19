@@ -18,11 +18,15 @@ type WLTServiceOptions struct {
 	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
 	AuthSnapshot      string `json:"auth_snapshot,omitempty"`
 	AuthSnapshotFile  string `json:"auth_snapshot_file,omitempty"`
-	// AuthSnapshotURL optionally refreshes the local auth snapshot before carrier start.
+	// AuthSnapshotURL is retained for profile compatibility. It is not used
+	// before the WLT carrier has established traffic.
 	AuthSnapshotURL          string             `json:"auth_snapshot_url,omitempty"`
 	AuthSnapshotFetchTimeout badoption.Duration `json:"auth_snapshot_fetch_timeout,omitempty"`
 	// AuthSnapshotOutputFile is updated after successful carrier auth.
 	AuthSnapshotOutputFile string `json:"auth_snapshot_output_file,omitempty"`
+	// ConfigTrustedAt is a client-owned Unix timestamp set only after a remote
+	// profile was successfully downloaded and validated.
+	ConfigTrustedAt int64 `json:"config_trusted_at,omitempty"`
 	// Deprecated: use carrier_config.
 	TurnableConfig string `json:"turnable_config,omitempty"`
 	// Deprecated: use carrier_config_file.

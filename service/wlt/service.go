@@ -123,9 +123,9 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 			socketControl = carriercommon.SocketControlFunc(protectFunc)
 		}
 	}
-	// PreferFile already prevents a speculative control-plane request during
-	// normal startup. Leave remote recovery enabled so a proven TURN 401 can
-	// replace rejected short-lived credentials without refreshing the profile.
+	// The carrier must establish traffic without the profile control plane.
+	// auth_snapshot_url remains a compatibility field, but pre-tunnel recovery
+	// is limited to the profile bootstrap and client-persisted auth state.
 	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
@@ -134,6 +134,7 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 		AuthSnapshotURL:              s.options.AuthSnapshotURL,
 		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
 		AuthSnapshotOutputFile:       s.options.AuthSnapshotOutputFile,
+		ConfigTrustedAt:              s.options.ConfigTrustedAt,
 		AuthSnapshotPreferFile:       preferPersistedAuth,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,

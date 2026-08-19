@@ -27,6 +27,7 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 				"auth_snapshot_url": "https://example.com/wlt-auth-snapshot",
 				"auth_snapshot_fetch_timeout": "4s",
 				"auth_snapshot_output_file": "/tmp/wlt-auth-next.json",
+				"config_trusted_at": 1787068800,
 				"connect_timeout": "10s",
 				"max_active_streams": 32,
 				"max_open_attempts": 16,
@@ -98,6 +99,9 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 	if serviceOptions.AuthSnapshotURL != "https://example.com/wlt-auth-snapshot" || time.Duration(serviceOptions.AuthSnapshotFetchTimeout) != 4*time.Second {
 		t.Fatalf("remote auth snapshot options=%+v", serviceOptions)
+	}
+	if serviceOptions.ConfigTrustedAt != 1787068800 {
+		t.Fatalf("config trusted at=%d", serviceOptions.ConfigTrustedAt)
 	}
 	if len(options.Outbounds) != 1 {
 		t.Fatalf("outbounds=%d, want 1", len(options.Outbounds))
