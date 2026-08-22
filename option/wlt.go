@@ -24,8 +24,8 @@ type WLTServiceOptions struct {
 	AuthSnapshotFetchTimeout badoption.Duration `json:"auth_snapshot_fetch_timeout,omitempty"`
 	// AuthSnapshotOutputFile is updated after successful carrier auth.
 	AuthSnapshotOutputFile string `json:"auth_snapshot_output_file,omitempty"`
-	// ConfigTrustedAt is a client-owned Unix timestamp set only after a remote
-	// profile was successfully downloaded and validated.
+	// Deprecated: local saved-profile presence is the client trust boundary.
+	// This field is parsed only for compatibility and is ignored by the carrier.
 	ConfigTrustedAt int64 `json:"config_trusted_at,omitempty"`
 	// Deprecated: use carrier_config.
 	TurnableConfig string `json:"turnable_config,omitempty"`
