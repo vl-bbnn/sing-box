@@ -465,11 +465,16 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	runtimeClient, err := connectCarrierClientForStart(runCtx, cfg, options.ConnectTimeout, logf)
-	if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+	if carrierAuthRecoveryReason(err) != "" {
+		reason := carrierAuthRecoveryReason(err)
 		if logf != nil {
-			logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
+			if reason == "rejected" {
+				logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
+			} else {
+				logf("WLT carrier auth event=recovery_required source=current phase=peer_timeout_recovery reason=%s", reason)
+			}
 		}
-		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, logf)
+		runtimeClient, err = recoverCarrierAuthAfterFailure(runCtx, cfg, options, err, logf)
 	}
 	if err != nil {
 		cancel()
@@ -664,6 +669,22 @@ func isFatalCarrierConnectError(err error) bool {
 		errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired)
 }
 
+func carrierAuthRecoveryReason(err error) string {
+	if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+		return "rejected"
+	}
+	// Some providers accept cached TURN credentials but never establish a peer.
+	// That path ends as a bounded connect timeout rather than an explicit auth
+	// rejection. Reusing the same cached candidate until the whole startup budget
+	// is gone cannot recover it, so run the same client-local refresh/fallback
+	// chain used for an explicit rejection. This never contacts the VPN API or
+	// auth_snapshot_url.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "peer_timeout"
+	}
+	return ""
+}
+
 func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
 	if cfg == nil {
 		return errors.New("carrier config is required for auth snapshot recovery")
@@ -708,7 +729,7 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 	return nil
 }
 
-func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, logf func(string, ...any)) (*carrierengine.Client, error) {
+func recoverCarrierAuthAfterFailure(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, logf func(string, ...any)) (*carrierengine.Client, error) {
 	combinedErr := initialErr
 	connectCandidate := func(source string) (*carrierengine.Client, bool) {
 		if logf != nil {
@@ -761,11 +782,12 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		}
 	}
 
-	// Explicit TURN/signaling rejection invalidates the provider cache in the
-	// carrier module. Only after all local last-known-good candidates failed do
-	// we permit one full client-local authorization/challenge attempt. PrewarmAuth
-	// has its own bounded provider authorization deadline and does not contact the
-	// VPN API or auth_snapshot_url.
+	// An explicit TURN/signaling rejection invalidates the provider cache in the
+	// carrier module. A peer timeout first attempts an ephemeral session refresh
+	// above. Only after all local last-known-good candidates failed do we permit
+	// one full client-local authorization/challenge attempt. PrewarmAuth has its
+	// own bounded provider authorization deadline and does not contact the VPN API
+	// or auth_snapshot_url.
 	if logf != nil {
 		logf("WLT carrier auth event=fresh_reauthorization_started source=client_local")
 	}

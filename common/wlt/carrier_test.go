@@ -542,7 +542,7 @@ func TestRecoverCarrierAuthPromotesFreshIdentityOnlyAfterSuccessfulConnect(t *te
 	}
 	cfg := testCarrierClientConfig("restart-snapshot-test")
 	var logs []string
-	client, err := recoverCarrierAuthAfterRejection(context.Background(), cfg, options, carriercommon.ErrAuthSnapshotReauthorizationRequired, func(format string, arguments ...any) {
+	client, err := recoverCarrierAuthAfterFailure(context.Background(), cfg, options, carriercommon.ErrAuthSnapshotReauthorizationRequired, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
 	if err != nil {
@@ -582,6 +582,18 @@ func TestRecoverCarrierAuthPromotesFreshIdentityOnlyAfterSuccessfulConnect(t *te
 		if strings.Contains(joinedLogs, secret) {
 			t.Fatalf("auth telemetry leaked snapshot material %q: %s", secret, joinedLogs)
 		}
+	}
+}
+
+func TestCarrierAuthRecoveryReasonIncludesPeerTimeout(t *testing.T) {
+	if got := carrierAuthRecoveryReason(carriercommon.ErrAuthSnapshotReauthorizationRequired); got != "rejected" {
+		t.Fatalf("rejection reason=%q", got)
+	}
+	if got := carrierAuthRecoveryReason(fmt.Errorf("connect failed: %w", context.DeadlineExceeded)); got != "peer_timeout" {
+		t.Fatalf("timeout reason=%q", got)
+	}
+	if got := carrierAuthRecoveryReason(errors.New("network unavailable")); got != "" {
+		t.Fatalf("generic error unexpectedly enabled auth recovery: %q", got)
 	}
 }
 
