@@ -502,6 +502,13 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
 		}
 		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, logf)
+		if err != nil {
+			if logf != nil {
+				logf("WLT carrier start phase=turn_auth_recovery_unavailable error=%v", err)
+			}
+		} else if logf != nil {
+			logf("WLT carrier start phase=turn_auth_recovered")
+		}
 	}
 	if err != nil {
 		cancel()
