@@ -139,7 +139,7 @@ const (
 
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
-	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuth
+	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuthUnattended
 	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
 	fetchCarrierAuthSnapshotForRecovery = fetchCarrierAuthSnapshot
 	connectCarrierClientForStart        = connectCarrierClient

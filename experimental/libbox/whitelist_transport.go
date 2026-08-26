@@ -108,7 +108,7 @@ func PrewarmWLTAuth(carrierConfig string, carrierConfigFile string, snapshotOutp
 	if err != nil {
 		return err
 	}
-	snapshot, err := carrierengine.PrewarmAuth(*cfg)
+	snapshot, err := carrierengine.PrewarmAuthUnattended(*cfg)
 	if err != nil {
 		return err
 	}
