@@ -5,9 +5,11 @@ package wlt
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
@@ -18,14 +20,141 @@ import (
 const (
 	authSnapshotReserveSuffix    = ".reserve"
 	authSnapshotQuarantineSuffix = ".quarantine"
+	authSnapshotRejectOnceSuffix = ".test-reject-active-once"
 	authReserveReadyWait         = 30 * time.Second
 	authReserveRetryInitial      = 15 * time.Minute
 	authReserveRetryMaximum      = 6 * time.Hour
 )
 
+type CarrierAuthRingStatus struct {
+	Version           int  `json:"version"`
+	ActivePresent     bool `json:"active_present"`
+	PreviousPresent   bool `json:"previous_present"`
+	ReservePresent    bool `json:"reserve_present"`
+	QuarantinePresent bool `json:"quarantine_present"`
+	FaultArmed        bool `json:"fault_armed"`
+}
+
+type carrierAuthRingFault struct {
+	Version int    `json:"version"`
+	Action  string `json:"action"`
+}
+
+const carrierAuthRingRejectActiveOnceAction = "reject_active_identity_once"
+
 type carrierAuthCandidate struct {
 	source string
 	path   string
+}
+
+// CarrierAuthRingStatusJSON returns only lifecycle booleans. It never returns
+// provider identity, cookies, tokens, endpoints, or snapshot contents.
+func CarrierAuthRingStatusJSON(snapshotPath string) (string, error) {
+	snapshotPath = filepath.Clean(snapshotPath)
+	if snapshotPath == "." || !filepath.IsAbs(snapshotPath) {
+		return "", errors.New("absolute auth snapshot path is required")
+	}
+	present := func(path string) (bool, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("auth ring path is not a regular file: %s", filepath.Base(path))
+		}
+		return true, nil
+	}
+	paths := []string{
+		snapshotPath,
+		snapshotPath + authSnapshotPreviousSuffix,
+		snapshotPath + authSnapshotReserveSuffix,
+		snapshotPath + authSnapshotQuarantineSuffix,
+		snapshotPath + authSnapshotRejectOnceSuffix,
+	}
+	values := make([]bool, len(paths))
+	for index, path := range paths {
+		value, err := present(path)
+		if err != nil {
+			return "", err
+		}
+		values[index] = value
+	}
+	content, err := json.Marshal(CarrierAuthRingStatus{
+		Version:           1,
+		ActivePresent:     values[0],
+		PreviousPresent:   values[1],
+		ReservePresent:    values[2],
+		QuarantinePresent: values[3],
+		FaultArmed:        values[4],
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+// ArmCarrierAuthRingTestRejectActiveOnce creates a one-shot local marker used
+// by Dev qualification builds. StartCarrier consumes it before any injected
+// rejection and refuses the fault unless an independent reserve is available.
+func ArmCarrierAuthRingTestRejectActiveOnce(snapshotPath string) error {
+	snapshotPath = filepath.Clean(snapshotPath)
+	if snapshotPath == "." || !filepath.IsAbs(snapshotPath) {
+		return errors.New("absolute auth snapshot path is required")
+	}
+	for _, path := range []string{snapshotPath, snapshotPath + authSnapshotReserveSuffix} {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("auth ring prerequisite unavailable: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("auth ring prerequisite is not a regular file: %s", filepath.Base(path))
+		}
+	}
+	content, err := json.Marshal(carrierAuthRingFault{Version: 1, Action: carrierAuthRingRejectActiveOnceAction})
+	if err != nil {
+		return err
+	}
+	return writeCarrierAuthSnapshotFile(snapshotPath+authSnapshotRejectOnceSuffix, content)
+}
+
+func consumeCarrierAuthRingTestRejectActiveOnce(cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) ([]byte, bool, error) {
+	markerPath := carrierAuthSnapshotPath(options) + authSnapshotRejectOnceSuffix
+	if carrierAuthSnapshotPath(options) == "" {
+		return nil, false, nil
+	}
+	content, err := os.ReadFile(markerPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read auth ring fault marker: %w", err)
+	}
+	// Consume before validation so a malformed or stale marker can never loop.
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, false, fmt.Errorf("consume auth ring fault marker: %w", err)
+	}
+	var marker carrierAuthRingFault
+	if err := json.Unmarshal(content, &marker); err != nil || marker.Version != 1 || marker.Action != carrierAuthRingRejectActiveOnceAction {
+		return nil, false, errors.New("invalid auth ring fault marker")
+	}
+	independent, err := carrierAuthReserveIndependent(cfg, options)
+	if err != nil {
+		return nil, false, fmt.Errorf("validate auth ring reserve before fault: %w", err)
+	}
+	if !independent {
+		return nil, false, errors.New("auth ring fault requires an independent reserve")
+	}
+	rejected, err := os.ReadFile(carrierAuthSnapshotPath(options))
+	if err != nil {
+		return nil, false, fmt.Errorf("read active auth identity before fault: %w", err)
+	}
+	if logf != nil {
+		logf("WLT carrier auth ring test event=active_rejection_injected scope=identity once=true")
+	}
+	return rejected, true, nil
 }
 
 func carrierAuthReservePath(options CarrierOptions) string {
@@ -56,7 +185,7 @@ func localCarrierAuthRecoveryCandidates(options CarrierOptions) []carrierAuthCan
 	}
 }
 
-func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carrierAuthCandidate, logf func(string, ...any)) (bool, error) {
+func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carrierAuthCandidate, rejectedIdentity []byte, logf func(string, ...any)) (bool, error) {
 	if cfg == nil {
 		return false, errors.New("carrier config is required for auth ring")
 	}
@@ -70,6 +199,18 @@ func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carri
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
 		return false, nil
+	}
+	if len(rejectedIdentity) > 0 {
+		independent, err := carrierAuthSnapshotsIndependent(*cfg, rejectedIdentity, data)
+		if err != nil {
+			return false, fmt.Errorf("compare %s auth identity: %w", candidate.source, err)
+		}
+		if !independent {
+			if logf != nil {
+				logf("WLT carrier auth ring test event=candidate_rejected_same_identity source=%s", candidate.source)
+			}
+			return false, nil
+		}
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON(data); err != nil {
 		return false, fmt.Errorf("import %s auth snapshot: %w", candidate.source, err)

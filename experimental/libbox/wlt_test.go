@@ -45,3 +45,12 @@ func TestValidateWLTAuthSnapshotRejectsMissingCarrierConfig(t *testing.T) {
 		t.Fatal("expected missing carrier config error")
 	}
 }
+
+func TestWLTAuthRingRejectsRelativePath(t *testing.T) {
+	if _, err := WLTAuthRingStatus("relative.json"); err == nil {
+		t.Fatal("expected relative path rejection")
+	}
+	if err := ArmWLTAuthRingTestRejectActiveOnce("relative.json"); err == nil {
+		t.Fatal("expected relative path rejection")
+	}
+}

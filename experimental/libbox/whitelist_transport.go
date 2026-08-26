@@ -144,6 +144,14 @@ func ValidateWLTAuthSnapshot(carrierConfig string, carrierConfigFile string, sna
 	return nil
 }
 
+func WLTAuthRingStatus(snapshotFile string) (string, error) {
+	return wlt.CarrierAuthRingStatusJSON(snapshotFile)
+}
+
+func ArmWLTAuthRingTestRejectActiveOnce(snapshotFile string) error {
+	return wlt.ArmCarrierAuthRingTestRejectActiveOnce(snapshotFile)
+}
+
 func loadPrewarmCarrierConfig(configContent string, configFile string) (*carrierconfig.ClientConfig, error) {
 	raw := strings.TrimSpace(configContent)
 	if raw == "" && strings.TrimSpace(configFile) != "" {

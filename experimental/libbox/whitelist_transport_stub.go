@@ -40,3 +40,11 @@ func PrewarmWLTAuth(carrierConfig string, carrierConfigFile string, snapshotOutp
 func ValidateWLTAuthSnapshot(carrierConfig string, carrierConfigFile string, snapshot string) error {
 	return fmt.Errorf("WLT support is disabled; rebuild libbox with the with_wlt tag")
 }
+
+func WLTAuthRingStatus(snapshotFile string) (string, error) {
+	return "", fmt.Errorf("WLT support is disabled; rebuild libbox with the with_wlt tag")
+}
+
+func ArmWLTAuthRingTestRejectActiveOnce(snapshotFile string) error {
+	return fmt.Errorf("WLT support is disabled; rebuild libbox with the with_wlt tag")
+}

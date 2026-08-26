@@ -552,12 +552,25 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		)
 	}
 
-	runtimeClient, err := connectCarrierClientForStart(runCtx, cfg, options.ConnectTimeout, logf)
+	rejectedIdentity, injectRejection, injectErr := consumeCarrierAuthRingTestRejectActiveOnce(cfg, options, logf)
+	if injectErr != nil {
+		cancel()
+		if restoreSocketControl != nil {
+			restoreSocketControl()
+		}
+		return nil, fmt.Errorf("prepare WLT auth ring fault: %w", injectErr)
+	}
+	var runtimeClient *carrierengine.Client
+	if injectRejection {
+		err = carriercommon.ErrAuthSnapshotReauthorizationRequired
+	} else {
+		runtimeClient, err = connectCarrierClientForStart(runCtx, cfg, options.ConnectTimeout, logf)
+	}
 	if carrierAuthRecoveryRequired(err) {
 		if logf != nil {
 			logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
 		}
-		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, logf)
+		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, rejectedIdentity, logf)
 		if err != nil {
 			if logf != nil {
 				logf("WLT carrier start phase=turn_auth_recovery_unavailable error=%v", err)
@@ -818,7 +831,7 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 	return nil
 }
 
-func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, logf func(string, ...any)) (*carrierengine.Client, error) {
+func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, rejectedIdentity []byte, logf func(string, ...any)) (*carrierengine.Client, error) {
 	combinedErr := initialErr
 	connectCandidate := func(source string) (*carrierengine.Client, bool) {
 		if logf != nil {
@@ -843,7 +856,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	// request. current/previous protect session rotation; reserve carries a
 	// separately minted provider identity for rate-limit-safe failover.
 	for _, candidate := range localCarrierAuthRecoveryCandidates(options) {
-		loaded, loadErr := importCarrierAuthCandidate(cfg, candidate, logf)
+		loaded, loadErr := importCarrierAuthCandidate(cfg, candidate, rejectedIdentity, logf)
 		if loadErr != nil {
 			combinedErr = errors.Join(combinedErr, loadErr)
 			if logf != nil {
@@ -860,13 +873,30 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 
 	inline := strings.TrimSpace(options.AuthSnapshot)
 	if inline != "" {
-		if inlineErr := carrierengine.ImportAuthSnapshotJSON([]byte(inline)); inlineErr != nil {
-			combinedErr = errors.Join(combinedErr, inlineErr)
-			if logf != nil {
-				logf("WLT carrier auth event=inline_unavailable source=inline error=%v", inlineErr)
+		inlineData := []byte(inline)
+		skipInline := false
+		if len(rejectedIdentity) > 0 {
+			independent, independentErr := carrierAuthSnapshotsIndependent(*cfg, rejectedIdentity, inlineData)
+			if independentErr != nil {
+				combinedErr = errors.Join(combinedErr, independentErr)
+				skipInline = true
+			} else if !independent {
+				if logf != nil {
+					logf("WLT carrier auth ring test event=candidate_rejected_same_identity source=inline")
+				}
+				skipInline = true
 			}
-		} else if client, ok := connectCandidate("inline"); ok {
-			return client, nil
+		}
+		if !skipInline {
+			inlineErr := carrierengine.ImportAuthSnapshotJSON(inlineData)
+			if inlineErr != nil {
+				combinedErr = errors.Join(combinedErr, inlineErr)
+				if logf != nil {
+					logf("WLT carrier auth event=inline_unavailable source=inline error=%v", inlineErr)
+				}
+			} else if client, ok := connectCandidate("inline"); ok {
+				return client, nil
+			}
 		}
 	}
 

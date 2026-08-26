@@ -3,8 +3,10 @@
 package wlt
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,124 @@ import (
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
+
+func TestAuthRingFaultMarkerIsOneShotAndRequiresIndependentReserve(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ArmCarrierAuthRingTestRejectActiveOnce(path); err != nil {
+		t.Fatal(err)
+	}
+	statusJSON, err := CarrierAuthRingStatusJSON(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(statusJSON, `"active_present":true`) ||
+		!strings.Contains(statusJSON, `"reserve_present":true`) ||
+		!strings.Contains(statusJSON, `"fault_armed":true`) ||
+		strings.Contains(statusJSON, "active-token") {
+		t.Fatalf("unexpected sanitized status: %s", statusJSON)
+	}
+	previousIndependent := carrierAuthSnapshotsIndependent
+	carrierAuthSnapshotsIndependent = func(carrierconfig.ClientConfig, []byte, []byte) (bool, error) {
+		return true, nil
+	}
+	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
+	rejected, consumed, err := consumeCarrierAuthRingTestRejectActiveOnce(
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{AuthSnapshotFile: path},
+		nil,
+	)
+	if err != nil || !consumed || !bytes.Equal(rejected, active) {
+		t.Fatalf("consumed=%t rejected=%q err=%v", consumed, rejected, err)
+	}
+	if _, err := os.Stat(path + authSnapshotRejectOnceSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fault marker was not consumed: %v", err)
+	}
+	if _, consumed, err := consumeCarrierAuthRingTestRejectActiveOnce(
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{AuthSnapshotFile: path},
+		nil,
+	); err != nil || consumed {
+		t.Fatalf("one-shot marker repeated consumed=%t err=%v", consumed, err)
+	}
+}
+
+func TestInjectedIdentityRejectionSkipsSameIdentitySessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path+authSnapshotPreviousSuffix, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	previousIndependent := carrierAuthSnapshotsIndependent
+	refreshCalls := 0
+	prewarmCalls := 0
+	connectCalls := 0
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		refreshCalls++
+		return nil, errors.New("must not refresh")
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("must not authorize")
+	}
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Equal(left, right), nil
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		return &carrierengine.Client{}, nil
+	}
+	t.Cleanup(func() {
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+		connectCarrierClientForStart = previousConnect
+		carrierAuthSnapshotsIndependent = previousIndependent
+	})
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{
+			AuthSnapshot:           string(active),
+			AuthSnapshotFile:       path,
+			AuthSnapshotOutputFile: path,
+			ConnectTimeout:         time.Second,
+			startup:                startup,
+		},
+		carriercommon.ErrAuthSnapshotReauthorizationRequired,
+		active,
+		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
+	)
+	if err != nil || client == nil {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if connectCalls != 1 || refreshCalls != 0 || prewarmCalls != 0 {
+		t.Fatalf("connect=%d refresh=%d prewarm=%d", connectCalls, refreshCalls, prewarmCalls)
+	}
+	if source := startup.getAuthSource(); source != "reserve" {
+		t.Fatalf("auth source=%q", source)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "candidate_rejected_same_identity source=previous") ||
+		!strings.Contains(joined, "fallback_succeeded source=reserve") {
+		t.Fatalf("identity-scoped recovery evidence missing: %s", joined)
+	}
+}
 
 func TestRecoveryUsesReserveBeforeProviderAuthorization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
@@ -52,7 +172,7 @@ func TestRecoveryUsesReserveBeforeProviderAuthorization(t *testing.T) {
 		ConnectTimeout:         time.Second,
 		startup:                startup,
 	}
-	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, errors.New("active rejected"), nil)
+	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, errors.New("active rejected"), nil, nil)
 	if err != nil || client == nil {
 		t.Fatalf("client=%v err=%v", client, err)
 	}
