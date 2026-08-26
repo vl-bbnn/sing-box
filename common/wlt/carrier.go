@@ -497,7 +497,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	runtimeClient, err := connectCarrierClientForStart(runCtx, cfg, options.ConnectTimeout, logf)
-	if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+	if carrierAuthRecoveryRequired(err) {
 		if logf != nil {
 			logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
 		}
@@ -587,6 +587,11 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	)
 	startup.markCarrierReady()
 	return carrier, nil
+}
+
+func carrierAuthRecoveryRequired(err error) bool {
+	return errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) ||
+		errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
 }
 
 func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, timeout time.Duration, logf func(string, ...any)) (*carrierengine.Client, error) {

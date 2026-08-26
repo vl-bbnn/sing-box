@@ -29,6 +29,21 @@ func TestCarrierConnectAttemptBudgetCoversMobileUnderlay(t *testing.T) {
 	}
 }
 
+func TestCarrierAuthRecoveryIncludesLegacyManualChallengeOutcome(t *testing.T) {
+	for _, err := range []error{
+		carriercommon.ErrAuthSnapshotReauthorizationRequired,
+		carriercommon.ErrManualCaptchaUnavailable,
+		fmt.Errorf("wrapped: %w", carriercommon.ErrManualCaptchaUnavailable),
+	} {
+		if !carrierAuthRecoveryRequired(err) {
+			t.Fatalf("auth recovery rejected %v", err)
+		}
+	}
+	if carrierAuthRecoveryRequired(errors.New("network unavailable")) {
+		t.Fatal("ordinary network error entered auth recovery")
+	}
+}
+
 func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
 	var logs []string
 	logf := func(format string, arguments ...any) {
