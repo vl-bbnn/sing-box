@@ -171,7 +171,7 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
-	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260826065828-53e4a2d9e97a
+	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260826070535-081d4baa9a8e
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
