@@ -625,6 +625,42 @@ func TestRefreshCarrierAuthSnapshotAfterRejectionNeverFallsBackToRemote(t *testi
 	}
 }
 
+func TestRecoveryDoesNotRepeatProviderWorkAfterCaptchaRateLimit(t *testing.T) {
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	startup.markProviderRateLimited()
+	options := CarrierOptions{startup: startup}
+	refreshCalls := 0
+	prewarmCalls := 0
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		refreshCalls++
+		return nil, errors.New("unexpected refresh")
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("unexpected prewarm")
+	}
+	t.Cleanup(func() {
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+	})
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("rate-limit-test"), options, carriercommon.ErrAuthSnapshotReauthorizationRequired, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	})
+	if client != nil || !errors.Is(err, carriercommon.ErrHumanChallengeErrorLimit) {
+		t.Fatalf("client=%v error=%v", client, err)
+	}
+	if refreshCalls != 0 || prewarmCalls != 0 {
+		t.Fatalf("refresh_calls=%d prewarm_calls=%d", refreshCalls, prewarmCalls)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "refresh_skipped") || !strings.Contains(joined, "fresh_reauthorization_skipped") {
+		t.Fatalf("missing rate-limit skip evidence: %s", joined)
+	}
+}
+
 func TestLoadCarrierAuthSnapshotRefreshesWithoutConfigTimestamp(t *testing.T) {
 	refreshCalls := 0
 	previousRefresh := refreshCarrierAuthSnapshot

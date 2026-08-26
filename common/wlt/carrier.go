@@ -197,6 +197,8 @@ type carrierStartupContextKey struct{}
 type carrierStartupTelemetry struct {
 	startedAt time.Time
 	logf      func(string, ...any)
+	rateMu    sync.RWMutex
+	rateLimit bool
 
 	snapshotChecked      sync.Once
 	providerRefreshStart sync.Once
@@ -271,6 +273,25 @@ func (t *carrierStartupTelemetry) markProviderRefreshReady(outcome string) {
 		return
 	}
 	t.mark(&t.providerRefreshReady, "provider_refresh_ready", "outcome="+outcome)
+}
+
+func (t *carrierStartupTelemetry) markProviderRateLimited() {
+	if t == nil {
+		return
+	}
+	t.rateMu.Lock()
+	t.rateLimit = true
+	t.rateMu.Unlock()
+}
+
+func (t *carrierStartupTelemetry) providerRateLimited() bool {
+	if t == nil {
+		return false
+	}
+	t.rateMu.RLock()
+	limited := t.rateLimit
+	t.rateMu.RUnlock()
+	return limited
 }
 
 func (t *carrierStartupTelemetry) markCarrierReady() {
@@ -728,8 +749,15 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		return nil, false
 	}
 
-	if refreshErr := refreshCarrierAuthSnapshotAfterRejection(ctx, cfg, options, logf); refreshErr != nil {
+	if options.startup.providerRateLimited() {
+		if logf != nil {
+			logf("WLT carrier auth event=refresh_skipped source=current reason=provider_rate_limited")
+		}
+	} else if refreshErr := refreshCarrierAuthSnapshotAfterRejection(ctx, cfg, options, logf); refreshErr != nil {
 		combinedErr = errors.Join(combinedErr, refreshErr)
+		if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+			options.startup.markProviderRateLimited()
+		}
 		if logf != nil {
 			logf("WLT carrier start phase=turn_auth_refresh_unavailable error=%v", refreshErr)
 		}
@@ -766,6 +794,12 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	// we permit one full client-local authorization/challenge attempt. PrewarmAuth
 	// has its own bounded provider authorization deadline and does not contact the
 	// VPN API or auth_snapshot_url.
+	if options.startup.providerRateLimited() {
+		if logf != nil {
+			logf("WLT carrier auth event=fresh_reauthorization_skipped source=client_local reason=provider_rate_limited")
+		}
+		return nil, errors.Join(combinedErr, carriercommon.ErrHumanChallengeErrorLimit)
+	}
 	if logf != nil {
 		logf("WLT carrier auth event=fresh_reauthorization_started source=client_local")
 	}
@@ -911,6 +945,13 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		return fmt.Errorf("inspect auth snapshot source=%s: %w", source, err)
 	}
 	if needsRefresh {
+		if options.startup.providerRateLimited() {
+			if logf != nil {
+				logf("WLT carrier auth event=refresh_skipped source=%s reason=provider_rate_limited", source)
+			}
+			options.startup.markProviderRefreshReady("cached")
+			return reportPreparedCarrierAuthSnapshot(raw, source, logf)
+		}
 		options.startup.markProviderRefreshStarted()
 		if logf != nil {
 			remaining, _ := carrierAuthSnapshotRemainingTTL(raw)
@@ -920,6 +961,9 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		refreshed, refreshErr := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
 		cancel()
 		if refreshErr != nil {
+			if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+				options.startup.markProviderRateLimited()
+			}
 			// expires_at is a local refresh policy, not proof that the provider
 			// revoked the saved signaling/TURN credentials. Restricted mobile
 			// networks may also make refresh impossible before the tunnel exists.
