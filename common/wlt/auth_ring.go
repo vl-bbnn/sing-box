@@ -21,6 +21,7 @@ const (
 	authSnapshotReserveSuffix    = ".reserve"
 	authSnapshotQuarantineSuffix = ".quarantine"
 	authSnapshotRejectOnceSuffix = ".test-reject-active-once"
+	authSnapshotBootstrapSuffix  = ".bootstrap-consumed"
 	authReserveReadyWait         = 30 * time.Second
 	authReserveRetryInitial      = 15 * time.Minute
 	authReserveRetryMaximum      = 6 * time.Hour
@@ -33,11 +34,16 @@ type CarrierAuthRingStatus struct {
 	ReservePresent    bool `json:"reserve_present"`
 	QuarantinePresent bool `json:"quarantine_present"`
 	FaultArmed        bool `json:"fault_armed"`
+	BootstrapConsumed bool `json:"bootstrap_consumed"`
 }
 
 type carrierAuthRingFault struct {
 	Version int    `json:"version"`
 	Action  string `json:"action"`
+}
+
+type carrierAuthRingBootstrapMarker struct {
+	Version int `json:"version"`
 }
 
 const carrierAuthRingRejectActiveOnceAction = "reject_active_identity_once"
@@ -73,6 +79,7 @@ func CarrierAuthRingStatusJSON(snapshotPath string) (string, error) {
 		snapshotPath + authSnapshotReserveSuffix,
 		snapshotPath + authSnapshotQuarantineSuffix,
 		snapshotPath + authSnapshotRejectOnceSuffix,
+		snapshotPath + authSnapshotBootstrapSuffix,
 	}
 	values := make([]bool, len(paths))
 	for index, path := range paths {
@@ -89,6 +96,7 @@ func CarrierAuthRingStatusJSON(snapshotPath string) (string, error) {
 		ReservePresent:    values[2],
 		QuarantinePresent: values[3],
 		FaultArmed:        values[4],
+		BootstrapConsumed: values[5],
 	})
 	if err != nil {
 		return "", err
@@ -163,6 +171,149 @@ func carrierAuthReservePath(options CarrierOptions) string {
 		return ""
 	}
 	return path + authSnapshotReserveSuffix
+}
+
+func carrierAuthBootstrapMarkerPath(options CarrierOptions) string {
+	path := carrierAuthSnapshotPath(options)
+	if path == "" {
+		return ""
+	}
+	return path + authSnapshotBootstrapSuffix
+}
+
+// bootstrapCarrierAuthRing consumes an independently authorized inline reserve
+// exactly once. The reserve is installed before the active snapshot: if the
+// process stops between the two atomic writes, the still-inline active identity
+// and the private reserve remain sufficient to complete startup and retry the
+// idempotent import. No provider or control-plane request is made here.
+func bootstrapCarrierAuthRing(cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) (bool, error) {
+	reserve := bytes.TrimSpace([]byte(options.AuthReserveSnapshot))
+	if len(reserve) == 0 {
+		return false, nil
+	}
+	if cfg == nil {
+		return true, errors.New("carrier config is required for auth ring bootstrap")
+	}
+	path := carrierAuthSnapshotPath(options)
+	markerPath := carrierAuthBootstrapMarkerPath(options)
+	if path == "" || markerPath == "" {
+		return true, errors.New("persistent auth snapshot path is required for auth ring bootstrap")
+	}
+	marker, markerErr := os.ReadFile(markerPath)
+	if markerErr == nil {
+		var consumed carrierAuthRingBootstrapMarker
+		if json.Unmarshal(marker, &consumed) != nil || consumed.Version != 1 {
+			return true, errors.New("auth ring bootstrap marker is invalid")
+		}
+		if logf != nil {
+			logf("WLT carrier auth ring event=bootstrap_skipped reason=already_consumed")
+		}
+		return true, nil
+	} else if !errors.Is(markerErr, os.ErrNotExist) {
+		return true, fmt.Errorf("inspect auth ring bootstrap marker: %w", markerErr)
+	}
+
+	inline := bytes.TrimSpace([]byte(options.AuthSnapshot))
+	if len(inline) == 0 {
+		return true, errors.New("inline active auth snapshot is required for auth ring bootstrap")
+	}
+	for _, candidate := range []struct {
+		label    string
+		snapshot []byte
+	}{{"active", inline}, {"reserve", reserve}} {
+		if err := carrierengine.ImportAuthSnapshotJSON(candidate.snapshot); err != nil {
+			return true, fmt.Errorf("validate auth ring bootstrap %s snapshot: %w", candidate.label, err)
+		}
+	}
+	independent, err := carrierAuthSnapshotsIndependent(*cfg, inline, reserve)
+	if err != nil {
+		return true, errors.New("validate auth ring bootstrap independence failed")
+	}
+	if !independent {
+		return true, errors.New("auth ring bootstrap identities are not independent")
+	}
+
+	activePath := path
+	reservePath := carrierAuthReservePath(options)
+	active, activeErr := os.ReadFile(activePath)
+	if activeErr != nil && !errors.Is(activeErr, os.ErrNotExist) {
+		return true, fmt.Errorf("read existing active auth snapshot: %w", activeErr)
+	}
+	reserveExisting, reserveErr := os.ReadFile(reservePath)
+	if reserveErr != nil && !errors.Is(reserveErr, os.ErrNotExist) {
+		return true, fmt.Errorf("read existing reserve auth snapshot: %w", reserveErr)
+	}
+	active = bytes.TrimSpace(active)
+	reserveExisting = bytes.TrimSpace(reserveExisting)
+	if len(active) > 0 && carrierengine.ImportAuthSnapshotJSON(active) != nil {
+		active = nil
+	}
+	if len(reserveExisting) > 0 && carrierengine.ImportAuthSnapshotJSON(reserveExisting) != nil {
+		reserveExisting = nil
+	}
+
+	selectedActive := active
+	selectedReserve := reserveExisting
+	if len(selectedActive) > 0 && len(selectedReserve) > 0 {
+		validExisting, compareErr := carrierAuthSnapshotsIndependent(*cfg, selectedActive, selectedReserve)
+		if compareErr == nil && validExisting {
+			if logf != nil {
+				logf("WLT carrier auth ring event=bootstrap_preserved_existing identities=2 independent=true")
+			}
+		} else {
+			selectedReserve = nil
+		}
+	}
+	if len(selectedActive) > 0 && len(selectedReserve) == 0 {
+		for _, candidate := range [][]byte{reserve, inline} {
+			candidateIndependent, compareErr := carrierAuthSnapshotsIndependent(*cfg, selectedActive, candidate)
+			if compareErr == nil && candidateIndependent {
+				selectedReserve = candidate
+				break
+			}
+		}
+		if len(selectedReserve) == 0 {
+			return true, errors.New("auth ring bootstrap has no reserve independent from the existing active identity")
+		}
+		if err := writeCarrierAuthSnapshotFile(reservePath, selectedReserve); err != nil {
+			return true, fmt.Errorf("install auth ring bootstrap reserve: %w", err)
+		}
+	}
+	if len(selectedActive) == 0 && len(selectedReserve) > 0 {
+		for _, candidate := range [][]byte{inline, reserve} {
+			candidateIndependent, compareErr := carrierAuthSnapshotsIndependent(*cfg, candidate, selectedReserve)
+			if compareErr == nil && candidateIndependent {
+				selectedActive = candidate
+				break
+			}
+		}
+		if len(selectedActive) == 0 {
+			return true, errors.New("auth ring bootstrap has no active identity independent from the existing reserve")
+		}
+		if err := writeCarrierAuthSnapshotFile(activePath, selectedActive); err != nil {
+			return true, fmt.Errorf("install auth ring bootstrap active: %w", err)
+		}
+	}
+	if len(selectedActive) == 0 && len(selectedReserve) == 0 {
+		selectedActive = inline
+		selectedReserve = reserve
+		if err := writeCarrierAuthSnapshotFile(reservePath, selectedReserve); err != nil {
+			return true, fmt.Errorf("install auth ring bootstrap reserve: %w", err)
+		}
+		if err := writeCarrierAuthSnapshotFile(activePath, selectedActive); err != nil {
+			return true, fmt.Errorf("install auth ring bootstrap active: %w", err)
+		}
+	}
+	if err := writeCarrierAuthSnapshotFile(markerPath, []byte(`{"version":1}`)); err != nil {
+		return true, fmt.Errorf("mark auth ring bootstrap consumed: %w", err)
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON(selectedActive); err != nil {
+		return true, fmt.Errorf("restore auth ring bootstrap active: %w", err)
+	}
+	if logf != nil {
+		logf("WLT carrier auth ring event=bootstrap_consumed identities=2 independent=true persistence=local")
+	}
+	return true, nil
 }
 
 func carrierAuthQuarantinePath(options CarrierOptions) string {

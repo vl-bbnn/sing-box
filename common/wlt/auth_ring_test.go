@@ -66,6 +66,136 @@ func TestAuthRingFaultMarkerIsOneShotAndRequiresIndependentReserve(t *testing.T)
 	}
 }
 
+func TestAuthRingBootstrapInstallsIndependentIdentitiesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	previousIndependent := carrierAuthSnapshotsIndependent
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Contains(left, []byte("active-token")) || !bytes.Contains(right, []byte("active-token")), nil
+	}
+	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
+	options := CarrierOptions{
+		AuthSnapshot:           string(active),
+		AuthReserveSnapshot:    string(reserve),
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
+		AuthSnapshotPreferFile: false,
+		AuthSnapshotSkipRemote: true,
+	}
+	var logs []string
+	if _, err := bootstrapCarrierAuthRing(testCarrierClientConfig("restart-snapshot-test"), options, func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for suffix, token := range map[string]string{"": "active-token", authSnapshotReserveSuffix: "reserve-token"} {
+		content, err := os.ReadFile(path + suffix)
+		if err != nil || !bytes.Contains(content, []byte(token)) {
+			t.Fatalf("bootstrap file suffix=%q token=%q err=%v", suffix, token, err)
+		}
+		if info, err := os.Stat(path + suffix); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("bootstrap file suffix=%q mode=%v err=%v", suffix, info.Mode().Perm(), err)
+		}
+	}
+	if _, err := os.Stat(path + authSnapshotBootstrapSuffix); err != nil {
+		t.Fatalf("bootstrap marker unavailable: %v", err)
+	}
+	statusJSON, err := CarrierAuthRingStatusJSON(path)
+	if err != nil || !strings.Contains(statusJSON, `"bootstrap_consumed":true`) {
+		t.Fatalf("bootstrap status unavailable status=%q err=%v", statusJSON, err)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "bootstrap_consumed identities=2 independent=true") {
+		t.Fatalf("sanitized bootstrap evidence missing: %v", logs)
+	}
+
+	// The consumed marker makes the embedded bundle one-shot even if a later
+	// profile still contains it.
+	options.AuthSnapshot = "invalid-reused-active"
+	options.AuthReserveSnapshot = "invalid-reused-reserve"
+	if _, err := bootstrapCarrierAuthRing(testCarrierClientConfig("restart-snapshot-test"), options, nil); err != nil {
+		t.Fatalf("consumed bootstrap was revalidated or reused: %v", err)
+	}
+}
+
+func TestAuthRingBootstrapRejectsSameIdentityBeforeWriting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	snapshot := testCarrierAuthSnapshot("same-token")
+	previousIndependent := carrierAuthSnapshotsIndependent
+	carrierAuthSnapshotsIndependent = func(carrierconfig.ClientConfig, []byte, []byte) (bool, error) { return false, nil }
+	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
+	_, err := bootstrapCarrierAuthRing(testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshot:           snapshot,
+		AuthReserveSnapshot:    snapshot,
+		AuthSnapshotOutputFile: path,
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not independent") {
+		t.Fatalf("error=%v, want same-identity rejection", err)
+	}
+	for _, suffix := range []string{"", authSnapshotReserveSuffix, authSnapshotBootstrapSuffix} {
+		if _, statErr := os.Stat(path + suffix); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("partial bootstrap file suffix=%q err=%v", suffix, statErr)
+		}
+	}
+}
+
+func TestAuthRingBootstrapResumesAfterReserveFirstInterruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousIndependent := carrierAuthSnapshotsIndependent
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		leftActive := bytes.Contains(left, []byte("active-token"))
+		rightActive := bytes.Contains(right, []byte("active-token"))
+		return leftActive != rightActive, nil
+	}
+	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
+	if _, err := bootstrapCarrierAuthRing(testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshot:           string(active),
+		AuthReserveSnapshot:    string(reserve),
+		AuthSnapshotOutputFile: path,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || !bytes.Contains(content, []byte("active-token")) {
+		t.Fatalf("active bootstrap was not resumed: %v", err)
+	}
+}
+
+func TestAuthRingBootstrapPreservesAnExistingIndependentRing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	existingActive := []byte(testCarrierAuthSnapshot("existing-active"))
+	existingReserve := []byte(testCarrierAuthSnapshot("existing-reserve"))
+	for suffix, content := range map[string][]byte{"": existingActive, authSnapshotReserveSuffix: existingReserve} {
+		if err := os.WriteFile(path+suffix, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousIndependent := carrierAuthSnapshotsIndependent
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Equal(left, right), nil
+	}
+	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
+	provided, err := bootstrapCarrierAuthRing(testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshot:           testCarrierAuthSnapshot("bootstrap-active"),
+		AuthReserveSnapshot:    testCarrierAuthSnapshot("bootstrap-reserve"),
+		AuthSnapshotOutputFile: path,
+	}, nil)
+	if err != nil || !provided {
+		t.Fatalf("provided=%t err=%v", provided, err)
+	}
+	for suffix, want := range map[string][]byte{"": existingActive, authSnapshotReserveSuffix: existingReserve} {
+		got, readErr := os.ReadFile(path + suffix)
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("existing ring changed suffix=%q err=%v", suffix, readErr)
+		}
+	}
+}
+
 func TestInjectedIdentityRejectionSkipsSameIdentitySessions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
 	active := []byte(testCarrierAuthSnapshot("active-token"))

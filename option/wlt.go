@@ -17,7 +17,11 @@ type WLTServiceOptions struct {
 	CarrierConfig     string `json:"carrier_config,omitempty"`
 	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
 	AuthSnapshot      string `json:"auth_snapshot,omitempty"`
-	AuthSnapshotFile  string `json:"auth_snapshot_file,omitempty"`
+	// AuthReserveSnapshot is an independently authorized bootstrap identity.
+	// It is consumed into the private local auth ring once and is never fetched
+	// again during startup or failover.
+	AuthReserveSnapshot string `json:"auth_reserve_snapshot,omitempty"`
+	AuthSnapshotFile    string `json:"auth_snapshot_file,omitempty"`
 	// AuthSnapshotURL is retained for profile compatibility. It is not used
 	// before the WLT carrier has established traffic.
 	AuthSnapshotURL          string             `json:"auth_snapshot_url,omitempty"`
@@ -76,6 +80,7 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	o.CarrierConfig = strings.TrimSpace(o.CarrierConfig)
 	o.CarrierConfigFile = strings.TrimSpace(o.CarrierConfigFile)
 	o.AuthSnapshot = strings.TrimSpace(o.AuthSnapshot)
+	o.AuthReserveSnapshot = strings.TrimSpace(o.AuthReserveSnapshot)
 	o.AuthSnapshotFile = strings.TrimSpace(o.AuthSnapshotFile)
 	o.AuthSnapshotURL = strings.TrimSpace(o.AuthSnapshotURL)
 	o.AuthSnapshotOutputFile = strings.TrimSpace(o.AuthSnapshotOutputFile)

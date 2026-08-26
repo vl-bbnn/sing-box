@@ -162,6 +162,7 @@ type CarrierOptions struct {
 	ConfigFile string
 
 	AuthSnapshot             string
+	AuthReserveSnapshot      string
 	AuthSnapshotFile         string
 	AuthSnapshotURL          string
 	AuthSnapshotFetchTimeout time.Duration
@@ -508,6 +509,16 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			strings.TrimSpace(cfg.Gateway) != "",
 			time.Since(startedAt),
 		)
+	}
+	bootstrapProvided, err := bootstrapCarrierAuthRing(cfg, options, logf)
+	if err != nil {
+		if logf != nil {
+			logf("WLT carrier start failed phase=auth_ring_bootstrap elapsed=%s error=%v", time.Since(startedAt), err)
+		}
+		return nil, err
+	}
+	if bootstrapProvided {
+		options.AuthSnapshotPreferFile = true
 	}
 	if err := loadCarrierAuthSnapshot(ctx, cfg, options, logf); err != nil {
 		if logf != nil {

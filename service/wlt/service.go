@@ -142,6 +142,7 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
 		AuthSnapshot:                 s.options.AuthSnapshot,
+		AuthReserveSnapshot:          s.options.AuthReserveSnapshot,
 		AuthSnapshotFile:             s.options.AuthSnapshotFile,
 		AuthSnapshotURL:              s.options.AuthSnapshotURL,
 		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
