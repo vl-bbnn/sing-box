@@ -115,6 +115,16 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 }
 
+func TestWLTDirectFallbackDefaultsOnAndCanBeDisabled(t *testing.T) {
+	if !(option.WLTOutboundOptions{}).DirectFallbackEnabled() {
+		t.Fatal("WLT direct fallback is disabled by default")
+	}
+	disabled := false
+	if (option.WLTOutboundOptions{DirectFallback: &disabled}).DirectFallbackEnabled() {
+		t.Fatal("explicitly disabled WLT direct fallback remained enabled")
+	}
+}
+
 func TestWLTConfigUnmarshalAcceptsLegacyTurnableFields(t *testing.T) {
 	ctx := include.Context(context.Background())
 	var options option.Options

@@ -145,9 +145,10 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 }
 
 type WLTOutboundOptions struct {
-	Service string      `json:"service,omitempty"`
-	Route   string      `json:"route,omitempty"`
-	Network NetworkList `json:"network,omitempty"`
+	Service        string      `json:"service,omitempty"`
+	Route          string      `json:"route,omitempty"`
+	Network        NetworkList `json:"network,omitempty"`
+	DirectFallback *bool       `json:"direct_fallback,omitempty"`
 }
 
 func (o *WLTOutboundOptions) UnmarshalJSONContext(_ context.Context, content []byte) error {
@@ -177,4 +178,8 @@ func (o WLTOutboundOptions) BuildNetwork() []string {
 		return []string{N.NetworkTCP}
 	}
 	return o.Network.Build()
+}
+
+func (o WLTOutboundOptions) DirectFallbackEnabled() bool {
+	return o.DirectFallback == nil || *o.DirectFallback
 }
