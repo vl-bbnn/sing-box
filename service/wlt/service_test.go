@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	wltpkg "github.com/sagernet/sing-box/common/wlt"
 	"github.com/sagernet/sing-box/option"
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 )
 
 func TestNetworkInterfaceIdentityDetectsHandoverAndAddressChange(t *testing.T) {
@@ -86,6 +87,18 @@ func TestPersistentAuthSnapshotAvailableRequiresAbsoluteNonEmptyRegularFile(t *t
 	}
 	if persistentAuthSnapshotAvailable(option.WLTServiceOptions{AuthSnapshotFile: "relative.json"}) {
 		t.Fatal("relative snapshot path reported as available")
+	}
+}
+
+func TestCarrierRestartRetryDelayBacksOffAndRespectsProviderCooldown(t *testing.T) {
+	if got := carrierRestartRetryDelay(1, errors.New("network unavailable")); got != wltCarrierRestartRetryDelay {
+		t.Fatalf("first retry delay=%s", got)
+	}
+	if got := carrierRestartRetryDelay(20, errors.New("network unavailable")); got != wltCarrierRestartRetryMax {
+		t.Fatalf("capped retry delay=%s", got)
+	}
+	if got := carrierRestartRetryDelay(1, carriercommon.ErrHumanChallengeErrorLimit); got != wltCarrierRateLimitRetry {
+		t.Fatalf("provider-limited retry delay=%s", got)
 	}
 }
 

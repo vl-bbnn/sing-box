@@ -4,6 +4,7 @@ package wlt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,8 @@ const (
 	wltReconnectRecoveryAfter    = 90 * time.Second
 	wltInterfaceRecoveryGrace    = 15 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
+	wltCarrierRestartRetryMax    = 15 * time.Minute
+	wltCarrierRateLimitRetry     = 30 * time.Minute
 	wltCarrierRestartRetryMaxLog = 4
 )
 
@@ -94,8 +97,17 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	// before the core can perform the identity-only refresh.
 	carrier, err := s.startCarrier(persistentAuthSnapshotAvailable(s.options))
 	if err != nil {
-		s.logger.Error("wlt service start failed elapsed=", time.Since(startedAt).String(), " error=", err)
-		return err
+		// Keep the sing-box instance available while the WLT provider identity or
+		// underlay recovers. WLT outbounds wait on carrierReady with their own dial
+		// context, while unrelated/direct outbounds remain usable. Recovery is
+		// unattended and serialized by the same restart lock used for handovers.
+		s.access.Lock()
+		s.stopped = false
+		s.interfaceKey = s.currentInterfaceKey()
+		s.access.Unlock()
+		s.logger.Error("wlt service start degraded elapsed=", time.Since(startedAt).String(), " error=", err)
+		go s.restartCarrier(nil, "initial startup degraded")
+		return nil
 	}
 	s.access.Lock()
 	s.carrier = carrier
@@ -396,8 +408,12 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		s.access.Unlock()
 		return
 	}
-	s.carrier = nil
-	s.carrierReady = make(chan struct{})
+	if expected != nil {
+		s.carrier = nil
+		s.carrierReady = make(chan struct{})
+	} else if s.carrierReady == nil {
+		s.carrierReady = make(chan struct{})
+	}
 	s.access.Unlock()
 
 	if s.statsCancel != nil {
@@ -450,7 +466,7 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		if attempt <= wltCarrierRestartRetryMaxLog || attempt%10 == 0 {
 			s.logger.Error("wlt service carrier restart failed attempt=", attempt, " error=", err)
 		}
-		timer := time.NewTimer(wltCarrierRestartRetryDelay)
+		timer := time.NewTimer(carrierRestartRetryDelay(attempt, err))
 		select {
 		case <-s.ctx.Done():
 			timer.Stop()
@@ -458,6 +474,23 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		case <-timer.C:
 		}
 	}
+}
+
+func carrierRestartRetryDelay(attempt int, err error) time.Duration {
+	if errors.Is(err, carriercommon.ErrHumanChallengeErrorLimit) {
+		return wltCarrierRateLimitRetry
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := wltCarrierRestartRetryDelay
+	for current := 1; current < attempt && delay < wltCarrierRestartRetryMax; current++ {
+		delay *= 2
+		if delay > wltCarrierRestartRetryMax {
+			delay = wltCarrierRestartRetryMax
+		}
+	}
+	return delay
 }
 
 func counterDelta(current int64, previous int64) int64 {

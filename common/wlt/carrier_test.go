@@ -4,12 +4,14 @@ package wlt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -658,6 +660,60 @@ func TestRecoveryDoesNotRepeatProviderWorkAfterCaptchaRateLimit(t *testing.T) {
 	joined := strings.Join(logs, "\n")
 	if !strings.Contains(joined, "refresh_skipped") || !strings.Contains(joined, "fresh_reauthorization_skipped") {
 		t.Fatalf("missing rate-limit skip evidence: %s", joined)
+	}
+}
+
+func TestProviderRateLimitPersistsAcrossProcessStartupAndClearsAfterRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	firstStartup := newCarrierStartupTelemetry(time.Now(), nil)
+	options := CarrierOptions{AuthSnapshotOutputFile: path, startup: firstStartup}
+	recordProviderRateLimit(options, nil)
+	if !firstStartup.providerRateLimited() {
+		t.Fatal("current startup did not retain provider rate limit")
+	}
+	data, err := os.ReadFile(path + providerCooldownSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted providerCooldownState
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(time.Unix(persisted.BlockedUntil, 0))
+	if persisted.Version != providerCooldownVersion || persisted.Attempts != 1 || remaining < providerCooldownInitial-time.Minute || remaining > providerCooldownInitial+time.Minute {
+		t.Fatalf("persisted cooldown=%+v remaining=%s", persisted, remaining)
+	}
+
+	restarted := newCarrierStartupTelemetry(time.Now(), nil)
+	restartedOptions := CarrierOptions{AuthSnapshotOutputFile: path, startup: restarted}
+	loadProviderCooldown(restartedOptions, nil)
+	if !restarted.providerRateLimited() {
+		t.Fatal("restarted process ignored active provider cooldown")
+	}
+
+	clearProviderCooldown(restartedOptions, nil)
+	if _, err := os.Stat(path + providerCooldownSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider cooldown survived successful recovery: %v", err)
+	}
+}
+
+func TestProviderRateLimitBackoffEscalatesAndCaps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	options := CarrierOptions{AuthSnapshotOutputFile: path, startup: newCarrierStartupTelemetry(time.Now(), nil)}
+	for attempt := 1; attempt <= 6; attempt++ {
+		recordProviderRateLimit(options, nil)
+	}
+	data, err := os.ReadFile(path + providerCooldownSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted providerCooldownState
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(time.Unix(persisted.BlockedUntil, 0))
+	if persisted.Attempts != 6 || remaining < providerCooldownMaximum-time.Minute || remaining > providerCooldownMaximum+time.Minute {
+		t.Fatalf("persisted cooldown=%+v remaining=%s", persisted, remaining)
 	}
 }
 

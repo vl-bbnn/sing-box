@@ -135,7 +135,17 @@ const (
 	authSnapshotRefreshBeforeExpiry   = 5 * time.Minute
 	maxAuthSnapshotBytes              = 256 * 1024
 	authSnapshotPreviousSuffix        = ".previous"
+	providerCooldownSuffix            = ".provider-cooldown"
+	providerCooldownVersion           = 1
+	providerCooldownInitial           = 6 * time.Hour
+	providerCooldownMaximum           = 48 * time.Hour
 )
+
+type providerCooldownState struct {
+	Version      int   `json:"version"`
+	BlockedUntil int64 `json:"blocked_until"`
+	Attempts     int   `json:"attempts"`
+}
 
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
@@ -416,6 +426,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	startedAt := time.Now()
 	startup := newCarrierStartupTelemetry(startedAt, logf)
 	options.startup = startup
+	loadProviderCooldown(options, logf)
 	if logf != nil {
 		logf("WLT carrier start phase=load_config source=%s", carrierConfigSource(options))
 	}
@@ -513,6 +524,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		}
 		return nil, fmt.Errorf("promote WLT carrier auth snapshot: %w", err)
 	}
+	clearProviderCooldown(options, logf)
 	if logf != nil {
 		logf("WLT carrier auth snapshot promoted after successful connect")
 	}
@@ -756,7 +768,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	} else if refreshErr := refreshCarrierAuthSnapshotAfterRejection(ctx, cfg, options, logf); refreshErr != nil {
 		combinedErr = errors.Join(combinedErr, refreshErr)
 		if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
-			options.startup.markProviderRateLimited()
+			recordProviderRateLimit(options, logf)
 		}
 		if logf != nil {
 			logf("WLT carrier start phase=turn_auth_refresh_unavailable error=%v", refreshErr)
@@ -805,6 +817,9 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	}
 	fresh, freshErr := prewarmCarrierAuthSnapshot(*cfg)
 	if freshErr != nil {
+		if errors.Is(freshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+			recordProviderRateLimit(options, logf)
+		}
 		combinedErr = errors.Join(combinedErr, fmt.Errorf("fresh client-local authorization: %w", freshErr))
 		if logf != nil {
 			logf("WLT carrier auth event=fresh_reauthorization_failed source=client_local error=%v", freshErr)
@@ -962,7 +977,7 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		cancel()
 		if refreshErr != nil {
 			if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
-				options.startup.markProviderRateLimited()
+				recordProviderRateLimit(options, logf)
 			}
 			// expires_at is a local refresh policy, not proof that the provider
 			// revoked the saved signaling/TURN credentials. Restricted mobile
@@ -1060,6 +1075,97 @@ func carrierAuthSnapshotPath(options CarrierOptions) string {
 		path = strings.TrimSpace(options.AuthSnapshotFile)
 	}
 	return path
+}
+
+func providerCooldownPath(options CarrierOptions) string {
+	path := carrierAuthSnapshotPath(options)
+	if path == "" {
+		return ""
+	}
+	return path + providerCooldownSuffix
+}
+
+func loadProviderCooldown(options CarrierOptions, logf func(string, ...any)) {
+	path := providerCooldownPath(options)
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && logf != nil {
+			logf("WLT carrier auth event=provider_cooldown_unavailable reason=read_error")
+		}
+		return
+	}
+	var state providerCooldownState
+	if json.Unmarshal(data, &state) != nil || state.Version != providerCooldownVersion || state.BlockedUntil <= 0 || state.Attempts <= 0 {
+		if logf != nil {
+			logf("WLT carrier auth event=provider_cooldown_unavailable reason=invalid_state")
+		}
+		return
+	}
+	remaining := time.Until(time.Unix(state.BlockedUntil, 0))
+	if remaining <= 0 {
+		if logf != nil {
+			logf("WLT carrier auth event=provider_cooldown_expired attempts=%d", state.Attempts)
+		}
+		return
+	}
+	options.startup.markProviderRateLimited()
+	if logf != nil {
+		logf("WLT carrier auth event=provider_cooldown_active remaining_seconds=%d attempts=%d", int64(remaining/time.Second), state.Attempts)
+	}
+}
+
+func recordProviderRateLimit(options CarrierOptions, logf func(string, ...any)) {
+	options.startup.markProviderRateLimited()
+	path := providerCooldownPath(options)
+	if path == "" {
+		return
+	}
+	state := providerCooldownState{Version: providerCooldownVersion}
+	if data, err := os.ReadFile(path); err == nil {
+		var previous providerCooldownState
+		if json.Unmarshal(data, &previous) == nil && previous.Version == providerCooldownVersion && previous.Attempts > 0 {
+			state.Attempts = previous.Attempts
+		}
+	}
+	state.Attempts++
+	delay := providerCooldownInitial
+	for attempt := 1; attempt < state.Attempts && delay < providerCooldownMaximum; attempt++ {
+		delay *= 2
+		if delay > providerCooldownMaximum {
+			delay = providerCooldownMaximum
+		}
+	}
+	state.BlockedUntil = time.Now().Add(delay).Unix()
+	data, err := json.Marshal(state)
+	if err != nil || writeCarrierAuthSnapshotFile(path, data) != nil {
+		if logf != nil {
+			logf("WLT carrier auth event=provider_cooldown_persist_failed")
+		}
+		return
+	}
+	if logf != nil {
+		logf("WLT carrier auth event=provider_cooldown_started duration_seconds=%d attempts=%d", int64(delay/time.Second), state.Attempts)
+	}
+}
+
+func clearProviderCooldown(options CarrierOptions, logf func(string, ...any)) {
+	path := providerCooldownPath(options)
+	if path == "" {
+		return
+	}
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if logf != nil {
+			logf("WLT carrier auth event=provider_cooldown_clear_failed")
+		}
+		return
+	}
+	if err == nil && logf != nil {
+		logf("WLT carrier auth event=provider_cooldown_cleared")
+	}
 }
 
 func writeCarrierAuthSnapshot(options CarrierOptions, data []byte, rotatePrevious bool) error {
