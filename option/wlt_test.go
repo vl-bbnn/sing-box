@@ -115,13 +115,13 @@ func TestWLTConfigUnmarshalAcceptsServiceAndOutbound(t *testing.T) {
 	}
 }
 
-func TestWLTDirectFallbackDefaultsOnAndCanBeDisabled(t *testing.T) {
-	if !(option.WLTOutboundOptions{}).DirectFallbackEnabled() {
-		t.Fatal("WLT direct fallback is disabled by default")
+func TestWLTDirectFallbackDefaultsOffAndCanBeEnabled(t *testing.T) {
+	if (option.WLTOutboundOptions{}).DirectFallbackEnabled() {
+		t.Fatal("WLT direct fallback is enabled by default")
 	}
-	disabled := false
-	if (option.WLTOutboundOptions{DirectFallback: &disabled}).DirectFallbackEnabled() {
-		t.Fatal("explicitly disabled WLT direct fallback remained enabled")
+	enabled := true
+	if !(option.WLTOutboundOptions{DirectFallback: &enabled}).DirectFallbackEnabled() {
+		t.Fatal("explicitly enabled WLT direct fallback remained disabled")
 	}
 }
 

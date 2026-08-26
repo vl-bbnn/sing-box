@@ -181,5 +181,5 @@ func (o WLTOutboundOptions) BuildNetwork() []string {
 }
 
 func (o WLTOutboundOptions) DirectFallbackEnabled() bool {
-	return o.DirectFallback == nil || *o.DirectFallback
+	return o.DirectFallback != nil && *o.DirectFallback
 }

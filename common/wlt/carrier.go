@@ -150,7 +150,9 @@ type providerCooldownState struct {
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
 	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuthUnattended
+	prewarmFreshCarrierAuthSnapshot     = carrierengine.PrewarmFreshAuthUnattendedContext
 	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
+	carrierAuthSnapshotsIndependent     = carrierengine.AuthSnapshotsIndependent
 	fetchCarrierAuthSnapshotForRecovery = fetchCarrierAuthSnapshot
 	connectCarrierClientForStart        = connectCarrierClient
 )
@@ -205,10 +207,14 @@ type CarrierOptions struct {
 type carrierStartupContextKey struct{}
 
 type carrierStartupTelemetry struct {
-	startedAt time.Time
-	logf      func(string, ...any)
-	rateMu    sync.RWMutex
-	rateLimit bool
+	startedAt          time.Time
+	logf               func(string, ...any)
+	rateMu             sync.RWMutex
+	rateLimit          bool
+	rateLimitUntil     time.Time
+	authMu             sync.RWMutex
+	authSource         string
+	trafficReadySignal chan struct{}
 
 	snapshotChecked      sync.Once
 	providerRefreshStart sync.Once
@@ -223,7 +229,7 @@ type carrierStartupTelemetry struct {
 }
 
 func newCarrierStartupTelemetry(startedAt time.Time, logf func(string, ...any)) *carrierStartupTelemetry {
-	return &carrierStartupTelemetry{startedAt: startedAt, logf: logf}
+	return &carrierStartupTelemetry{startedAt: startedAt, logf: logf, authSource: "current", trafficReadySignal: make(chan struct{})}
 }
 
 func contextWithCarrierStartup(ctx context.Context, startup *carrierStartupTelemetry) context.Context {
@@ -286,11 +292,16 @@ func (t *carrierStartupTelemetry) markProviderRefreshReady(outcome string) {
 }
 
 func (t *carrierStartupTelemetry) markProviderRateLimited() {
+	t.markProviderRateLimitedUntil(time.Time{})
+}
+
+func (t *carrierStartupTelemetry) markProviderRateLimitedUntil(until time.Time) {
 	if t == nil {
 		return
 	}
 	t.rateMu.Lock()
 	t.rateLimit = true
+	t.rateLimitUntil = until
 	t.rateMu.Unlock()
 }
 
@@ -298,10 +309,50 @@ func (t *carrierStartupTelemetry) providerRateLimited() bool {
 	if t == nil {
 		return false
 	}
-	t.rateMu.RLock()
-	limited := t.rateLimit
-	t.rateMu.RUnlock()
-	return limited
+	t.rateMu.Lock()
+	defer t.rateMu.Unlock()
+	if t.rateLimit && !t.rateLimitUntil.IsZero() && !time.Now().Before(t.rateLimitUntil) {
+		t.rateLimit = false
+		t.rateLimitUntil = time.Time{}
+	}
+	return t.rateLimit
+}
+
+func (t *carrierStartupTelemetry) providerRateLimitRemaining() time.Duration {
+	if t == nil {
+		return 0
+	}
+	t.rateMu.Lock()
+	defer t.rateMu.Unlock()
+	if !t.rateLimit || t.rateLimitUntil.IsZero() {
+		return 0
+	}
+	remaining := time.Until(t.rateLimitUntil)
+	if remaining <= 0 {
+		t.rateLimit = false
+		t.rateLimitUntil = time.Time{}
+		return 0
+	}
+	return remaining
+}
+
+func (t *carrierStartupTelemetry) setAuthSource(source string) {
+	if t == nil || strings.TrimSpace(source) == "" {
+		return
+	}
+	t.authMu.Lock()
+	t.authSource = source
+	t.authMu.Unlock()
+}
+
+func (t *carrierStartupTelemetry) getAuthSource() string {
+	if t == nil {
+		return ""
+	}
+	t.authMu.RLock()
+	source := t.authSource
+	t.authMu.RUnlock()
+	return source
 }
 
 func (t *carrierStartupTelemetry) markCarrierReady() {
@@ -329,7 +380,12 @@ func (t *carrierStartupTelemetry) markTrafficReady() {
 	if t == nil {
 		return
 	}
-	t.mark(&t.trafficReady, "traffic_ready", "")
+	t.trafficReady.Do(func() {
+		close(t.trafficReadySignal)
+		if t.logf != nil {
+			t.logf("WLT startup phase=traffic_ready elapsed_ms=%d", time.Since(t.startedAt).Milliseconds())
+		}
+	})
 }
 
 type CarrierConfigOptions struct {
@@ -531,12 +587,20 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		}
 		return nil, fmt.Errorf("promote WLT carrier auth snapshot: %w", err)
 	}
-	clearProviderCooldown(options, logf)
+	// A valid reserve may recover traffic while provider authorization remains
+	// rate-limited. Preserve that cooldown so background replenishment cannot
+	// immediately repeat the blocked request.
+	if !startup.providerRateLimited() {
+		clearProviderCooldown(options, logf)
+	}
 	if logf != nil {
 		logf("WLT carrier auth snapshot promoted after successful connect")
 	}
 	if err := saveCarrierAuthSnapshot(options, cfg, logf); err != nil && logf != nil {
 		logf("WLT carrier auth snapshot save failed error=%v", err)
+	}
+	if err := quarantineRejectedCarrierAuth(cfg, options, startup.getAuthSource(), logf); err != nil && logf != nil {
+		logf("WLT carrier auth ring event=quarantine_failed error=%v", err)
 	}
 
 	carrier := &Carrier{
@@ -593,6 +657,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		transportOptions.RelayBandwidthBytesPerSecond,
 	)
 	startup.markCarrierReady()
+	scheduleCarrierAuthReserve(runCtx, cfg, options, logf)
 	return carrier, nil
 }
 
@@ -761,6 +826,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		}
 		client, err := connectCarrierClientForStart(ctx, cfg, options.ConnectTimeout, logf)
 		if err == nil {
+			options.startup.setAuthSource(source)
 			if logf != nil {
 				logf("WLT carrier auth event=fallback_succeeded source=%s", source)
 			}
@@ -771,6 +837,37 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 			logf("WLT carrier auth event=fallback_failed source=%s error=%v", source, err)
 		}
 		return nil, false
+	}
+
+	// Exhaust every persisted local lane before making another provider auth
+	// request. current/previous protect session rotation; reserve carries a
+	// separately minted provider identity for rate-limit-safe failover.
+	for _, candidate := range localCarrierAuthRecoveryCandidates(options) {
+		loaded, loadErr := importCarrierAuthCandidate(cfg, candidate, logf)
+		if loadErr != nil {
+			combinedErr = errors.Join(combinedErr, loadErr)
+			if logf != nil {
+				logf("WLT carrier auth event=candidate_unavailable source=%s", candidate.source)
+			}
+			continue
+		}
+		if loaded {
+			if client, ok := connectCandidate(candidate.source); ok {
+				return client, nil
+			}
+		}
+	}
+
+	inline := strings.TrimSpace(options.AuthSnapshot)
+	if inline != "" {
+		if inlineErr := carrierengine.ImportAuthSnapshotJSON([]byte(inline)); inlineErr != nil {
+			combinedErr = errors.Join(combinedErr, inlineErr)
+			if logf != nil {
+				logf("WLT carrier auth event=inline_unavailable source=inline error=%v", inlineErr)
+			}
+		} else if client, ok := connectCandidate("inline"); ok {
+			return client, nil
+		}
 	}
 
 	if options.startup.providerRateLimited() {
@@ -787,30 +884,6 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		}
 	} else if client, ok := connectCandidate("refreshed"); ok {
 		return client, nil
-	}
-
-	previousLoaded, previousErr := loadCarrierPreviousAuthSnapshot(cfg, options, logf)
-	if previousErr != nil {
-		combinedErr = errors.Join(combinedErr, previousErr)
-		if logf != nil {
-			logf("WLT carrier auth event=previous_unavailable source=previous error=%v", previousErr)
-		}
-	} else if previousLoaded {
-		if client, ok := connectCandidate("previous"); ok {
-			return client, nil
-		}
-	}
-
-	inline := strings.TrimSpace(options.AuthSnapshot)
-	if inline != "" {
-		if inlineErr := prepareCarrierAuthSnapshot(ctx, cfg, options, []byte(inline), "inline_recovery", logf); inlineErr != nil {
-			combinedErr = errors.Join(combinedErr, inlineErr)
-			if logf != nil {
-				logf("WLT carrier auth event=inline_unavailable source=inline error=%v", inlineErr)
-			}
-		} else if client, ok := connectCandidate("inline"); ok {
-			return client, nil
-		}
 	}
 
 	// Explicit TURN/signaling rejection invalidates the provider cache in the
@@ -1123,14 +1196,13 @@ func loadProviderCooldown(options CarrierOptions, logf func(string, ...any)) {
 		}
 		return
 	}
-	options.startup.markProviderRateLimited()
+	options.startup.markProviderRateLimitedUntil(time.Unix(state.BlockedUntil, 0))
 	if logf != nil {
 		logf("WLT carrier auth event=provider_cooldown_active remaining_seconds=%d attempts=%d", int64(remaining/time.Second), state.Attempts)
 	}
 }
 
 func recordProviderRateLimit(options CarrierOptions, logf func(string, ...any)) {
-	options.startup.markProviderRateLimited()
 	path := providerCooldownPath(options)
 	if path == "" {
 		return
@@ -1151,6 +1223,7 @@ func recordProviderRateLimit(options CarrierOptions, logf func(string, ...any)) 
 		}
 	}
 	state.BlockedUntil = time.Now().Add(delay).Unix()
+	options.startup.markProviderRateLimitedUntil(time.Unix(state.BlockedUntil, 0))
 	data, err := json.Marshal(state)
 	if err != nil || writeCarrierAuthSnapshotFile(path, data) != nil {
 		if logf != nil {

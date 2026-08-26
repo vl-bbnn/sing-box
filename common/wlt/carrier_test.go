@@ -732,6 +732,23 @@ func TestProviderRateLimitBackoffEscalatesAndCaps(t *testing.T) {
 	}
 }
 
+func TestProviderRateLimitExpiresWithoutProcessRestart(t *testing.T) {
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	startup.markProviderRateLimitedUntil(time.Now().Add(time.Hour))
+	if !startup.providerRateLimited() {
+		t.Fatal("fresh provider cooldown was not active")
+	}
+	startup.rateMu.Lock()
+	startup.rateLimitUntil = time.Now().Add(-time.Second)
+	startup.rateMu.Unlock()
+	if startup.providerRateLimited() {
+		t.Fatal("expired provider cooldown remained active")
+	}
+	if remaining := startup.providerRateLimitRemaining(); remaining != 0 {
+		t.Fatalf("expired provider cooldown remaining=%s", remaining)
+	}
+}
+
 func TestLoadCarrierAuthSnapshotRefreshesWithoutConfigTimestamp(t *testing.T) {
 	refreshCalls := 0
 	previousRefresh := refreshCarrierAuthSnapshot
