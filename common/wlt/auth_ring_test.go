@@ -248,6 +248,7 @@ func TestInjectedIdentityRejectionSkipsSameIdentitySessions(t *testing.T) {
 		},
 		carriercommon.ErrAuthSnapshotReauthorizationRequired,
 		active,
+		true,
 		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
 	)
 	if err != nil || client == nil {
@@ -302,7 +303,7 @@ func TestRecoveryUsesReserveBeforeProviderAuthorization(t *testing.T) {
 		ConnectTimeout:         time.Second,
 		startup:                startup,
 	}
-	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, errors.New("active rejected"), nil, nil)
+	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, errors.New("active rejected"), nil, true, nil)
 	if err != nil || client == nil {
 		t.Fatalf("client=%v err=%v", client, err)
 	}
@@ -311,6 +312,75 @@ func TestRecoveryUsesReserveBeforeProviderAuthorization(t *testing.T) {
 	}
 	if source := startup.getAuthSource(); source != "reserve" {
 		t.Fatalf("auth source=%q", source)
+	}
+}
+
+func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	previousIndependent := carrierAuthSnapshotsIndependent
+	refreshCalls := 0
+	prewarmCalls := 0
+	connectCalls := 0
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		refreshCalls++
+		return nil, errors.New("must not refresh")
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("must not authorize")
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		return nil, context.DeadlineExceeded
+	}
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Equal(left, right), nil
+	}
+	t.Cleanup(func() {
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+		connectCarrierClientForStart = previousConnect
+		carrierAuthSnapshotsIndependent = previousIndependent
+	})
+
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("transport-local-only-test"),
+		CarrierOptions{
+			AuthSnapshotFile:       path,
+			AuthSnapshotOutputFile: path,
+			ConnectTimeout:         time.Second,
+			startup:                startup,
+		},
+		context.DeadlineExceeded,
+		active,
+		false,
+		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
+	)
+	if client != nil || err == nil {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if connectCalls != 1 || refreshCalls != 0 || prewarmCalls != 0 {
+		t.Fatalf("connect=%d refresh=%d prewarm=%d", connectCalls, refreshCalls, prewarmCalls)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "fallback_started source=reserve") ||
+		!strings.Contains(joined, "provider_fallback_skipped reason=local_only") {
+		t.Fatalf("local-only transport recovery evidence missing: %s", joined)
 	}
 }
 

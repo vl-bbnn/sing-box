@@ -559,7 +559,7 @@ func TestRecoverCarrierAuthPromotesFreshIdentityOnlyAfterSuccessfulConnect(t *te
 	}
 	cfg := testCarrierClientConfig("restart-snapshot-test")
 	var logs []string
-	client, err := recoverCarrierAuthAfterRejection(context.Background(), cfg, options, carriercommon.ErrAuthSnapshotReauthorizationRequired, nil, func(format string, arguments ...any) {
+	client, err := recoverCarrierAuthAfterRejection(context.Background(), cfg, options, carriercommon.ErrAuthSnapshotReauthorizationRequired, nil, true, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
 	if err != nil {
@@ -663,7 +663,7 @@ func TestRecoveryDoesNotRepeatProviderWorkAfterCaptchaRateLimit(t *testing.T) {
 		prewarmCarrierAuthSnapshot = previousPrewarm
 	})
 	var logs []string
-	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("rate-limit-test"), options, carriercommon.ErrAuthSnapshotReauthorizationRequired, nil, func(format string, arguments ...any) {
+	client, err := recoverCarrierAuthAfterRejection(context.Background(), testCarrierClientConfig("rate-limit-test"), options, carriercommon.ErrAuthSnapshotReauthorizationRequired, nil, true, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
 	if client != nil || !errors.Is(err, carriercommon.ErrHumanChallengeErrorLimit) {

@@ -577,11 +577,33 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	} else {
 		runtimeClient, err = connectCarrierClientForStart(runCtx, cfg, options.ConnectTimeout, logf)
 	}
-	if carrierAuthRecoveryRequired(err) {
-		if logf != nil {
-			logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
+	allowProviderRecovery := carrierAuthRecoveryRequired(err)
+	localTransportRecovery := false
+	if err != nil && !allowProviderRecovery && runCtx.Err() == nil {
+		reserveIndependent, reserveErr := carrierAuthReserveIndependent(cfg, options)
+		if reserveErr != nil {
+			if logf != nil {
+				logf("WLT carrier auth ring event=transport_fallback_unavailable error=%v", reserveErr)
+			}
+		} else if reserveIndependent {
+			localTransportRecovery = true
+			if exported, exportErr := carrierengine.ExportAuthSnapshotJSON(*cfg); exportErr == nil {
+				rejectedIdentity = exported
+			}
+			if logf != nil {
+				logf("WLT carrier auth ring event=transport_fallback_required source=current scope=local_only")
+			}
 		}
-		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, rejectedIdentity, logf)
+	}
+	if allowProviderRecovery || localTransportRecovery {
+		if logf != nil {
+			if allowProviderRecovery {
+				logf("WLT carrier auth event=reauthorization_required source=current phase=turn_auth_recovery")
+			} else {
+				logf("WLT carrier auth event=transport_recovery_required source=current phase=local_ring_failover")
+			}
+		}
+		runtimeClient, err = recoverCarrierAuthAfterRejection(runCtx, cfg, options, err, rejectedIdentity, allowProviderRecovery, logf)
 		if err != nil {
 			if logf != nil {
 				logf("WLT carrier start phase=turn_auth_recovery_unavailable error=%v", err)
@@ -842,7 +864,7 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 	return nil
 }
 
-func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, rejectedIdentity []byte, logf func(string, ...any)) (*carrierengine.Client, error) {
+func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, rejectedIdentity []byte, allowProviderRecovery bool, logf func(string, ...any)) (*carrierengine.Client, error) {
 	combinedErr := initialErr
 	connectCandidate := func(source string) (*carrierengine.Client, bool) {
 		if logf != nil {
@@ -909,6 +931,13 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 				return client, nil
 			}
 		}
+	}
+
+	if !allowProviderRecovery {
+		if logf != nil {
+			logf("WLT carrier auth event=provider_fallback_skipped reason=local_only")
+		}
+		return nil, combinedErr
 	}
 
 	if options.startup.providerRateLimited() {
