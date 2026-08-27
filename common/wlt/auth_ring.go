@@ -336,6 +336,24 @@ func localCarrierAuthRecoveryCandidates(options CarrierOptions) []carrierAuthCan
 	}
 }
 
+func currentCarrierAuthIdentity(cfg *carrierconfig.ClientConfig, options CarrierOptions) ([]byte, error) {
+	path := carrierAuthSnapshotPath(options)
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil && len(bytes.TrimSpace(data)) > 0 {
+			return data, nil
+		}
+	}
+	if cfg == nil {
+		return nil, errors.New("carrier config is required to export the active auth identity")
+	}
+	data, err := carrierengine.ExportAuthSnapshotJSON(*cfg)
+	if err != nil {
+		return nil, fmt.Errorf("export active auth identity: %w", err)
+	}
+	return data, nil
+}
+
 func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carrierAuthCandidate, rejectedIdentity []byte, logf func(string, ...any)) (bool, error) {
 	if cfg == nil {
 		return false, errors.New("carrier config is required for auth ring")

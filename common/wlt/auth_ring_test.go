@@ -322,6 +322,9 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 	if err := os.WriteFile(path, active, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(path+authSnapshotPreviousSuffix, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -357,17 +360,23 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 
 	startup := newCarrierStartupTelemetry(time.Now(), nil)
 	var logs []string
+	options := CarrierOptions{
+		AuthSnapshot:           string(active),
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
+		ConnectTimeout:         time.Second,
+		startup:                startup,
+	}
+	rejectedIdentity, err := currentCarrierAuthIdentity(testCarrierClientConfig("transport-local-only-test"), options)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client, err := recoverCarrierAuthAfterRejection(
 		context.Background(),
 		testCarrierClientConfig("transport-local-only-test"),
-		CarrierOptions{
-			AuthSnapshotFile:       path,
-			AuthSnapshotOutputFile: path,
-			ConnectTimeout:         time.Second,
-			startup:                startup,
-		},
+		options,
 		context.DeadlineExceeded,
-		active,
+		rejectedIdentity,
 		false,
 		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
 	)
@@ -378,7 +387,9 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 		t.Fatalf("connect=%d refresh=%d prewarm=%d", connectCalls, refreshCalls, prewarmCalls)
 	}
 	joined := strings.Join(logs, "\n")
-	if !strings.Contains(joined, "fallback_started source=reserve") ||
+	if !strings.Contains(joined, "candidate_rejected_same_identity source=previous") ||
+		!strings.Contains(joined, "fallback_started source=reserve") ||
+		!strings.Contains(joined, "candidate_rejected_same_identity source=inline") ||
 		!strings.Contains(joined, "provider_fallback_skipped reason=local_only") {
 		t.Fatalf("local-only transport recovery evidence missing: %s", joined)
 	}

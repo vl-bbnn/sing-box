@@ -587,8 +587,10 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 			}
 		} else if reserveIndependent {
 			localTransportRecovery = true
-			if exported, exportErr := carrierengine.ExportAuthSnapshotJSON(*cfg); exportErr == nil {
-				rejectedIdentity = exported
+			if activeIdentity, identityErr := currentCarrierAuthIdentity(cfg, options); identityErr == nil {
+				rejectedIdentity = activeIdentity
+			} else if logf != nil {
+				logf("WLT carrier auth ring event=active_identity_unavailable error=%v", identityErr)
 			}
 			if logf != nil {
 				logf("WLT carrier auth ring event=transport_fallback_required source=current scope=local_only")
