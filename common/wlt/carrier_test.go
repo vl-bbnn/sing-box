@@ -418,11 +418,11 @@ func TestLoadCarrierAuthSnapshotDefersRefreshedIdentityPersistence(t *testing.T)
 	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshotAt("expired-token", time.Now().Add(-time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	previousRefresh := refreshCarrierAuthSnapshot
-	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	previousRefresh := refreshExistingCarrierAuthSnapshot
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
 		return []byte(testCarrierAuthSnapshotAt("refreshed-token", time.Now().Add(30*time.Minute))), nil
 	}
-	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	t.Cleanup(func() { refreshExistingCarrierAuthSnapshot = previousRefresh })
 	var logs []string
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
@@ -452,11 +452,11 @@ func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T
 	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshotAt("expired-token", time.Now().Add(-time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	previousRefresh := refreshCarrierAuthSnapshot
-	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	previousRefresh := refreshExistingCarrierAuthSnapshot
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
 		return nil, errors.New("provider unavailable")
 	}
-	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	t.Cleanup(func() { refreshExistingCarrierAuthSnapshot = previousRefresh })
 	var logs []string
 	err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
@@ -751,12 +751,12 @@ func TestProviderRateLimitExpiresWithoutProcessRestart(t *testing.T) {
 
 func TestLoadCarrierAuthSnapshotRefreshesWithoutConfigTimestamp(t *testing.T) {
 	refreshCalls := 0
-	previousRefresh := refreshCarrierAuthSnapshot
-	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	previousRefresh := refreshExistingCarrierAuthSnapshot
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
 		refreshCalls++
 		return []byte(testCarrierAuthSnapshot("refreshed-token")), nil
 	}
-	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	t.Cleanup(func() { refreshExistingCarrierAuthSnapshot = previousRefresh })
 	var logs []string
 	err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshot: testCarrierAuthSnapshotAt("cached-token", time.Now().Add(-time.Hour)),

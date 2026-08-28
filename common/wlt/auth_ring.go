@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"time"
 
-	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
@@ -330,9 +329,9 @@ func localCarrierAuthRecoveryCandidates(options CarrierOptions) []carrierAuthCan
 		return nil
 	}
 	return []carrierAuthCandidate{
-		{source: "previous", path: path + authSnapshotPreviousSuffix},
 		{source: "reserve", path: path + authSnapshotReserveSuffix},
 		{source: "reserve_previous", path: path + authSnapshotReserveSuffix + authSnapshotPreviousSuffix},
+		{source: "previous", path: path + authSnapshotPreviousSuffix},
 	}
 }
 
@@ -354,41 +353,65 @@ func currentCarrierAuthIdentity(cfg *carrierconfig.ClientConfig, options Carrier
 	return data, nil
 }
 
-func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carrierAuthCandidate, rejectedIdentity []byte, logf func(string, ...any)) (bool, error) {
+func importCarrierAuthCandidate(cfg *carrierconfig.ClientConfig, candidate carrierAuthCandidate, rejectedIdentity []byte, logf func(string, ...any)) (bool, []byte, error) {
 	if cfg == nil {
-		return false, errors.New("carrier config is required for auth ring")
+		return false, nil, errors.New("carrier config is required for auth ring")
 	}
 	data, err := os.ReadFile(candidate.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return false, nil, nil
 		}
-		return false, fmt.Errorf("read %s auth snapshot: %w", candidate.source, err)
+		return false, nil, fmt.Errorf("read %s auth snapshot: %w", candidate.source, err)
 	}
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 	if len(rejectedIdentity) > 0 {
 		independent, err := carrierAuthSnapshotsIndependent(*cfg, rejectedIdentity, data)
 		if err != nil {
-			return false, fmt.Errorf("compare %s auth identity: %w", candidate.source, err)
+			return false, nil, fmt.Errorf("compare %s auth identity: %w", candidate.source, err)
 		}
 		if !independent {
 			if logf != nil {
 				logf("WLT carrier auth ring test event=candidate_rejected_same_identity source=%s", candidate.source)
 			}
-			return false, nil
+			return false, nil, nil
 		}
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON(data); err != nil {
-		return false, fmt.Errorf("import %s auth snapshot: %w", candidate.source, err)
+		return false, nil, fmt.Errorf("import %s auth snapshot: %w", candidate.source, err)
 	}
 	if logf != nil {
 		remaining, _ := carrierAuthSnapshotRemainingTTL(data)
 		logf("WLT carrier auth event=snapshot_loaded source=%s remaining_ttl_seconds=%d", candidate.source, int64(remaining/time.Second))
 	}
-	return true, nil
+	return true, data, nil
+}
+
+func consumeCarrierAuthRecoverySource(options CarrierOptions, source string, logf func(string, ...any)) error {
+	switch source {
+	case "reserve", "reserve_refreshed", "reserve_previous", "reserve_previous_refreshed":
+	default:
+		return nil
+	}
+	reservePath := carrierAuthReservePath(options)
+	if reservePath == "" {
+		return nil
+	}
+	for _, path := range []string{
+		reservePath,
+		reservePath + authSnapshotPreviousSuffix,
+	} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("consume promoted reserve auth snapshot: %w", err)
+		}
+	}
+	if logf != nil {
+		logf("WLT carrier auth ring event=reserve_consumed replacement=active replenishment=required")
+	}
+	return nil
 }
 
 func writeCarrierAuthReserve(options CarrierOptions, data []byte) error {
@@ -540,7 +563,7 @@ func replenishCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientC
 	fresh, err := prewarmFreshCarrierAuthSnapshot(ctx, *cfg)
 	if err != nil {
 		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		if errors.Is(err, carriercommon.ErrHumanChallengeErrorLimit) {
+		if isProviderRateLimitError(err) {
 			recordProviderRateLimit(options, logf)
 		}
 		return fmt.Errorf("create reserve auth identity: %w", err)

@@ -149,6 +149,7 @@ type providerCooldownState struct {
 
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
+	refreshExistingCarrierAuthSnapshot  = carrierengine.RefreshExistingAuthSnapshotContext
 	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuthUnattended
 	prewarmFreshCarrierAuthSnapshot     = carrierengine.PrewarmFreshAuthUnattendedContext
 	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
@@ -650,6 +651,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	if err := quarantineRejectedCarrierAuth(cfg, options, startup.getAuthSource(), logf); err != nil && logf != nil {
 		logf("WLT carrier auth ring event=quarantine_failed error=%v", err)
 	}
+	if err := consumeCarrierAuthRecoverySource(options, startup.getAuthSource(), logf); err != nil && logf != nil {
+		logf("WLT carrier auth ring event=reserve_consume_failed error=%v", err)
+	}
 
 	carrier := &Carrier{
 		client:               runtimeClient,
@@ -822,6 +826,33 @@ func isFatalCarrierConnectError(err error) bool {
 		errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired)
 }
 
+func isProviderRateLimitError(err error) bool {
+	return errors.Is(err, carriercommon.ErrProviderRateLimited) ||
+		errors.Is(err, carriercommon.ErrHumanChallengeErrorLimit)
+}
+
+func refreshExistingCarrierAuthCandidate(ctx context.Context, cfg *carrierconfig.ClientConfig, raw []byte, source string, logf func(string, ...any)) error {
+	if cfg == nil {
+		return errors.New("carrier config is required for local auth recovery")
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
+	defer cancel()
+	refreshed, err := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+	if err != nil {
+		if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) && logf != nil {
+			logf("WLT carrier auth event=reauthorization_required source=%s", source)
+		}
+		return fmt.Errorf("refresh existing %s auth snapshot: %w", source, err)
+	}
+	if err := carrierengine.ImportAuthSnapshotJSON(refreshed); err != nil {
+		return fmt.Errorf("import refreshed existing %s auth snapshot: %w", source, err)
+	}
+	if logf != nil {
+		logf("WLT carrier start phase=turn_auth_candidate_ready source=%s_refreshed identity=existing persistence=deferred", source)
+	}
+	return nil
+}
+
 func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
 	if cfg == nil {
 		return errors.New("carrier config is required for auth snapshot recovery")
@@ -868,7 +899,8 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 
 func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, rejectedIdentity []byte, allowProviderRecovery bool, logf func(string, ...any)) (*carrierengine.Client, error) {
 	combinedErr := initialErr
-	connectCandidate := func(source string) (*carrierengine.Client, bool) {
+	var refreshedIdentities [][]byte
+	connectCandidate := func(source string) (*carrierengine.Client, error) {
 		if logf != nil {
 			logf("WLT carrier auth event=fallback_started source=%s", source)
 		}
@@ -878,20 +910,65 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 			if logf != nil {
 				logf("WLT carrier auth event=fallback_succeeded source=%s", source)
 			}
-			return client, true
+			return client, nil
 		}
 		combinedErr = errors.Join(combinedErr, fmt.Errorf("connect %s auth snapshot: %w", source, err))
 		if logf != nil {
 			logf("WLT carrier auth event=fallback_failed source=%s error=%v", source, err)
 		}
-		return nil, false
+		return nil, err
+	}
+	tryLocalCandidate := func(source string, raw []byte) (*carrierengine.Client, bool) {
+		client, connectErr := connectCandidate(source)
+		if connectErr == nil {
+			return client, true
+		}
+		if !allowProviderRecovery || !errors.Is(connectErr, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+			return nil, false
+		}
+		if options.startup.providerRateLimited() {
+			if logf != nil {
+				logf("WLT carrier auth event=refresh_skipped source=%s reason=provider_rate_limited", source)
+			}
+			return nil, false
+		}
+		for _, refreshedIdentity := range refreshedIdentities {
+			independent, independentErr := carrierAuthSnapshotsIndependent(*cfg, refreshedIdentity, raw)
+			if independentErr != nil {
+				combinedErr = errors.Join(combinedErr, fmt.Errorf("compare refreshed %s auth identity: %w", source, independentErr))
+				if logf != nil {
+					logf("WLT carrier auth event=refresh_skipped source=%s reason=identity_comparison_failed", source)
+				}
+				return nil, false
+			}
+			if !independent {
+				if logf != nil {
+					logf("WLT carrier auth event=refresh_skipped source=%s reason=identity_already_attempted", source)
+				}
+				return nil, false
+			}
+		}
+		refreshedIdentities = append(refreshedIdentities, append([]byte(nil), raw...))
+		if refreshErr := refreshExistingCarrierAuthCandidate(ctx, cfg, raw, source, logf); refreshErr != nil {
+			combinedErr = errors.Join(combinedErr, refreshErr)
+			if isProviderRateLimitError(refreshErr) {
+				recordProviderRateLimit(options, logf)
+			}
+			if logf != nil {
+				logf("WLT carrier auth event=existing_refresh_failed source=%s error=%v", source, refreshErr)
+			}
+			return nil, false
+		}
+		refreshedSource := source + "_refreshed"
+		client, connectErr = connectCandidate(refreshedSource)
+		return client, connectErr == nil
 	}
 
 	// Exhaust every persisted local lane before making another provider auth
-	// request. current/previous protect session rotation; reserve carries a
-	// separately minted provider identity for rate-limit-safe failover.
+	// request. Reserve carries a separately minted identity and is attempted
+	// first; previous snapshots retain alternate sessions for both identities.
 	for _, candidate := range localCarrierAuthRecoveryCandidates(options) {
-		loaded, loadErr := importCarrierAuthCandidate(cfg, candidate, rejectedIdentity, logf)
+		loaded, raw, loadErr := importCarrierAuthCandidate(cfg, candidate, rejectedIdentity, logf)
 		if loadErr != nil {
 			combinedErr = errors.Join(combinedErr, loadErr)
 			if logf != nil {
@@ -900,7 +977,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 			continue
 		}
 		if loaded {
-			if client, ok := connectCandidate(candidate.source); ok {
+			if client, ok := tryLocalCandidate(candidate.source, raw); ok {
 				return client, nil
 			}
 		}
@@ -929,7 +1006,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 				if logf != nil {
 					logf("WLT carrier auth event=inline_unavailable source=inline error=%v", inlineErr)
 				}
-			} else if client, ok := connectCandidate("inline"); ok {
+			} else if client, ok := tryLocalCandidate("inline", inlineData); ok {
 				return client, nil
 			}
 		}
@@ -948,13 +1025,13 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		}
 	} else if refreshErr := refreshCarrierAuthSnapshotAfterRejection(ctx, cfg, options, logf); refreshErr != nil {
 		combinedErr = errors.Join(combinedErr, refreshErr)
-		if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+		if isProviderRateLimitError(refreshErr) {
 			recordProviderRateLimit(options, logf)
 		}
 		if logf != nil {
 			logf("WLT carrier start phase=turn_auth_refresh_unavailable error=%v", refreshErr)
 		}
-	} else if client, ok := connectCandidate("refreshed"); ok {
+	} else if client, connectErr := connectCandidate("refreshed"); connectErr == nil {
 		return client, nil
 	}
 
@@ -974,7 +1051,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	}
 	fresh, freshErr := prewarmCarrierAuthSnapshot(*cfg)
 	if freshErr != nil {
-		if errors.Is(freshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+		if isProviderRateLimitError(freshErr) {
 			recordProviderRateLimit(options, logf)
 		}
 		combinedErr = errors.Join(combinedErr, fmt.Errorf("fresh client-local authorization: %w", freshErr))
@@ -990,7 +1067,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 	if logf != nil {
 		logf("WLT carrier auth event=fresh_reauthorization_ready source=client_local persistence=deferred")
 	}
-	if client, ok := connectCandidate("fresh"); ok {
+	if client, connectErr := connectCandidate("fresh"); connectErr == nil {
 		return client, nil
 	}
 	return nil, combinedErr
@@ -1130,10 +1207,10 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 			logf("WLT carrier auth event=refresh_started source=%s remaining_ttl_seconds=%d", source, int64(remaining/time.Second))
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
-		refreshed, refreshErr := refreshCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+		refreshed, refreshErr := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
 		cancel()
 		if refreshErr != nil {
-			if errors.Is(refreshErr, carriercommon.ErrHumanChallengeErrorLimit) {
+			if isProviderRateLimitError(refreshErr) {
 				recordProviderRateLimit(options, logf)
 			}
 			// expires_at is a local refresh policy, not proof that the provider

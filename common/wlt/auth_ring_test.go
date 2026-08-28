@@ -196,7 +196,7 @@ func TestAuthRingBootstrapPreservesAnExistingIndependentRing(t *testing.T) {
 	}
 }
 
-func TestInjectedIdentityRejectionSkipsSameIdentitySessions(t *testing.T) {
+func TestInjectedIdentityRejectionUsesReserveBeforeSameIdentitySessions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
 	active := []byte(testCarrierAuthSnapshot("active-token"))
 	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
@@ -261,9 +261,282 @@ func TestInjectedIdentityRejectionSkipsSameIdentitySessions(t *testing.T) {
 		t.Fatalf("auth source=%q", source)
 	}
 	joined := strings.Join(logs, "\n")
-	if !strings.Contains(joined, "candidate_rejected_same_identity source=previous") ||
-		!strings.Contains(joined, "fallback_succeeded source=reserve") {
+	if !strings.Contains(joined, "snapshot_loaded source=reserve") ||
+		!strings.Contains(joined, "fallback_succeeded source=reserve") ||
+		strings.Contains(joined, "source=previous") {
 		t.Fatalf("identity-scoped recovery evidence missing: %s", joined)
+	}
+}
+
+func TestExpiredReserveRefreshesExistingIdentityBeforeFreshAuthorization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	refreshedReserve := []byte(testCarrierAuthSnapshot("reserve-token-refreshed"))
+	if err := os.WriteFile(path, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousExistingRefresh := refreshExistingCarrierAuthSnapshot
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	previousIndependent := carrierAuthSnapshotsIndependent
+	existingRefreshCalls := 0
+	fullRefreshCalls := 0
+	prewarmCalls := 0
+	connectCalls := 0
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte) ([]byte, error) {
+		existingRefreshCalls++
+		if !bytes.Equal(raw, reserve) {
+			t.Fatalf("existing-only refresh received wrong identity")
+		}
+		return refreshedReserve, nil
+	}
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		fullRefreshCalls++
+		return nil, errors.New("full refresh must not run")
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("fresh authorization must not run")
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		if connectCalls == 1 {
+			return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+		}
+		return &carrierengine.Client{}, nil
+	}
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Equal(left, right), nil
+	}
+	t.Cleanup(func() {
+		refreshExistingCarrierAuthSnapshot = previousExistingRefresh
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+		connectCarrierClientForStart = previousConnect
+		carrierAuthSnapshotsIndependent = previousIndependent
+	})
+
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	options := CarrierOptions{
+		AuthSnapshot:           string(active),
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
+		ConnectTimeout:         time.Second,
+		startup:                startup,
+	}
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("restart-snapshot-test"),
+		options,
+		carriercommon.ErrAuthSnapshotReauthorizationRequired,
+		active,
+		true,
+		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
+	)
+	if err != nil || client == nil {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if existingRefreshCalls != 1 || fullRefreshCalls != 0 || prewarmCalls != 0 || connectCalls != 2 {
+		t.Fatalf("existing_refresh=%d full_refresh=%d prewarm=%d connect=%d", existingRefreshCalls, fullRefreshCalls, prewarmCalls, connectCalls)
+	}
+	if source := startup.getAuthSource(); source != "reserve_refreshed" {
+		t.Fatalf("auth source=%q", source)
+	}
+	currentBeforePromotion, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(currentBeforePromotion, active) {
+		t.Fatal("current identity changed before successful candidate promotion")
+	}
+
+	cfg := testCarrierClientConfig("restart-snapshot-test")
+	if err := saveCarrierAuthSnapshot(options, cfg, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineRejectedCarrierAuth(cfg, options, startup.getAuthSource(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumeCarrierAuthRecoverySource(options, startup.getAuthSource(), nil); err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(promoted), "reserve-token-refreshed") || strings.Contains(string(promoted), "active-token") {
+		t.Fatal("refreshed reserve was not promoted")
+	}
+	quarantined, err := os.ReadFile(path + authSnapshotQuarantineSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(quarantined), bytes.TrimSpace(active)) {
+		t.Fatal("rejected active identity was not quarantined")
+	}
+	for _, consumedPath := range []string{path + authSnapshotReserveSuffix, path + authSnapshotReserveSuffix + authSnapshotPreviousSuffix} {
+		if _, err := os.Stat(consumedPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("promoted reserve was not consumed: %v", err)
+		}
+	}
+	joined := strings.Join(logs, "\n")
+	for _, event := range []string{"fallback_failed source=reserve", "source=reserve_refreshed", "identity=existing"} {
+		if !strings.Contains(joined, event) {
+			t.Fatalf("missing recovery evidence %q: %s", event, joined)
+		}
+	}
+}
+
+func TestReserveRefreshRateLimitPersistsCooldownAndStopsProviderWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousExistingRefresh := refreshExistingCarrierAuthSnapshot
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	existingRefreshCalls := 0
+	fullRefreshCalls := 0
+	prewarmCalls := 0
+	connectCalls := 0
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		existingRefreshCalls++
+		return nil, carriercommon.ErrProviderRateLimited
+	}
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		fullRefreshCalls++
+		return nil, errors.New("full refresh must not run")
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("fresh authorization must not run")
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+	}
+	t.Cleanup(func() {
+		refreshExistingCarrierAuthSnapshot = previousExistingRefresh
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+		connectCarrierClientForStart = previousConnect
+	})
+
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	options := CarrierOptions{
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
+		ConnectTimeout:         time.Second,
+		startup:                startup,
+	}
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("restart-snapshot-test"),
+		options,
+		carriercommon.ErrAuthSnapshotReauthorizationRequired,
+		nil,
+		true,
+		nil,
+	)
+	if client != nil || !errors.Is(err, carriercommon.ErrProviderRateLimited) {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if existingRefreshCalls != 1 || fullRefreshCalls != 0 || prewarmCalls != 0 || connectCalls != 1 {
+		t.Fatalf("existing_refresh=%d full_refresh=%d prewarm=%d connect=%d", existingRefreshCalls, fullRefreshCalls, prewarmCalls, connectCalls)
+	}
+	if !startup.providerRateLimited() {
+		t.Fatal("provider cooldown was not retained in startup state")
+	}
+	if _, err := os.Stat(path + providerCooldownSuffix); err != nil {
+		t.Fatalf("provider cooldown was not persisted: %v", err)
+	}
+}
+
+func TestSameReserveIdentityRefreshIsNotAmplifiedAcrossSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	active := []byte(testCarrierAuthSnapshot("active-token"))
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+authSnapshotReserveSuffix+authSnapshotPreviousSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousExistingRefresh := refreshExistingCarrierAuthSnapshot
+	previousRefresh := refreshCarrierAuthSnapshot
+	previousPrewarm := prewarmCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	previousIndependent := carrierAuthSnapshotsIndependent
+	existingRefreshCalls := 0
+	fullRefreshCalls := 0
+	prewarmCalls := 0
+	connectCalls := 0
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		existingRefreshCalls++
+		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+	}
+	refreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+		fullRefreshCalls++
+		return []byte(testCarrierAuthSnapshot("active-token-refreshed")), nil
+	}
+	prewarmCarrierAuthSnapshot = func(carrierconfig.ClientConfig) ([]byte, error) {
+		prewarmCalls++
+		return nil, errors.New("fresh authorization must not run")
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		if connectCalls < 3 {
+			return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+		}
+		return &carrierengine.Client{}, nil
+	}
+	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
+		return !bytes.Equal(left, right), nil
+	}
+	t.Cleanup(func() {
+		refreshExistingCarrierAuthSnapshot = previousExistingRefresh
+		refreshCarrierAuthSnapshot = previousRefresh
+		prewarmCarrierAuthSnapshot = previousPrewarm
+		connectCarrierClientForStart = previousConnect
+		carrierAuthSnapshotsIndependent = previousIndependent
+	})
+
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{
+			AuthSnapshot:           string(active),
+			AuthSnapshotFile:       path,
+			AuthSnapshotOutputFile: path,
+			ConnectTimeout:         time.Second,
+			startup:                startup,
+		},
+		carriercommon.ErrAuthSnapshotReauthorizationRequired,
+		active,
+		true,
+		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
+	)
+	if err != nil || client == nil {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if existingRefreshCalls != 1 || fullRefreshCalls != 1 || prewarmCalls != 0 || connectCalls != 3 {
+		t.Fatalf("existing_refresh=%d full_refresh=%d prewarm=%d connect=%d", existingRefreshCalls, fullRefreshCalls, prewarmCalls, connectCalls)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "refresh_skipped source=reserve_previous reason=identity_already_attempted") {
+		t.Fatalf("same reserve identity refresh was not deduplicated: %s", strings.Join(logs, "\n"))
 	}
 }
 
