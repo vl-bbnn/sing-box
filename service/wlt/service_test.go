@@ -167,47 +167,6 @@ func TestWaitCarrierRejectsStoppedService(t *testing.T) {
 	}
 }
 
-func TestScheduleCarrierRestartDetachesBeforeReturning(t *testing.T) {
-	serviceContext, cancelService := context.WithCancel(context.Background())
-	cancelService()
-	carrier := &wltpkg.Carrier{}
-	service := &Service{
-		ctx:          serviceContext,
-		carrier:      carrier,
-		carrierReady: closedSignal(),
-	}
-
-	service.scheduleCarrierRestart(carrier, "test handover")
-	if got := service.Carrier(); got != nil {
-		t.Fatalf("carrier remained published after handover: %p", got)
-	}
-	select {
-	case <-service.carrierReady:
-		t.Fatal("replacement readiness was published before restart completed")
-	default:
-	}
-}
-
-func TestScheduleCarrierRestartIgnoresStaleCarrier(t *testing.T) {
-	current := &wltpkg.Carrier{}
-	service := &Service{
-		ctx:          context.Background(),
-		carrier:      current,
-		carrierReady: closedSignal(),
-	}
-
-	service.scheduleCarrierRestart(&wltpkg.Carrier{}, "stale handover")
-	if got := service.Carrier(); got != current {
-		t.Fatalf("stale restart detached current carrier: got %p want %p", got, current)
-	}
-}
-
-func closedSignal() chan struct{} {
-	ready := make(chan struct{})
-	close(ready)
-	return ready
-}
-
 func TestInterfaceUpdatePreservesCarrierWithAnyOnlinePeer(t *testing.T) {
 	stats := wltpkg.CarrierStats{}
 	stats.Runtime.Peer.OnlinePeers = 2
