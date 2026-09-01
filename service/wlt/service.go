@@ -27,6 +27,7 @@ const (
 	wltStatsHeartbeatInterval    = 30 * time.Second
 	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
+	wltInterfaceDialHold         = 4 * time.Second
 	wltInterfaceRecoveryGrace    = 15 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMax    = 15 * time.Minute
@@ -40,17 +41,19 @@ func RegisterService(registry *boxService.Registry) {
 
 type Service struct {
 	boxService.Adapter
-	ctx          context.Context
-	logger       log.ContextLogger
-	options      option.WLTServiceOptions
-	network      adapter.NetworkManager
-	access       sync.RWMutex
-	restart      sync.Mutex
-	carrier      *wltpkg.Carrier
-	carrierReady chan struct{}
-	stopped      bool
-	statsCancel  context.CancelFunc
-	interfaceKey string
+	ctx                 context.Context
+	logger              log.ContextLogger
+	options             option.WLTServiceOptions
+	network             adapter.NetworkManager
+	access              sync.RWMutex
+	restart             sync.Mutex
+	carrier             *wltpkg.Carrier
+	carrierReady        chan struct{}
+	interfaceReady      chan struct{}
+	interfaceGeneration uint64
+	stopped             bool
+	statsCancel         context.CancelFunc
+	interfaceKey        string
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
@@ -63,12 +66,13 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		return nil, E.New("unsupported wlt service transport: ", options.Transport)
 	}
 	return &Service{
-		Adapter:      boxService.NewAdapter(C.TypeWLT, tag),
-		ctx:          ctx,
-		logger:       logger,
-		options:      options,
-		network:      service.FromContext[adapter.NetworkManager](ctx),
-		carrierReady: make(chan struct{}),
+		Adapter:        boxService.NewAdapter(C.TypeWLT, tag),
+		ctx:            ctx,
+		logger:         logger,
+		options:        options,
+		network:        service.FromContext[adapter.NetworkManager](ctx),
+		carrierReady:   make(chan struct{}),
+		interfaceReady: closedSignal(),
 	}, nil
 }
 
@@ -211,6 +215,7 @@ func (s *Service) Close() error {
 	carrier := s.carrier
 	s.carrier = nil
 	s.stopped = true
+	closeSignal(s.interfaceReady)
 	select {
 	case <-s.carrierReady:
 	default:
@@ -237,10 +242,26 @@ func (s *Service) WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error) {
 		s.access.RLock()
 		carrier := s.carrier
 		ready := s.carrierReady
+		interfaceReady := s.interfaceReady
 		stopped := s.stopped
 		s.access.RUnlock()
 		if carrier != nil {
-			return carrier, nil
+			if interfaceReady == nil {
+				return carrier, nil
+			}
+			select {
+			case <-interfaceReady:
+				return carrier, nil
+			default:
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.ctx.Done():
+				return nil, s.ctx.Err()
+			case <-interfaceReady:
+				continue
+			}
 		}
 		if stopped {
 			return nil, E.New("wlt service is stopped")
@@ -278,30 +299,83 @@ func (s *Service) InterfaceUpdated() {
 	} else {
 		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery grace")
 	}
+	generation := s.beginInterfaceRecovery()
 	// An iOS default-interface notification does not prove that the existing
 	// TURN underlay is dead.  It can arrive while LTE remains usable, and the
 	// old break-before-make path aborted every TinyMux flow immediately.  Give
 	// per-peer reconnect and the carrier's own full reconnect a bounded grace
 	// period, then replace only a carrier which has actually lost every peer.
-	go func(expected *wltpkg.Carrier) {
-		timer := time.NewTimer(wltInterfaceRecoveryGrace)
-		defer timer.Stop()
+	go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
+		holdTimer := time.NewTimer(wltInterfaceDialHold)
+		defer holdTimer.Stop()
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-timer.C:
+		case <-holdTimer.C:
 		}
-		if s.Carrier() != expected {
-			return
+		deadline := time.NewTimer(wltInterfaceRecoveryGrace - wltInterfaceDialHold)
+		defer deadline.Stop()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if s.Carrier() != expected {
+				s.finishInterfaceRecovery(expectedGeneration)
+				return
+			}
+			stats := expected.Stats()
+			if interfaceRecoveryReady(stats) {
+				s.logger.Info("wlt service interface recovery ready peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+				s.finishInterfaceRecovery(expectedGeneration)
+				return
+			}
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				continue
+			case <-deadline.C:
+				s.logger.Warn("wlt service interface recovery incomplete; replacing carrier after grace=", wltInterfaceRecoveryGrace.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+				s.restartCarrier(expected, "default interface changed without complete peer recovery")
+				s.finishInterfaceRecovery(expectedGeneration)
+				return
+			}
 		}
-		stats := expected.Stats()
-		if !interfaceUpdateNeedsCarrierRestart(stats) {
-			s.logger.Info("wlt service interface recovery retained carrier peer_online=", stats.Runtime.Peer.OnlinePeers, " reconnecting=", stats.Runtime.Reconnecting)
-			return
-		}
-		s.logger.Warn("wlt service interface recovery lost all peers; replacing carrier after grace=", wltInterfaceRecoveryGrace.String())
-		s.restartCarrier(expected, "default interface changed with no peers after grace")
-	}(carrier)
+	}(carrier, generation)
+}
+
+func closedSignal() chan struct{} {
+	ready := make(chan struct{})
+	close(ready)
+	return ready
+}
+
+func closeSignal(signal chan struct{}) {
+	if signal == nil {
+		return
+	}
+	select {
+	case <-signal:
+	default:
+		close(signal)
+	}
+}
+
+func (s *Service) beginInterfaceRecovery() uint64 {
+	s.access.Lock()
+	defer s.access.Unlock()
+	closeSignal(s.interfaceReady)
+	s.interfaceReady = make(chan struct{})
+	s.interfaceGeneration++
+	return s.interfaceGeneration
+}
+
+func (s *Service) finishInterfaceRecovery(generation uint64) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.interfaceGeneration != generation {
+		return
+	}
+	closeSignal(s.interfaceReady)
 }
 
 func (s *Service) currentInterfaceKey() string {
@@ -329,7 +403,16 @@ func interfaceIdentityChanged(previous string, current string) bool {
 }
 
 func interfaceUpdateNeedsCarrierRestart(stats wltpkg.CarrierStats) bool {
-	return stats.Runtime.Peer.OnlinePeers == 0
+	return !interfaceRecoveryReady(stats)
+}
+
+func interfaceRecoveryReady(stats wltpkg.CarrierStats) bool {
+	peer := stats.Runtime.Peer
+	required := peer.ActiveDataPeers
+	if required < 1 {
+		required = 1
+	}
+	return !stats.Runtime.Reconnecting && peer.OnlinePeers >= required
 }
 
 func formatWLTStatsHeartbeat(messages ...any) string {

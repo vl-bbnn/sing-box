@@ -156,6 +156,38 @@ func TestWaitCarrierHonorsDialContext(t *testing.T) {
 	}
 }
 
+func TestWaitCarrierBlocksDuringInterfaceRecovery(t *testing.T) {
+	serviceContext, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	service := &Service{
+		ctx:            serviceContext,
+		carrier:        &wltpkg.Carrier{},
+		carrierReady:   closedSignal(),
+		interfaceReady: make(chan struct{}),
+	}
+	result := make(chan *wltpkg.Carrier, 1)
+	go func() {
+		carrier, _ := service.WaitCarrier(context.Background())
+		result <- carrier
+	}()
+	select {
+	case <-result:
+		t.Fatal("WaitCarrier returned while interface recovery gate was closed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	service.access.Lock()
+	closeSignal(service.interfaceReady)
+	service.access.Unlock()
+	select {
+	case got := <-result:
+		if got != service.carrier {
+			t.Fatal("WaitCarrier returned the wrong carrier after recovery")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitCarrier did not resume after interface recovery")
+	}
+}
+
 func TestWaitCarrierRejectsStoppedService(t *testing.T) {
 	service := &Service{
 		ctx:          context.Background(),
@@ -170,13 +202,13 @@ func TestWaitCarrierRejectsStoppedService(t *testing.T) {
 func TestInterfaceUpdatePreservesCarrierWithAnyOnlinePeer(t *testing.T) {
 	stats := wltpkg.CarrierStats{}
 	stats.Runtime.Peer.OnlinePeers = 2
+	stats.Runtime.Peer.ActiveDataPeers = 2
 	if interfaceUpdateNeedsCarrierRestart(stats) {
-		t.Fatal("interface update would destroy a carrier with active peers")
+		t.Fatal("interface update would destroy a fully recovered carrier")
 	}
 	stats.Runtime.Peer.OnlinePeers = 1
-	stats.Runtime.Reconnecting = true
-	if interfaceUpdateNeedsCarrierRestart(stats) {
-		t.Fatal("interface update would destroy the remaining live peer")
+	if !interfaceUpdateNeedsCarrierRestart(stats) {
+		t.Fatal("partial peer recovery must remain gated")
 	}
 }
 

@@ -122,9 +122,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		h.logger.WarnContext(ctx, "WLT carrier unavailable; using encrypted upstream direct fallback")
 		return h.fallbackDialer.DialContext(ctx, network, destination)
 	}
-	if carrier == nil {
-		carrier, err = carrierService.WaitCarrier(ctx)
-	}
+	carrier, err = carrierService.WaitCarrier(ctx)
 	if err != nil {
 		return nil, E.Cause(err, "wait for wlt carrier")
 	}
