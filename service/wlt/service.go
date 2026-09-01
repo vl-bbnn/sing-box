@@ -268,22 +268,21 @@ func (s *Service) InterfaceUpdated() {
 	}
 	s.access.Unlock()
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
-		// A real default-interface or address change invalidates the UDP/TURN
-		// sockets even while their peer goroutines still look online.  Waiting
-		// for peer_online to reach zero leaves TinyMux opens hanging for the
-		// full connect timeout after LTE <-> Wi-Fi handover.  Abort the stale
-		// underlay immediately; restartCarrier reuses the persisted auth
-		// snapshot and serializes duplicate notifications.
-		s.logger.Warn("wlt service default interface identity changed; replacing carrier immediately")
-		go s.restartCarrier(carrier, "default interface identity changed")
-		return
+		// Peer reconnect can move the carrier to the new default interface without
+		// repeating provider/TURN bootstrap.  A break-before-make restart here can
+		// race with iOS interface notifications and leave the replacement waiting
+		// behind an allocation that the old carrier has not released yet.  Preserve
+		// the carrier for the same bounded grace used by ambiguous notifications;
+		// restart only if every peer is still gone when the grace expires.
+		s.logger.Info("wlt service default interface identity changed; preserving carrier during recovery grace")
+	} else {
+		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery grace")
 	}
 	// An iOS default-interface notification does not prove that the existing
 	// TURN underlay is dead.  It can arrive while LTE remains usable, and the
 	// old break-before-make path aborted every TinyMux flow immediately.  Give
 	// per-peer reconnect and the carrier's own full reconnect a bounded grace
 	// period, then replace only a carrier which has actually lost every peer.
-	s.logger.Info("wlt service default interface changed; preserving active carrier during recovery grace")
 	go func(expected *wltpkg.Carrier) {
 		timer := time.NewTimer(wltInterfaceRecoveryGrace)
 		defer timer.Stop()
