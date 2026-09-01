@@ -13,6 +13,7 @@ type URLTestOutboundOptions struct {
 	URL                       string             `json:"url,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
+	PreferFirstAvailable      bool               `json:"prefer_first_available,omitempty"`
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 }

@@ -41,6 +41,7 @@ type URLTest struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	preferFirstAvailable         bool
 	idleTimeout                  time.Duration
 	group                        *URLTestGroup
 	interruptExternalConnections bool
@@ -57,6 +58,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
+		preferFirstAvailable:         options.PreferFirstAvailable,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
@@ -75,7 +77,7 @@ func (s *URLTest) Start() error {
 		}
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.preferFirstAvailable, s.idleTimeout, s.interruptExternalConnections)
 	if err != nil {
 		return err
 	}
@@ -215,6 +217,7 @@ type URLTestGroup struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	preferFirstAvailable         bool
 	idleTimeout                  time.Duration
 	history                      adapter.URLTestHistoryStorage
 	checking                     atomic.Bool
@@ -229,7 +232,7 @@ type URLTestGroup struct {
 	lastActive                   common.TypedValue[time.Time]
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, preferFirstAvailable bool, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -258,6 +261,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		link:                         link,
 		interval:                     interval,
 		tolerance:                    tolerance,
+		preferFirstAvailable:         preferFirstAvailable,
 		idleTimeout:                  idleTimeout,
 		history:                      history,
 		close:                        make(chan struct{}),
@@ -306,6 +310,16 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	if g.preferFirstAvailable {
+		for _, detour := range g.outbounds {
+			if !common.Contains(detour.Network(), network) {
+				continue
+			}
+			if g.history.LoadURLTestHistory(RealTag(detour)) != nil {
+				return detour, true
+			}
+		}
+	}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	switch network {

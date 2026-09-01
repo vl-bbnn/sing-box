@@ -79,3 +79,27 @@ func TestURLTestDialContextRetriesHealthValidatedAlternative(t *testing.T) {
 		t.Fatal("unavailable outbound history was not invalidated")
 	}
 }
+
+func TestURLTestPreferFirstAvailableIgnoresLatency(t *testing.T) {
+	direct := &failoverTestOutbound{tag: "direct"}
+	fallback := &failoverTestOutbound{tag: "fallback"}
+	history := urltest.NewHistoryStorage()
+	history.StoreURLTestHistory(direct.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 500})
+	history.StoreURLTestHistory(fallback.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 5})
+	group := &URLTestGroup{
+		outbounds:            []adapter.Outbound{direct, fallback},
+		history:              history,
+		preferFirstAvailable: true,
+	}
+
+	selected, available := group.Select(N.NetworkTCP)
+	if !available || selected != direct {
+		t.Fatalf("selected outbound=%v available=%v, want first healthy outbound", selected, available)
+	}
+
+	history.DeleteURLTestHistory(direct.Tag())
+	selected, available = group.Select(N.NetworkTCP)
+	if !available || selected != fallback {
+		t.Fatalf("selected outbound=%v available=%v, want healthy fallback", selected, available)
+	}
+}
