@@ -27,7 +27,6 @@ const (
 	wltStatsHeartbeatInterval    = 30 * time.Second
 	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
-	wltInterfaceDialHold         = 4 * time.Second
 	wltInterfaceRecoveryGrace    = 15 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMax    = 15 * time.Minute
@@ -302,44 +301,28 @@ func (s *Service) InterfaceUpdated() {
 	generation := s.beginInterfaceRecovery()
 	// An iOS default-interface notification does not prove that the existing
 	// TURN underlay is dead.  It can arrive while LTE remains usable, and the
-	// old break-before-make path aborted every TinyMux flow immediately.  Give
-	// per-peer reconnect and the carrier's own full reconnect a bounded grace
-	// period, then replace only a carrier which has actually lost every peer.
+	// old break-before-make path aborted every TinyMux flow immediately.  Keep
+	// the carrier for a bounded grace so current traffic can drain and TURN can
+	// release obsolete allocations, but do not trust peer-online alone as proof
+	// that the old mux accepts new streams: Android has observed healthy-looking
+	// peers followed by deterministic mux-open timeouts.  Replace after grace
+	// while WaitCarrier keeps new WLT dials closed.
 	go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
-		holdTimer := time.NewTimer(wltInterfaceDialHold)
-		defer holdTimer.Stop()
+		timer := time.NewTimer(wltInterfaceRecoveryGrace)
+		defer timer.Stop()
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-holdTimer.C:
+		case <-timer.C:
 		}
-		deadline := time.NewTimer(wltInterfaceRecoveryGrace - wltInterfaceDialHold)
-		defer deadline.Stop()
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			if s.Carrier() != expected {
-				s.finishInterfaceRecovery(expectedGeneration)
-				return
-			}
-			stats := expected.Stats()
-			if interfaceRecoveryReady(stats) {
-				s.logger.Info("wlt service interface recovery ready peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
-				s.finishInterfaceRecovery(expectedGeneration)
-				return
-			}
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-ticker.C:
-				continue
-			case <-deadline.C:
-				s.logger.Warn("wlt service interface recovery incomplete; replacing carrier after grace=", wltInterfaceRecoveryGrace.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
-				s.restartCarrier(expected, "default interface changed without complete peer recovery")
-				s.finishInterfaceRecovery(expectedGeneration)
-				return
-			}
+		if s.Carrier() != expected || !s.interfaceRecoveryCurrent(expectedGeneration) {
+			s.finishInterfaceRecovery(expectedGeneration)
+			return
 		}
+		stats := expected.Stats()
+		s.logger.Warn("wlt service replacing carrier after interface recovery grace=", wltInterfaceRecoveryGrace.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+		s.restartCarrier(expected, "default interface changed after recovery grace", expectedGeneration)
+		s.finishInterfaceRecovery(expectedGeneration)
 	}(carrier, generation)
 }
 
@@ -378,6 +361,12 @@ func (s *Service) finishInterfaceRecovery(generation uint64) {
 	closeSignal(s.interfaceReady)
 }
 
+func (s *Service) interfaceRecoveryCurrent(generation uint64) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.interfaceGeneration == generation
+}
+
 func (s *Service) currentInterfaceKey() string {
 	if s.network == nil {
 		return ""
@@ -400,19 +389,6 @@ func networkInterfaceKey(networkInterface *adapter.NetworkInterface) string {
 
 func interfaceIdentityChanged(previous string, current string) bool {
 	return previous != "" && current != "" && previous != current
-}
-
-func interfaceUpdateNeedsCarrierRestart(stats wltpkg.CarrierStats) bool {
-	return !interfaceRecoveryReady(stats)
-}
-
-func interfaceRecoveryReady(stats wltpkg.CarrierStats) bool {
-	peer := stats.Runtime.Peer
-	required := peer.ActiveDataPeers
-	if required < 1 {
-		required = 1
-	}
-	return !stats.Runtime.Reconnecting && peer.OnlinePeers >= required
 }
 
 func formatWLTStatsHeartbeat(messages ...any) string {
@@ -482,11 +458,15 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 	}()
 }
 
-func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
+func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, interfaceGeneration ...uint64) {
 	s.restart.Lock()
 	defer s.restart.Unlock()
 
 	s.access.Lock()
+	if len(interfaceGeneration) > 0 && s.interfaceGeneration != interfaceGeneration[0] {
+		s.access.Unlock()
+		return
+	}
 	if s.carrier != expected {
 		s.access.Unlock()
 		return

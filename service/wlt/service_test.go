@@ -199,24 +199,30 @@ func TestWaitCarrierRejectsStoppedService(t *testing.T) {
 	}
 }
 
-func TestInterfaceUpdatePreservesCarrierWithAnyOnlinePeer(t *testing.T) {
-	stats := wltpkg.CarrierStats{}
-	stats.Runtime.Peer.OnlinePeers = 2
-	stats.Runtime.Peer.ActiveDataPeers = 2
-	if interfaceUpdateNeedsCarrierRestart(stats) {
-		t.Fatal("interface update would destroy a fully recovered carrier")
+func TestInterfaceRecoveryGenerationSupersedesOlderNotification(t *testing.T) {
+	service := &Service{interfaceReady: closedSignal()}
+	first := service.beginInterfaceRecovery()
+	second := service.beginInterfaceRecovery()
+	if first == second {
+		t.Fatal("interface recovery generation did not advance")
 	}
-	stats.Runtime.Peer.OnlinePeers = 1
-	if !interfaceUpdateNeedsCarrierRestart(stats) {
-		t.Fatal("partial peer recovery must remain gated")
+	if service.interfaceRecoveryCurrent(first) {
+		t.Fatal("older interface notification remained current")
 	}
-}
-
-func TestInterfaceUpdateRestartsOnlyAfterEveryPeerIsGone(t *testing.T) {
-	stats := wltpkg.CarrierStats{}
-	stats.Runtime.Peer.OnlinePeers = 0
-	if !interfaceUpdateNeedsCarrierRestart(stats) {
-		t.Fatal("carrier with no peers must be recoverable after the grace period")
+	if !service.interfaceRecoveryCurrent(second) {
+		t.Fatal("latest interface notification was not current")
+	}
+	service.finishInterfaceRecovery(first)
+	select {
+	case <-service.interfaceReady:
+		t.Fatal("older interface notification opened the current gate")
+	default:
+	}
+	service.finishInterfaceRecovery(second)
+	select {
+	case <-service.interfaceReady:
+	default:
+		t.Fatal("latest interface notification did not open the gate")
 	}
 }
 
