@@ -118,7 +118,8 @@ func (s *URLTest) CheckOutbounds() {
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
 	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
+	networkName := N.NetworkName(network)
+	switch networkName {
 	case N.NetworkTCP:
 		outbound = s.group.selectedOutboundTCP
 	case N.NetworkUDP:
@@ -137,8 +138,18 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	fallback := s.group.invalidateAndSelectAlternative(networkName, outbound)
+	if fallback == nil {
+		return nil, err
+	}
+	s.logger.WarnContext(ctx, "selected outbound unavailable; retrying health-validated alternative")
+	conn, fallbackErr := fallback.DialContext(ctx, network, destination)
+	if fallbackErr == nil {
+		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	}
+	s.logger.ErrorContext(ctx, fallbackErr)
+	s.group.invalidateAndSelectAlternative(networkName, fallback)
+	return nil, E.Errors(err, fallbackErr)
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -155,8 +166,18 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	fallback := s.group.invalidateAndSelectAlternative(N.NetworkUDP, outbound)
+	if fallback == nil {
+		return nil, err
+	}
+	s.logger.WarnContext(ctx, "selected outbound unavailable; retrying health-validated alternative")
+	conn, fallbackErr := fallback.ListenPacket(ctx, destination)
+	if fallbackErr == nil {
+		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	}
+	s.logger.ErrorContext(ctx, fallbackErr)
+	s.group.invalidateAndSelectAlternative(N.NetworkUDP, fallback)
+	return nil, E.Errors(err, fallbackErr)
 }
 
 func (s *URLTest) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -428,4 +449,20 @@ func (g *URLTestGroup) performUpdateCheck() {
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
+}
+
+func (g *URLTestGroup) invalidateAndSelectAlternative(network string, unavailable adapter.Outbound) adapter.Outbound {
+	g.history.DeleteURLTestHistory(RealTag(unavailable))
+	g.performUpdateCheck()
+	var selected adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		selected = g.selectedOutboundTCP
+	case N.NetworkUDP:
+		selected = g.selectedOutboundUDP
+	}
+	if selected == unavailable {
+		return nil
+	}
+	return selected
 }
