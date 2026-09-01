@@ -275,7 +275,7 @@ func (s *Service) InterfaceUpdated() {
 		// underlay immediately; restartCarrier reuses the persisted auth
 		// snapshot and serializes duplicate notifications.
 		s.logger.Warn("wlt service default interface identity changed; replacing carrier immediately")
-		go s.restartCarrier(carrier, "default interface identity changed")
+		s.scheduleCarrierRestart(carrier, "default interface identity changed")
 		return
 	}
 	// An iOS default-interface notification does not prove that the existing
@@ -301,7 +301,7 @@ func (s *Service) InterfaceUpdated() {
 			return
 		}
 		s.logger.Warn("wlt service interface recovery lost all peers; replacing carrier after grace=", wltInterfaceRecoveryGrace.String())
-		s.restartCarrier(expected, "default interface changed with no peers after grace")
+		s.scheduleCarrierRestart(expected, "default interface changed with no peers after grace")
 	}(carrier)
 }
 
@@ -376,7 +376,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 					}
 					if now.Sub(reconnectingSince) >= wltReconnectRecoveryAfter {
 						s.logger.Warn("wlt service reconnect outage exceeded threshold elapsed=", now.Sub(reconnectingSince).String(), " threshold=", wltReconnectRecoveryAfter.String(), " reason=", rt.LastReconnectReason)
-						go s.restartCarrier(carrier, "reconnect outage: "+rt.LastReconnectReason)
+						s.scheduleCarrierRestart(carrier, "reconnect outage: "+rt.LastReconnectReason)
 						return
 					}
 				} else if !reconnectingSince.IsZero() {
@@ -403,11 +403,40 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	s.restart.Lock()
 	defer s.restart.Unlock()
-
-	s.access.Lock()
-	if s.carrier != expected {
-		s.access.Unlock()
+	ready, detached := s.detachCarrierForRestart(expected)
+	if !detached {
 		return
+	}
+	s.restartCarrierGeneration(expected, ready, reason)
+}
+
+// scheduleCarrierRestart removes an obsolete carrier from the dial path before
+// returning to the interface-monitor callback.  Starting restartCarrier in a
+// goroutine directly leaves a scheduler-sized window where new streams can
+// still acquire the stale carrier and produce an avoidable mux open failure.
+// The restart goroutine receives the exact ready generation it owns so a stale
+// restart can never publish over a newer service state.
+func (s *Service) scheduleCarrierRestart(expected *wltpkg.Carrier, reason string) {
+	if expected == nil {
+		go s.restartCarrier(nil, reason)
+		return
+	}
+	ready, detached := s.detachCarrierForRestart(expected)
+	if !detached {
+		return
+	}
+	go func() {
+		s.restart.Lock()
+		defer s.restart.Unlock()
+		s.restartCarrierGeneration(expected, ready, reason)
+	}()
+}
+
+func (s *Service) detachCarrierForRestart(expected *wltpkg.Carrier) (chan struct{}, bool) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.carrier != expected {
+		return nil, false
 	}
 	if expected != nil {
 		s.carrier = nil
@@ -415,13 +444,21 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	} else if s.carrierReady == nil {
 		s.carrierReady = make(chan struct{})
 	}
-	s.access.Unlock()
+	return s.carrierReady, true
+}
+
+func (s *Service) restartCarrierGeneration(expected *wltpkg.Carrier, ready chan struct{}, reason string) {
+	s.access.RLock()
+	currentGeneration := s.carrier == nil && s.carrierReady == ready && !s.stopped
+	s.access.RUnlock()
+	if !currentGeneration || s.ctx.Err() != nil {
+		return
+	}
 
 	if s.statsCancel != nil {
 		s.statsCancel()
 		s.statsCancel = nil
 	}
-
 	s.logger.Warn("wlt service restarting carrier reason=", reason)
 
 	if expected != nil {
@@ -441,9 +478,9 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 
 	for attempt := 1; ; attempt++ {
 		s.access.RLock()
-		stopped := s.stopped
+		currentGeneration = s.carrier == nil && s.carrierReady == ready && !s.stopped
 		s.access.RUnlock()
-		if stopped || s.ctx.Err() != nil {
+		if !currentGeneration || s.ctx.Err() != nil {
 			return
 		}
 		startedAt := time.Now()
@@ -451,14 +488,14 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 		carrier, err := s.startCarrier(true)
 		if err == nil {
 			s.access.Lock()
-			if s.stopped {
+			if s.stopped || s.carrier != nil || s.carrierReady != ready {
 				s.access.Unlock()
 				_ = carrier.Close()
 				return
 			}
 			s.carrier = carrier
 			s.interfaceKey = s.currentInterfaceKey()
-			close(s.carrierReady)
+			close(ready)
 			s.access.Unlock()
 			s.startStatsHeartbeat(carrier)
 			s.logger.Info("wlt service carrier restarted elapsed=", time.Since(startedAt).String(), " attempts=", attempt)
