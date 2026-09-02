@@ -45,9 +45,9 @@ func TestNetworkInterfaceIdentityDetectsHandoverAndAddressChange(t *testing.T) {
 	}
 }
 
-func TestInterfaceRecoveryGraceIsImmediateOnlyOnAndroid(t *testing.T) {
-	if got := interfaceRecoveryGraceFor("android"); got != 0 {
-		t.Fatalf("Android interface recovery grace=%s, want immediate", got)
+func TestInterfaceRecoveryUsesShortSettleDelayOnlyOnAndroid(t *testing.T) {
+	if got := interfaceRecoveryGraceFor("android"); got != wltAndroidInterfaceSettle {
+		t.Fatalf("Android interface recovery delay=%s, want %s", got, wltAndroidInterfaceSettle)
 	}
 	for _, goos := range []string{"darwin", "ios", "linux"} {
 		if got := interfaceRecoveryGraceFor(goos); got != wltInterfaceRecoveryGrace {

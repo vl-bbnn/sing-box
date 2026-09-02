@@ -29,6 +29,7 @@ const (
 	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
 	wltInterfaceRecoveryGrace    = 15 * time.Second
+	wltAndroidInterfaceSettle    = 1 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMax    = 15 * time.Minute
 	wltCarrierRateLimitRetry     = 30 * time.Minute
@@ -292,47 +293,25 @@ func (s *Service) InterfaceUpdated() {
 		s.logger.Info("wlt service ignoring duplicate Android default interface update")
 		return
 	}
-	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) &&
-		interfaceRecoveryGraceFor(runtime.GOOS) == 0 {
-		// Android reports the new default network only after its old UDP route is
-		// already unusable.  Holding the old TURN sockets for the Apple recovery
-		// grace therefore adds a deterministic outage without preserving traffic.
-		// Close the dial gate synchronously, then abort-before-replace in the
-		// serialized restart path.  Apple retains the grace which prevents its
-		// provider-allocation race.
-		s.logger.Warn("wlt service Android interface identity changed; replacing carrier immediately")
-		generation := s.beginInterfaceRecovery()
-		go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
-			s.restartCarrier(expected, "default interface changed on Android", expectedGeneration)
-			s.finishInterfaceRecovery(expectedGeneration)
-		}(carrier, generation)
-		return
-	}
+	recoveryDelay := interfaceRecoveryGraceFor(runtime.GOOS)
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
-		// Peer reconnect can move the carrier to the new default interface without
-		// repeating provider/TURN bootstrap.  A break-before-make restart here can
-		// race with iOS interface notifications and leave the replacement waiting
-		// behind an allocation that the old carrier has not released yet.  Preserve
-		// the carrier for the same bounded grace used by ambiguous notifications;
-		// restart only if every peer is still gone when the grace expires.
-		s.logger.Info("wlt service default interface identity changed; preserving carrier during recovery grace")
+		s.logger.Info("wlt service default interface identity changed; scheduling carrier replacement after settle delay=", recoveryDelay.String())
 	} else {
-		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery grace")
+		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery delay=", recoveryDelay.String())
 	}
 	generation := s.beginInterfaceRecovery()
-	// An iOS default-interface notification does not prove that the existing
-	// TURN underlay is dead.  It can arrive while LTE remains usable, and the
-	// old break-before-make path aborted every TinyMux flow immediately.  Keep
-	// the carrier for a bounded grace so current traffic can drain and TURN can
-	// release obsolete allocations, but do not trust peer-online alone as proof
-	// that the old mux accepts new streams: Android has observed healthy-looking
-	// peers followed by deterministic mux-open timeouts.  Replace after grace
-	// while WaitCarrier keeps new WLT dials closed.
+	// Close the WLT dial gate immediately, then let the platform interface settle
+	// before replacing the carrier. Android used to restart the carrier here and
+	// reload the complete client runtime one second later. Those two owners could
+	// overlap TURN sessions and leave post-handover writes on the obsolete
+	// network. Core is now the sole recovery owner: Android uses a short settle
+	// delay, while Apple retains its longer allocation-preserving grace.
 	go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
-		timer := time.NewTimer(wltInterfaceRecoveryGrace)
+		timer := time.NewTimer(recoveryDelay)
 		defer timer.Stop()
 		select {
 		case <-s.ctx.Done():
+			s.finishInterfaceRecovery(expectedGeneration)
 			return
 		case <-timer.C:
 		}
@@ -341,15 +320,15 @@ func (s *Service) InterfaceUpdated() {
 			return
 		}
 		stats := expected.Stats()
-		s.logger.Warn("wlt service replacing carrier after interface recovery grace=", wltInterfaceRecoveryGrace.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
-		s.restartCarrier(expected, "default interface changed after recovery grace", expectedGeneration)
+		s.logger.Warn("wlt service replacing carrier after interface recovery delay=", recoveryDelay.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+		s.restartCarrier(expected, "default interface changed after recovery delay", expectedGeneration)
 		s.finishInterfaceRecovery(expectedGeneration)
 	}(carrier, generation)
 }
 
 func interfaceRecoveryGraceFor(goos string) time.Duration {
 	if goos == "android" {
-		return 0
+		return wltAndroidInterfaceSettle
 	}
 	return wltInterfaceRecoveryGrace
 }
