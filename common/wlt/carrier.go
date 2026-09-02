@@ -1640,6 +1640,7 @@ reconnectLoop:
 		releaseActive: releaseActive,
 		idleTimeout:   c.idleTimeout,
 		routeClass:    normalizeCarrierRouteClass(routeClass),
+		idleStop:      make(chan struct{}),
 	}
 	c.registerStream(stream)
 	return stream, nil
@@ -2100,8 +2101,8 @@ type carrierConn struct {
 	idleTimeout   time.Duration
 	routeClass    string
 	lastActivity  atomic.Int64
-	ioMu          sync.RWMutex
 	closeOnce     sync.Once
+	idleStop      chan struct{}
 }
 
 // FlowID exposes the diagnostics-safe TinyMux flow identifier while retaining
@@ -2118,8 +2119,6 @@ func (c *carrierConn) FlowID() uint16 {
 }
 
 func (c *carrierConn) Read(p []byte) (int, error) {
-	c.ioMu.RLock()
-	defer c.ioMu.RUnlock()
 	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Read(p)
@@ -2135,8 +2134,6 @@ func (c *carrierConn) Read(p []byte) (int, error) {
 }
 
 func (c *carrierConn) Write(p []byte) (int, error) {
-	c.ioMu.RLock()
-	defer c.ioMu.RUnlock()
 	c.markActivity()
 	c.refreshDeadline()
 	n, err := c.Conn.Write(p)
@@ -2151,8 +2148,12 @@ func (c *carrierConn) Write(p []byte) (int, error) {
 }
 
 func (c *carrierConn) Close() error {
-	err := c.Conn.Close()
+	var err error
 	c.closeOnce.Do(func() {
+		if c.idleStop != nil {
+			close(c.idleStop)
+		}
+		err = c.Conn.Close()
 		c.carrier.unregisterStream(c)
 		c.releaseActive()
 		c.carrier.closedStreams.Add(1)
@@ -2182,6 +2183,47 @@ func (c *Carrier) registerStream(stream *carrierConn) {
 	}
 	c.streams[stream] = struct{}{}
 	c.streamsMu.Unlock()
+	stream.startIdleWatch()
+}
+
+// startIdleWatch enforces carrier idle timeouts even when the underlying
+// transport cannot implement net.Conn deadlines. TinyMux flow connections
+// intentionally reject SetDeadline, so relying only on refreshDeadline leaves
+// a blocked idle Read alive forever and eventually exhausts active slots.
+func (c *carrierConn) startIdleWatch() {
+	if c == nil || c.idleTimeout <= 0 || c.idleStop == nil {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(c.idleTimeout)
+		defer timer.Stop()
+		for {
+			lastActivity := c.lastActivity.Load()
+			if lastActivity == 0 {
+				lastActivity = time.Now().UnixNano()
+				c.lastActivity.CompareAndSwap(0, lastActivity)
+			}
+			remaining := time.Until(time.Unix(0, lastActivity).Add(c.idleTimeout))
+			if remaining <= 0 {
+				_ = c.Close()
+				return
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(remaining)
+			select {
+			case <-timer.C:
+				// Activity may have advanced while the timer was sleeping. The
+				// next iteration recalculates the remaining idle interval.
+			case <-c.idleStop:
+				return
+			}
+		}
+	}()
 }
 
 func (c *Carrier) unregisterStream(stream *carrierConn) {
@@ -2209,30 +2251,14 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 		}
 		if stream.routeClass != routeClass {
 			if candidate == nil || lastActivity < candidate.lastActivity.Load() {
-				if !stream.ioMu.TryLock() {
-					continue
-				}
-				if candidate != nil {
-					candidate.ioMu.Unlock()
-				}
 				candidate = stream
 			}
 		} else if sameRouteCandidate == nil || lastActivity < sameRouteCandidate.lastActivity.Load() {
-			if !stream.ioMu.TryLock() {
-				continue
-			}
-			if sameRouteCandidate != nil {
-				sameRouteCandidate.ioMu.Unlock()
-			}
 			sameRouteCandidate = stream
 		}
 	}
 	if candidate == nil {
 		candidate = sameRouteCandidate
-		sameRouteCandidate = nil
-	}
-	if sameRouteCandidate != nil {
-		sameRouteCandidate.ioMu.Unlock()
 	}
 	if candidate != nil {
 		// Remove it before closing so concurrent admission attempts cannot pick
@@ -2248,6 +2274,5 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 		c.logf("WLT carrier pressure idle reclaim stream route=%s requested_route=%s idle_ms=%d", candidate.routeClass, routeClass, time.Since(time.Unix(0, candidate.lastActivity.Load())).Milliseconds())
 	}
 	_ = candidate.Close()
-	candidate.ioMu.Unlock()
 	return true
 }

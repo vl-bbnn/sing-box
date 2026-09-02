@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1410,7 +1411,121 @@ func TestCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
 	}
 }
 
-func TestCarrierPressureReclaimSkipsStreamWithActiveRead(t *testing.T) {
+func TestCarrierIdleWatchClosesTransportWithoutDeadlineSupport(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	var released atomic.Int64
+	conn := &carrierConn{
+		Conn:    &deadlineUnsupportedConn{Conn: left},
+		carrier: carrier,
+		releaseActive: func() {
+			released.Add(1)
+			carrier.activeStreams.Add(-1)
+		},
+		idleTimeout: 30 * time.Millisecond,
+		routeClass:  "eu",
+		idleStop:    make(chan struct{}),
+	}
+	carrier.activeStreams.Store(1)
+	carrier.registerStream(conn)
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected idle watch to close blocked read")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle watch did not close transport without deadline support")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if released.Load() != 1 || carrier.closedStreams.Load() != 1 || carrier.activeStreams.Load() != 0 {
+		t.Fatalf(
+			"released=%d closed=%d active=%d, want one release and no active streams",
+			released.Load(),
+			carrier.closedStreams.Load(),
+			carrier.activeStreams.Load(),
+		)
+	}
+}
+
+func TestCarrierIdleWatchExtendsDeadlineOnActivity(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	conn := &carrierConn{
+		Conn:          &deadlineUnsupportedConn{Conn: left},
+		carrier:       carrier,
+		releaseActive: func() { carrier.activeStreams.Add(-1) },
+		idleTimeout:   120 * time.Millisecond,
+		routeClass:    "eu",
+		idleStop:      make(chan struct{}),
+	}
+	carrier.activeStreams.Store(1)
+	carrier.registerStream(conn)
+
+	readDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		for {
+			if _, err := conn.Read(buffer); err != nil {
+				readDone <- err
+				return
+			}
+		}
+	}()
+	for range 6 {
+		time.Sleep(30 * time.Millisecond)
+		if _, err := right.Write([]byte{1}); err != nil {
+			t.Fatalf("write activity: %v", err)
+		}
+	}
+	select {
+	case err := <-readDone:
+		t.Fatalf("idle watch closed active transport early: %v", err)
+	default:
+	}
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected idle watch to close transport after activity stopped")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle watch did not close transport after activity stopped")
+	}
+	if carrier.activeStreams.Load() != 0 {
+		t.Fatalf("active=%d, want 0 after idle close", carrier.activeStreams.Load())
+	}
+}
+
+type deadlineUnsupportedConn struct {
+	net.Conn
+}
+
+func (c *deadlineUnsupportedConn) SetDeadline(time.Time) error {
+	return errors.New("deadlines unsupported")
+}
+
+func (c *deadlineUnsupportedConn) SetReadDeadline(time.Time) error {
+	return errors.New("read deadlines unsupported")
+}
+
+func (c *deadlineUnsupportedConn) SetWriteDeadline(time.Time) error {
+	return errors.New("write deadlines unsupported")
+}
+
+func TestCarrierPressureReclaimClosesStaleBlockedRead(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
 
@@ -1441,19 +1556,16 @@ func TestCarrierPressureReclaimSkipsStreamWithActiveRead(t *testing.T) {
 	}
 	// Make the stream eligible while Read still owns ioMu.RLock.
 	conn.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
-	if carrier.reclaimPressureIdleStream("eu") {
-		t.Fatal("pressure reclaim closed a stream with an active read")
-	}
-
-	if _, err := right.Write([]byte{'x'}); err != nil {
-		t.Fatalf("release blocked read: %v", err)
-	}
-	if err := <-readDone; err != nil {
-		t.Fatalf("blocked read failed: %v", err)
-	}
-	conn.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
 	if !carrier.reclaimPressureIdleStream("eu") {
-		t.Fatal("pressure reclaim did not close an idle stream after read completed")
+		t.Fatal("pressure reclaim did not close a stale stream with a blocked read")
+	}
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected pressure reclaim to unblock read with an error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pressure reclaim did not unblock stale read")
 	}
 }
 
