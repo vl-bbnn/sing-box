@@ -56,6 +56,22 @@ func TestInterfaceRecoveryGraceIsImmediateOnlyOnAndroid(t *testing.T) {
 	}
 }
 
+func TestDuplicateInterfaceUpdatesAreIgnoredOnlyOnAndroid(t *testing.T) {
+	const identity = "10|cellular0|cellular|[192.0.2.2/32]"
+	if !ignoreDuplicateInterfaceUpdate("android", identity, identity) {
+		t.Fatal("duplicate Android callback was not ignored")
+	}
+	if ignoreDuplicateInterfaceUpdate("ios", identity, identity) {
+		t.Fatal("duplicate Apple callback lost its recovery-grace behavior")
+	}
+	if ignoreDuplicateInterfaceUpdate("android", "", identity) {
+		t.Fatal("initial Android callback was ignored")
+	}
+	if ignoreDuplicateInterfaceUpdate("android", identity, identity+"-new") {
+		t.Fatal("real Android handover was ignored")
+	}
+}
+
 func TestPersistentDNSCacheFileUsesWritableAuthDirectory(t *testing.T) {
 	authPath := filepath.Join(t.TempDir(), "wlt-auth.json")
 	got := persistentDNSCacheFile(option.WLTServiceOptions{

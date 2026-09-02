@@ -288,6 +288,10 @@ func (s *Service) InterfaceUpdated() {
 		s.interfaceKey = currentInterfaceKey
 	}
 	s.access.Unlock()
+	if ignoreDuplicateInterfaceUpdate(runtime.GOOS, previousInterfaceKey, currentInterfaceKey) {
+		s.logger.Info("wlt service ignoring duplicate Android default interface update")
+		return
+	}
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) &&
 		interfaceRecoveryGraceFor(runtime.GOOS) == 0 {
 		// Android reports the new default network only after its old UDP route is
@@ -348,6 +352,10 @@ func interfaceRecoveryGraceFor(goos string) time.Duration {
 		return 0
 	}
 	return wltInterfaceRecoveryGrace
+}
+
+func ignoreDuplicateInterfaceUpdate(goos string, previous string, current string) bool {
+	return goos == "android" && previous != "" && previous == current
 }
 
 func closedSignal() chan struct{} {
