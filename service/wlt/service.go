@@ -29,7 +29,7 @@ const (
 	wltIncidentPollInterval      = 5 * time.Second
 	wltReconnectRecoveryAfter    = 90 * time.Second
 	wltInterfaceRecoveryGrace    = 15 * time.Second
-	wltAndroidInterfaceSettle    = 1 * time.Second
+	wltAndroidInterfaceFallback  = 5 * time.Second
 	wltCarrierRestartRetryDelay  = 15 * time.Second
 	wltCarrierRestartRetryMax    = 15 * time.Minute
 	wltCarrierRateLimitRetry     = 30 * time.Minute
@@ -300,12 +300,13 @@ func (s *Service) InterfaceUpdated() {
 		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery delay=", recoveryDelay.String())
 	}
 	generation := s.beginInterfaceRecovery()
-	// Close the WLT dial gate immediately, then let the platform interface settle
-	// before replacing the carrier. Android used to restart the carrier here and
-	// reload the complete client runtime one second later. Those two owners could
-	// overlap TURN sessions and leave post-handover writes on the obsolete
-	// network. Core is now the sole recovery owner: Android uses a short settle
-	// delay, while Apple retains its longer allocation-preserving grace.
+	// Close the WLT dial gate immediately. The Android client reloads the complete
+	// merged runtime after its one-second physical-network debounce so ordinary
+	// proxy and URL-test state move together with the WLT carrier. Keep a longer
+	// core-side fallback for clients which do not complete that reload; the old
+	// service context is canceled before this timer fires during a healthy reload,
+	// preventing two carrier replacements from racing each other. Apple retains
+	// its allocation-preserving grace.
 	go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
 		timer := time.NewTimer(recoveryDelay)
 		defer timer.Stop()
@@ -328,7 +329,7 @@ func (s *Service) InterfaceUpdated() {
 
 func interfaceRecoveryGraceFor(goos string) time.Duration {
 	if goos == "android" {
-		return wltAndroidInterfaceSettle
+		return wltAndroidInterfaceFallback
 	}
 	return wltInterfaceRecoveryGrace
 }
