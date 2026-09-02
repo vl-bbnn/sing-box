@@ -45,6 +45,17 @@ func TestNetworkInterfaceIdentityDetectsHandoverAndAddressChange(t *testing.T) {
 	}
 }
 
+func TestInterfaceRecoveryGraceIsImmediateOnlyOnAndroid(t *testing.T) {
+	if got := interfaceRecoveryGraceFor("android"); got != 0 {
+		t.Fatalf("Android interface recovery grace=%s, want immediate", got)
+	}
+	for _, goos := range []string{"darwin", "ios", "linux"} {
+		if got := interfaceRecoveryGraceFor(goos); got != wltInterfaceRecoveryGrace {
+			t.Fatalf("%s interface recovery grace=%s, want %s", goos, got, wltInterfaceRecoveryGrace)
+		}
+	}
+}
+
 func TestPersistentDNSCacheFileUsesWritableAuthDirectory(t *testing.T) {
 	authPath := filepath.Join(t.TempDir(), "wlt-auth.json")
 	got := persistentDNSCacheFile(option.WLTServiceOptions{

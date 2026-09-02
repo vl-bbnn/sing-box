@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -287,6 +288,22 @@ func (s *Service) InterfaceUpdated() {
 		s.interfaceKey = currentInterfaceKey
 	}
 	s.access.Unlock()
+	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) &&
+		interfaceRecoveryGraceFor(runtime.GOOS) == 0 {
+		// Android reports the new default network only after its old UDP route is
+		// already unusable.  Holding the old TURN sockets for the Apple recovery
+		// grace therefore adds a deterministic outage without preserving traffic.
+		// Close the dial gate synchronously, then abort-before-replace in the
+		// serialized restart path.  Apple retains the grace which prevents its
+		// provider-allocation race.
+		s.logger.Warn("wlt service Android interface identity changed; replacing carrier immediately")
+		generation := s.beginInterfaceRecovery()
+		go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
+			s.restartCarrier(expected, "default interface changed on Android", expectedGeneration)
+			s.finishInterfaceRecovery(expectedGeneration)
+		}(carrier, generation)
+		return
+	}
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
 		// Peer reconnect can move the carrier to the new default interface without
 		// repeating provider/TURN bootstrap.  A break-before-make restart here can
@@ -324,6 +341,13 @@ func (s *Service) InterfaceUpdated() {
 		s.restartCarrier(expected, "default interface changed after recovery grace", expectedGeneration)
 		s.finishInterfaceRecovery(expectedGeneration)
 	}(carrier, generation)
+}
+
+func interfaceRecoveryGraceFor(goos string) time.Duration {
+	if goos == "android" {
+		return 0
+	}
+	return wltInterfaceRecoveryGrace
 }
 
 func closedSignal() chan struct{} {
