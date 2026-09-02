@@ -34,7 +34,10 @@ var (
 	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
 )
 
-const urlTestInterfaceUpdateDebounce = 100 * time.Millisecond
+const (
+	urlTestInterfaceUpdateDebounce      = 100 * time.Millisecond
+	urlTestInterfaceUpdateFollowupDelay = 5 * time.Second
+)
 
 type URLTest struct {
 	outbound.Adapter
@@ -234,6 +237,7 @@ type URLTestGroup struct {
 	checking                     atomic.Bool
 	interfaceUpdatePending       atomic.Bool
 	interfaceUpdateGeneration    atomic.Uint64
+	interfaceUpdateFollowupDelay time.Duration
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -241,6 +245,7 @@ type URLTestGroup struct {
 	access                       sync.Mutex
 	ticker                       *time.Ticker
 	close                        chan struct{}
+	closeOnce                    sync.Once
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
 }
@@ -278,6 +283,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		idleTimeout:                  idleTimeout,
 		history:                      history,
 		close:                        make(chan struct{}),
+		interfaceUpdateFollowupDelay: urlTestInterfaceUpdateFollowupDelay,
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
@@ -311,14 +317,13 @@ func (g *URLTestGroup) Touch() {
 func (g *URLTestGroup) Close() error {
 	g.access.Lock()
 	defer g.access.Unlock()
-	if g.ticker == nil {
-		return nil
+	if g.ticker != nil {
+		g.ticker.Stop()
+		g.ticker = nil
+		g.pause.UnregisterCallback(g.pauseCallback)
+		g.pauseCallback = nil
 	}
-	g.ticker.Stop()
-	g.ticker = nil
-	g.pause.UnregisterCallback(g.pauseCallback)
-	g.pauseCallback = nil
-	close(g.close)
+	g.closeOnce.Do(func() { close(g.close) })
 	return nil
 }
 
@@ -427,15 +432,18 @@ func (g *URLTestGroup) runInterfaceUpdateChecks() {
 			g.interfaceUpdatePending.Store(false)
 			return
 		}
-		for {
-			_, _, started := g.tryURLTest(g.ctx, true)
-			if started {
-				break
-			}
-			if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
-				g.interfaceUpdatePending.Store(false)
-				return
-			}
+		if !g.runInterfaceUpdateCheck() {
+			g.interfaceUpdatePending.Store(false)
+			return
+		}
+		// Child transports receive the same interface notification and can take
+		// several seconds to rebuild. The immediate check preserves a fast
+		// already-usable ordinary path; this mandatory settled check prevents a
+		// transient WLT restart from being cached until the periodic interval.
+		if !g.waitInterfaceUpdateDelay(g.interfaceUpdateFollowupDelay) ||
+			!g.runInterfaceUpdateCheck() {
+			g.interfaceUpdatePending.Store(false)
+			return
 		}
 		if g.interfaceUpdateGeneration.Load() == generation {
 			g.interfaceUpdatePending.Store(false)
@@ -443,6 +451,18 @@ func (g *URLTestGroup) runInterfaceUpdateChecks() {
 				!g.interfaceUpdatePending.CompareAndSwap(false, true) {
 				return
 			}
+		}
+	}
+}
+
+func (g *URLTestGroup) runInterfaceUpdateCheck() bool {
+	for {
+		_, _, started := g.tryURLTest(g.ctx, true)
+		if started {
+			return true
+		}
+		if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
+			return false
 		}
 	}
 }

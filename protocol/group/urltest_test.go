@@ -108,9 +108,10 @@ func TestURLTestInterfaceUpdateWaitsForInFlightCheck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	group := &URLTestGroup{
-		ctx:     ctx,
-		history: urltest.NewHistoryStorage(),
-		close:   make(chan struct{}),
+		ctx:                          ctx,
+		history:                      urltest.NewHistoryStorage(),
+		close:                        make(chan struct{}),
+		interfaceUpdateFollowupDelay: 300 * time.Millisecond,
 	}
 	group.checking.Store(true)
 	group.InterfaceUpdated()
@@ -119,11 +120,40 @@ func TestURLTestInterfaceUpdateWaitsForInFlightCheck(t *testing.T) {
 		t.Fatal("interface update was dropped while a URL test was in flight")
 	}
 	group.checking.Store(false)
+	time.Sleep(2 * urlTestInterfaceUpdateDebounce)
+	if !group.interfaceUpdatePending.Load() {
+		t.Fatal("interface update completed without the settled follow-up check")
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for group.interfaceUpdatePending.Load() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if group.interfaceUpdatePending.Load() {
 		t.Fatal("deferred interface URL test did not complete")
+	}
+}
+
+func TestURLTestCloseStopsPendingInterfaceFollowup(t *testing.T) {
+	ctx := context.Background()
+	group := &URLTestGroup{
+		ctx:                          ctx,
+		history:                      urltest.NewHistoryStorage(),
+		close:                        make(chan struct{}),
+		interfaceUpdateFollowupDelay: time.Minute,
+	}
+	group.InterfaceUpdated()
+	time.Sleep(2 * urlTestInterfaceUpdateDebounce)
+	if !group.interfaceUpdatePending.Load() {
+		t.Fatal("interface follow-up was not pending")
+	}
+	if err := group.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for group.interfaceUpdatePending.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if group.interfaceUpdatePending.Load() {
+		t.Fatal("close did not stop pending interface follow-up")
 	}
 }
