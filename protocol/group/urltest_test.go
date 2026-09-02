@@ -103,3 +103,27 @@ func TestURLTestPreferFirstAvailableIgnoresLatency(t *testing.T) {
 		t.Fatalf("selected outbound=%v available=%v, want healthy fallback", selected, available)
 	}
 }
+
+func TestURLTestInterfaceUpdateWaitsForInFlightCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	group := &URLTestGroup{
+		ctx:     ctx,
+		history: urltest.NewHistoryStorage(),
+		close:   make(chan struct{}),
+	}
+	group.checking.Store(true)
+	group.InterfaceUpdated()
+	time.Sleep(2 * urlTestInterfaceUpdateDebounce)
+	if !group.interfaceUpdatePending.Load() {
+		t.Fatal("interface update was dropped while a URL test was in flight")
+	}
+	group.checking.Store(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for group.interfaceUpdatePending.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if group.interfaceUpdatePending.Load() {
+		t.Fatal("deferred interface URL test did not complete")
+	}
+}

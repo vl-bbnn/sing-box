@@ -29,7 +29,12 @@ func RegisterURLTest(registry *outbound.Registry) {
 	outbound.Register[option.URLTestOutboundOptions](registry, C.TypeURLTest, NewURLTest)
 }
 
-var _ adapter.OutboundGroup = (*URLTest)(nil)
+var (
+	_ adapter.OutboundGroup           = (*URLTest)(nil)
+	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
+)
+
+const urlTestInterfaceUpdateDebounce = 100 * time.Millisecond
 
 type URLTest struct {
 	outbound.Adapter
@@ -115,6 +120,12 @@ func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 
 func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
+}
+
+func (s *URLTest) InterfaceUpdated() {
+	if s.group != nil {
+		s.group.InterfaceUpdated()
+	}
 }
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -221,6 +232,8 @@ type URLTestGroup struct {
 	idleTimeout                  time.Duration
 	history                      adapter.URLTestHistoryStorage
 	checking                     atomic.Bool
+	interfaceUpdatePending       atomic.Bool
+	interfaceUpdateGeneration    atomic.Uint64
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -393,14 +406,73 @@ func (g *URLTestGroup) CheckOutbounds(force bool) {
 	_, _ = g.urlTest(g.ctx, force)
 }
 
+// InterfaceUpdated forces a fresh availability decision after the underlying
+// network changes. Child outbounds already reset their transports from the
+// same NetworkManager notification, but cached URL-test history is scoped to
+// the previous interface and otherwise keeps a stale ordinary/WLT choice until
+// the periodic interval expires. Coalesce callback bursts while guaranteeing
+// that an update arriving during an in-flight check receives a later check.
+func (g *URLTestGroup) InterfaceUpdated() {
+	g.interfaceUpdateGeneration.Add(1)
+	if !g.interfaceUpdatePending.CompareAndSwap(false, true) {
+		return
+	}
+	go g.runInterfaceUpdateChecks()
+}
+
+func (g *URLTestGroup) runInterfaceUpdateChecks() {
+	for {
+		generation := g.interfaceUpdateGeneration.Load()
+		if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
+			g.interfaceUpdatePending.Store(false)
+			return
+		}
+		for {
+			_, _, started := g.tryURLTest(g.ctx, true)
+			if started {
+				break
+			}
+			if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
+				g.interfaceUpdatePending.Store(false)
+				return
+			}
+		}
+		if g.interfaceUpdateGeneration.Load() == generation {
+			g.interfaceUpdatePending.Store(false)
+			if g.interfaceUpdateGeneration.Load() == generation ||
+				!g.interfaceUpdatePending.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}
+}
+
+func (g *URLTestGroup) waitInterfaceUpdateDelay(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-g.ctx.Done():
+		return false
+	case <-g.close:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return g.urlTest(ctx, false)
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+	result, err, _ := g.tryURLTest(ctx, force)
+	return result, err
+}
+
+func (g *URLTestGroup) tryURLTest(ctx context.Context, force bool) (map[string]uint16, error, bool) {
 	result := make(map[string]uint16)
-	if g.checking.Swap(true) {
-		return result, nil
+	if !g.checking.CompareAndSwap(false, true) {
+		return result, nil, false
 	}
 	defer g.checking.Store(false)
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
@@ -443,7 +515,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	b.Wait()
 	g.performUpdateCheck()
-	return result, nil
+	return result, nil, true
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
