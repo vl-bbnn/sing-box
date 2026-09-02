@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,29 +35,33 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
+	ctx               context.Context
 	logger            logger.ContextLogger
 	interfaceFinder   *control.DefaultInterfaceFinder
 	networkInterfaces common.TypedValue[[]adapter.NetworkInterface]
 
-	autoDetectInterface    bool
-	defaultOptions         adapter.NetworkOptions
-	autoRedirectOutputMark uint32
-	networkMonitor         tun.NetworkUpdateMonitor
-	interfaceMonitor       tun.DefaultInterfaceMonitor
-	packageManager         tun.PackageManager
-	powerListener          winpowrprof.EventListener
-	pauseManager           pause.Manager
-	platformInterface      adapter.PlatformInterface
-	connectionManager      adapter.ConnectionManager
-	endpoint               adapter.EndpointManager
-	inbound                adapter.InboundManager
-	outbound               adapter.OutboundManager
-	needWIFIState          bool
-	wifiMonitor            settings.WIFIMonitor
-	wifiState              adapter.WIFIState
-	wifiStateMutex         sync.RWMutex
-	started                bool
+	autoDetectInterface      bool
+	defaultOptions           adapter.NetworkOptions
+	autoRedirectOutputMark   uint32
+	networkMonitor           tun.NetworkUpdateMonitor
+	interfaceMonitor         tun.DefaultInterfaceMonitor
+	packageManager           tun.PackageManager
+	powerListener            winpowrprof.EventListener
+	pauseManager             pause.Manager
+	platformInterface        adapter.PlatformInterface
+	connectionManager        adapter.ConnectionManager
+	endpoint                 adapter.EndpointManager
+	inbound                  adapter.InboundManager
+	outbound                 adapter.OutboundManager
+	needWIFIState            bool
+	wifiMonitor              settings.WIFIMonitor
+	wifiState                adapter.WIFIState
+	wifiStateMutex           sync.RWMutex
+	interfaceResetGeneration atomic.Uint64
+	started                  bool
 }
+
+const androidInterfaceSettledResetDelay = 3 * time.Second
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
 	defaultDomainResolver := common.PtrValueOrDefault(options.DefaultDomainResolver)
@@ -70,6 +75,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 		return nil, E.New("`default_mark` is only supported on linux")
 	}
 	nm := &NetworkManager{
+		ctx:                 ctx,
 		logger:              logger,
 		interfaceFinder:     control.NewDefaultInterfaceFinder(),
 		autoDetectInterface: options.AutoDetectInterface,
@@ -519,6 +525,33 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 		return
 	}
 	r.ResetNetwork()
+	if C.IsAndroid {
+		r.scheduleAndroidSettledReset()
+	}
+}
+
+// Android can report the new default Network before sockets created through
+// it are consistently usable. Keep the immediate reset for fast recovery, then
+// coalesce interface-update bursts into one settled reset so transports opened
+// inside that short transition window cannot remain pinned until their own
+// long timeout. WLT's listener ignores this second callback when the physical
+// interface identity is unchanged.
+func (r *NetworkManager) scheduleAndroidSettledReset() {
+	generation := r.interfaceResetGeneration.Add(1)
+	go func() {
+		timer := time.NewTimer(androidInterfaceSettledResetDelay)
+		defer timer.Stop()
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if r.interfaceResetGeneration.Load() != generation || !r.started {
+			return
+		}
+		r.logger.Info("resetting Android transports after interface settle")
+		r.ResetNetwork()
+	}()
 }
 
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
