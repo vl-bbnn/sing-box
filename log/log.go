@@ -43,6 +43,14 @@ func New(options Options) (Factory, error) {
 		logWriter = io.Discard
 		logFilePath = logOptions.Output
 	}
+	if logOptions.OutputMaxBytes != 0 {
+		if logFilePath == "" {
+			return nil, E.New("log: output_max_bytes requires a file output")
+		}
+		if logOptions.OutputMaxBytes < minimumBoundedOutputBytes {
+			return nil, E.New("log: output_max_bytes must be at least 4096")
+		}
+	}
 	logFormatter := Formatter{
 		BaseTime:         options.BaseTime,
 		DisableColors:    logOptions.DisableColor || logFilePath != "",
@@ -58,6 +66,7 @@ func New(options Options) (Factory, error) {
 		options.PlatformWriter,
 		options.Observable,
 	)
+	factory.(*defaultFactory).fileMaxBytes = logOptions.OutputMaxBytes
 	if logOptions.Level != "" {
 		logLevel, err := ParseLevel(logOptions.Level)
 		if err != nil {

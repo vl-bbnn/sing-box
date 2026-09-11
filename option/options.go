@@ -38,11 +38,12 @@ func (o *Options) UnmarshalJSONContext(ctx context.Context, content []byte) erro
 }
 
 type LogOptions struct {
-	Disabled     bool   `json:"disabled,omitempty"`
-	Level        string `json:"level,omitempty"`
-	Output       string `json:"output,omitempty"`
-	Timestamp    bool   `json:"timestamp,omitempty"`
-	DisableColor bool   `json:"-"`
+	Disabled       bool   `json:"disabled,omitempty"`
+	Level          string `json:"level,omitempty"`
+	Output         string `json:"output,omitempty"`
+	OutputMaxBytes int64  `json:"output_max_bytes,omitempty"`
+	Timestamp      bool   `json:"timestamp,omitempty"`
+	DisableColor   bool   `json:"-"`
 }
 
 type StubOptions struct{}
