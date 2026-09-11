@@ -177,9 +177,13 @@ func (s *StartedService) StartOrReloadService(profileContent string, options *Ov
 	isReload := oldInstance != nil
 	if oldInstance != nil {
 		s.updateStatus(ServiceStatus_STOPPING)
+		s.instance = nil
 		s.serviceAccess.Unlock()
-		_ = oldInstance.Close()
+		closeErr := oldInstance.Close()
 		s.serviceAccess.Lock()
+		if closeErr != nil {
+			return s.updateStatusError(closeErr)
+		}
 	}
 	s.updateStatus(ServiceStatus_STARTING)
 	instance, err := s.newInstance(profileContent, options)
