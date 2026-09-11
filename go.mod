@@ -207,4 +207,8 @@ replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // inherited, so the executable module pins the matching fork explicitly.
 replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1
 
+// Local physical-device qualification only. The carrier worktree combines
+// the pinned mobile carrier with the uncommitted durable-identity change.
+replace github.com/vl-bbnn/wlt-carrier => ../wlt-carrier
+
 // lx:end awg
