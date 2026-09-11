@@ -97,6 +97,65 @@ func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
 	}
 }
 
+func TestCarrierWaitTrafficReadyWaitsForEndToEndSignal(t *testing.T) {
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	carrier := &Carrier{startup: startup, done: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		result <- carrier.WaitTrafficReady(context.Background())
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("WaitTrafficReady returned before traffic signal: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	startup.markTrafficReady()
+	if err := <-result; err != nil {
+		t.Fatalf("WaitTrafficReady returned error: %v", err)
+	}
+}
+
+func TestCarrierWaitTrafficReadyHonorsTimeoutAndCancellation(t *testing.T) {
+	newCarrier := func() *Carrier {
+		return &Carrier{startup: newCarrierStartupTelemetry(time.Now(), nil), done: make(chan struct{})}
+	}
+	t.Run("timeout", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := newCarrier().WaitTrafficReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("WaitTrafficReady error = %v, want deadline exceeded", err)
+		}
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := newCarrier().WaitTrafficReady(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitTrafficReady error = %v, want context cancellation", err)
+		}
+	})
+}
+
+func TestCarrierWaitTrafficReadyWakesWhenCarrierCloses(t *testing.T) {
+	carrier := &Carrier{startup: newCarrierStartupTelemetry(time.Now(), nil), done: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		result <- carrier.WaitTrafficReady(context.Background())
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := carrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("WaitTrafficReady error = %v, want closed carrier", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitTrafficReady did not wake when carrier closed")
+	}
+}
+
 func TestCarrierConnMarksFirstPacketAfterSuccessfulIO(t *testing.T) {
 	var logs []string
 	startup := newCarrierStartupTelemetry(time.Now(), func(format string, arguments ...any) {
@@ -1312,6 +1371,127 @@ func TestCarrierDialStreamCancelsOpen(t *testing.T) {
 	stats := carrier.Stats()
 	if stats.FailedStreams != 1 || stats.ActiveStreams != 0 || stats.OpenAttempts != 1 || stats.LastDialMillis <= 0 {
 		t.Fatalf("stats=%+v, want failed canceled open with released active slot", stats)
+	}
+}
+
+func TestCarrierDialStreamWaitsForReadinessBeforeAdmission(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	ready := make(chan struct{})
+	var dialCalls atomic.Int64
+	carrier.waitReady = func(ctx context.Context) error {
+		select {
+		case <-ready:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		left, right := net.Pipe()
+		_ = right.Close()
+		return left, nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, err := carrier.DialStream(context.Background(), "eu", "ready.example:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.ActiveStreams != 0 || stats.PendingDials != 0 {
+		t.Fatalf("dial admitted before readiness: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+	close(ready)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if dialCalls.Load() != 1 || carrier.Stats().OpenAttempts != 1 {
+		t.Fatal("ready dial was not attempted exactly once")
+	}
+}
+
+func TestCarrierDialStreamReadinessCancellationSendsNoOpen(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.waitReady = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var dialCalls atomic.Int64
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		return nil, errors.New("unexpected dial")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := carrier.DialStream(ctx, "eu", "ready.example:443"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DialStream readiness error=%v", err)
+	}
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.FailedStreams != 0 {
+		t.Fatalf("readiness cancellation counted as route open: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+}
+
+func TestCarrierDialStreamReadinessUsesConnectTimeoutWithoutCallerDeadline(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 25*time.Millisecond, time.Second)
+	carrier.waitReady = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var dialCalls atomic.Int64
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		return nil, errors.New("unexpected dial")
+	}
+	started := time.Now()
+	if _, err := carrier.DialStream(context.Background(), "eu", "ready.example:443"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DialStream readiness error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("readiness exceeded connect timeout: %v", elapsed)
+	}
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.FailedStreams != 0 {
+		t.Fatalf("bounded readiness counted as route open: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+}
+
+func TestCarrierDialStreamSharesConnectBudgetBetweenReadinessAndOpen(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 50*time.Millisecond, time.Second)
+	var readyDeadline time.Time
+	carrier.waitReady = func(ctx context.Context) error {
+		var ok bool
+		readyDeadline, ok = ctx.Deadline()
+		if !ok {
+			t.Fatal("readiness has no connect deadline")
+		}
+		timer := time.NewTimer(30 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	carrier.dialRoute = func(ctx context.Context, _ string) (net.Conn, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || !deadline.Equal(readyDeadline) {
+			t.Fatal("route open did not preserve readiness deadline")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if _, err := carrier.DialStream(context.Background(), "eu", "ready.example:443"); err == nil {
+		t.Fatal("expected shared connect budget to expire")
+	}
+	stats := carrier.Stats()
+	if stats.OpenAttempts != 1 || stats.FailedStreams != 1 {
+		t.Fatalf("post-readiness open failure not counted: %+v", stats)
 	}
 }
 

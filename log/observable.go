@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"time"
@@ -20,7 +21,9 @@ type defaultFactory struct {
 	platformFormatter Formatter
 	writer            io.Writer
 	file              *os.File
+	boundedFile       *boundedOutputWriter
 	filePath          string
+	fileMaxBytes      int64
 	platformWriter    PlatformWriter
 	needObservable    bool
 	level             Level
@@ -67,11 +70,31 @@ func (f *defaultFactory) Start() error {
 		}
 		f.writer = logFile
 		f.file = logFile
+		if f.fileMaxBytes > 0 {
+			info, err := logFile.Stat()
+			if err != nil {
+				_ = logFile.Close()
+				f.file = nil
+				return err
+			}
+			boundedFile, err := newBoundedOutputWriter(logFile, f.fileMaxBytes, info.Size())
+			if err != nil {
+				_ = logFile.Close()
+				f.file = nil
+				return err
+			}
+			f.writer = boundedFile
+			f.boundedFile = boundedFile
+			f.file = nil
+		}
 	}
 	return nil
 }
 
 func (f *defaultFactory) Close() error {
+	if f.boundedFile != nil {
+		return errors.Join(f.boundedFile.Close(), f.subscriber.Close())
+	}
 	return common.Close(
 		common.PtrOrNil(f.file),
 		f.subscriber,
