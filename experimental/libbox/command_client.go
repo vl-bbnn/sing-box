@@ -514,6 +514,23 @@ func (c *CommandClient) ServiceClose() error {
 	return err
 }
 
+// ServiceCloseWithTimeout bounds the caller's wait for StopService. The server
+// handler can continue after the context deadline because it is synchronous.
+func (c *CommandClient) ServiceCloseWithTimeout(timeoutMillis int64) error {
+	if timeoutMillis <= 0 || timeoutMillis > 60_000 {
+		return os.ErrInvalid
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Duration(timeoutMillis)*time.Millisecond,
+	)
+	defer cancel()
+	_, err := callWithResult(c, func(client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.StopService(ctx, &emptypb.Empty{})
+	})
+	return err
+}
+
 func (c *CommandClient) ClearLogs() error {
 	_, err := callWithResult(c, func(client daemon.StartedServiceClient) (*emptypb.Empty, error) {
 		return client.ClearLogs(context.Background(), &emptypb.Empty{})
