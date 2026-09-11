@@ -458,9 +458,21 @@ func (r *NetworkManager) UpdateWIFIState() {
 }
 
 func (r *NetworkManager) ResetNetwork() {
-	if r.connectionManager != nil {
-		r.connectionManager.CloseAll()
+	// lx:begin wlt
+	var outbounds []adapter.Outbound
+	if !notifyInterfaceListenersBeforeConnectionClose {
+		if r.connectionManager != nil {
+			r.connectionManager.CloseAll()
+		}
 	}
+	// Notify WLT before other listeners because a nested VLESS multiplex reset
+	// can spend its full graceful-drain timeout closing the old WLT stream.
+	// The WLT service must close its dial gate before those synchronous closes.
+	if notifyInterfaceListenersBeforeConnectionClose {
+		outbounds = r.outbound.Outbounds()
+		notifyPriorityInterfaceUpdateListeners(outbounds)
+	}
+	// lx:end wlt
 
 	for _, endpoint := range r.endpoint.Endpoints() {
 		listener, isListener := endpoint.(adapter.InterfaceUpdateListener)
@@ -476,16 +488,53 @@ func (r *NetworkManager) ResetNetwork() {
 		}
 	}
 
-	for _, outbound := range r.outbound.Outbounds() {
+	// lx:begin wlt
+	if outbounds == nil {
+		outbounds = r.outbound.Outbounds()
+	}
+	// lx:end wlt
+	for _, outbound := range outbounds {
 		listener, isListener := outbound.(adapter.InterfaceUpdateListener)
 		if isListener {
+			// lx:begin wlt
+			if isPriorityInterfaceUpdateListener(listener) {
+				continue
+			}
+			// lx:end wlt
 			listener.InterfaceUpdated()
 		}
 	}
+
+	// lx:begin wlt
+	if notifyInterfaceListenersBeforeConnectionClose {
+		// Gate WLT dials before closing tracked connections because a graceful
+		// connection shutdown can keep the obsolete carrier reachable for seconds.
+		if r.connectionManager != nil {
+			r.connectionManager.CloseAll()
+		}
+	}
+	// lx:end wlt
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
 	if defaultInterface == nil {
+		// lx:begin wlt
+		if notifyInterfaceListenersBeforeConnectionClose && r.started {
+			// A settled reset for the previous interface must not fire while
+			// Android has no physical network. Only WLT needs this loss edge:
+			// its live UDP carrier otherwise starts reconnecting against the
+			// absent underlay before the replacement network exists.
+			r.interfaceResetGeneration.Add(1)
+		}
+		// The interface monitor starts before outbounds and services. Forward the
+		// trusted absence edge to the structural WLT listener even before PostStart
+		// so its Initialize-stage carrier cannot open on a missing underlay.
+		if notifyInterfaceListenersBeforeConnectionClose && r.outbound != nil {
+			notifyPriorityNetworkUnavailableListeners(r.outbound.Outbounds())
+		}
+		// lx:end wlt
+		// WLT cancellation must precede potentially blocking pause subscribers
+		// and logging so admitted peer writes observe the loss edge promptly.
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
 		return
@@ -522,6 +571,13 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	r.UpdateWIFIState()
 
 	if !r.started {
+		// lx:begin wlt
+		// Pair a pre-PostStart nil edge with its physical-network return. Ordinary
+		// listeners retain their existing post-start reset ordering.
+		if notifyInterfaceListenersBeforeConnectionClose && r.outbound != nil {
+			notifyPriorityInterfaceUpdateListeners(r.outbound.Outbounds())
+		}
+		// lx:end wlt
 		return
 	}
 	r.ResetNetwork()
