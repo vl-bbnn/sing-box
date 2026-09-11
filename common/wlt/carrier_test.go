@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"reflect"
 	"strings"
@@ -189,9 +188,7 @@ func TestLoadCarrierAuthSnapshotImportsSnapshot(t *testing.T) {
 func TestLoadCarrierAuthSnapshotDoesNotBlockInlineSnapshotOnRemoteRefresh(t *testing.T) {
 	var logs []string
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
-		AuthSnapshot:             testCarrierAuthSnapshot("inline-token"),
-		AuthSnapshotURL:          "https://127.0.0.1:1/unreachable",
-		AuthSnapshotFetchTimeout: time.Second,
+		AuthSnapshot: testCarrierAuthSnapshot("inline-token"),
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	}); err != nil {
@@ -214,20 +211,8 @@ func TestLoadCarrierAuthSnapshotIgnoresMissingFile(t *testing.T) {
 }
 
 func TestLoadCarrierAuthSnapshotNeverFetchesURLBeforeTrafficReady(t *testing.T) {
-	remoteCalled := false
-	previousFetch := fetchCarrierAuthSnapshotForRecovery
-	fetchCarrierAuthSnapshotForRecovery = func(context.Context, string, time.Duration) ([]byte, error) {
-		remoteCalled = true
-		return nil, errors.New("must not run")
-	}
-	t.Cleanup(func() { fetchCarrierAuthSnapshotForRecovery = previousFetch })
-	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("no-pre-tunnel-fetch-test"), CarrierOptions{
-		AuthSnapshotURL: "https://control.example.com/auth-snapshot",
-	}, nil); err != nil {
+	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("no-pre-tunnel-fetch-test"), CarrierOptions{}, nil); err != nil {
 		t.Fatal(err)
-	}
-	if remoteCalled {
-		t.Fatal("pre-tunnel snapshot load contacted auth_snapshot_url")
 	}
 }
 
@@ -253,7 +238,6 @@ func TestLoadCarrierAuthSnapshotFallsBackToPreviousWhenCurrentIsCorrupt(t *testi
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotPreferFile: true,
-		AuthSnapshotSkipRemote: true,
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	}); err != nil {
@@ -322,9 +306,7 @@ func TestLoadCarrierAuthSnapshotPrefersPersistedFileOnRestart(t *testing.T) {
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshot:           testCarrierAuthSnapshot("inline-token"),
 		AuthSnapshotFile:       path,
-		AuthSnapshotURL:        "https://127.0.0.1:1/unreachable",
 		AuthSnapshotPreferFile: true,
-		AuthSnapshotSkipRemote: true,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +332,6 @@ func TestLoadCarrierAuthSnapshotFallsBackFromCorruptPreferredFile(t *testing.T) 
 		AuthSnapshot:           testCarrierAuthSnapshot("inline-fallback-token"),
 		AuthSnapshotFile:       path,
 		AuthSnapshotPreferFile: true,
-		AuthSnapshotSkipRemote: true,
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -396,17 +377,15 @@ func testCarrierClientConfig(callID string) *carrierconfig.ClientConfig {
 	return &carrierconfig.ClientConfig{PlatformID: "vk.com", CallID: callID, Username: "tester"}
 }
 
-func testConfigTrustedAt() int64 {
-	return time.Now().Add(-time.Hour).Unix()
-}
-
-func TestLoadCarrierAuthSnapshotRefreshesExpiredPersistedIdentity(t *testing.T) {
+func TestLoadCarrierAuthSnapshotDefersExpiredIdentityRefreshUntilProviderRejection(t *testing.T) {
 	path := t.TempDir() + "/auth-snapshot.json"
 	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshotAt("expired-token", time.Now().Add(-time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	refreshCalls := 0
 	previousRefresh := refreshCarrierAuthSnapshot
 	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+		refreshCalls++
 		return []byte(testCarrierAuthSnapshotAt("refreshed-token", time.Now().Add(30*time.Minute))), nil
 	}
 	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
@@ -414,9 +393,7 @@ func TestLoadCarrierAuthSnapshotRefreshesExpiredPersistedIdentity(t *testing.T) 
 	if err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotOutputFile: path,
-		ConfigTrustedAt:        testConfigTrustedAt(),
 		AuthSnapshotPreferFile: true,
-		AuthSnapshotSkipRemote: true,
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	}); err != nil {
@@ -426,27 +403,27 @@ func TestLoadCarrierAuthSnapshotRefreshesExpiredPersistedIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), "refreshed-token") || !strings.Contains(strings.Join(logs, "\n"), "event=refresh_succeeded") {
-		t.Fatalf("refreshed snapshot was not persisted; logs=%v", logs)
+	if refreshCalls != 0 || !strings.Contains(string(content), "expired-token") || !strings.Contains(strings.Join(logs, "\n"), "event=refresh_deferred") {
+		t.Fatalf("provider refresh was not deferred; calls=%d logs=%v", refreshCalls, logs)
 	}
 }
 
-func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T) {
+func TestLoadCarrierAuthSnapshotDoesNotProbeUnavailableProviderBeforeConnect(t *testing.T) {
 	path := t.TempDir() + "/auth-snapshot.json"
 	if err := os.WriteFile(path, []byte(testCarrierAuthSnapshotAt("expired-token", time.Now().Add(-time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	refreshCalls := 0
 	previousRefresh := refreshCarrierAuthSnapshot
 	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+		refreshCalls++
 		return nil, errors.New("provider unavailable")
 	}
 	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
 	var logs []string
 	err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
-		ConfigTrustedAt:        testConfigTrustedAt(),
 		AuthSnapshotPreferFile: true,
-		AuthSnapshotSkipRemote: true,
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
@@ -458,8 +435,8 @@ func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T
 		t.Fatal(err)
 	}
 	joinedLogs := strings.Join(logs, "\n")
-	if !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "event=refresh_unavailable") || !strings.Contains(joinedLogs, "fallback=saved_snapshot") {
-		t.Fatalf("saved snapshot fallback was not preserved; logs=%v", logs)
+	if refreshCalls != 0 || !strings.Contains(string(content), "expired-token") || !strings.Contains(joinedLogs, "event=refresh_deferred") {
+		t.Fatalf("saved snapshot was not used without a provider probe; calls=%d logs=%v", refreshCalls, logs)
 	}
 	if strings.Contains(joinedLogs, "expired-token") || strings.Contains(joinedLogs, "messages") || strings.Contains(joinedLogs, "turn-pass") {
 		t.Fatalf("auth telemetry leaked snapshot material: %s", joinedLogs)
@@ -480,7 +457,6 @@ func TestRefreshCarrierAuthSnapshotAfterRejectionPersistsReplacement(t *testing.
 	err := refreshCarrierAuthSnapshotAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotOutputFile: path,
-		ConfigTrustedAt:        testConfigTrustedAt(),
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
@@ -505,31 +481,18 @@ func TestRefreshCarrierAuthSnapshotAfterRejectionNeverFallsBackToRemote(t *testi
 	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
 		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
 	}
-	remoteCalled := false
-	previousFetch := fetchCarrierAuthSnapshotForRecovery
-	fetchCarrierAuthSnapshotForRecovery = func(context.Context, string, time.Duration) ([]byte, error) {
-		remoteCalled = true
-		return nil, errors.New("must not run")
-	}
 	t.Cleanup(func() {
 		refreshCarrierAuthSnapshot = previousRefresh
-		fetchCarrierAuthSnapshotForRecovery = previousFetch
 	})
 	var logs []string
 	err := refreshCarrierAuthSnapshotAfterRejection(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
-		AuthSnapshotFile:         path,
-		AuthSnapshotOutputFile:   path,
-		AuthSnapshotURL:          "https://control.example.com/auth-snapshot",
-		AuthSnapshotFetchTimeout: time.Second,
-		ConfigTrustedAt:          testConfigTrustedAt(),
+		AuthSnapshotFile:       path,
+		AuthSnapshotOutputFile: path,
 	}, func(format string, arguments ...any) {
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	})
 	if !errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
 		t.Fatalf("error=%v", err)
-	}
-	if remoteCalled {
-		t.Fatal("pre-tunnel recovery contacted auth_snapshot_url")
 	}
 	joinedLogs := strings.Join(logs, "\n")
 	if strings.Contains(joinedLogs, "control.example.com") {
@@ -537,92 +500,74 @@ func TestRefreshCarrierAuthSnapshotAfterRejectionNeverFallsBackToRemote(t *testi
 	}
 }
 
-func TestLoadCarrierAuthSnapshotSkipsRefreshWithoutRecentConfigTrust(t *testing.T) {
-	for name, trustedAt := range map[string]int64{
-		"missing": 0,
-		"expired": time.Now().AddDate(0, -6, -1).Unix(),
-		"future":  time.Now().Add(48 * time.Hour).Unix(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			refreshCalls := 0
-			previousRefresh := refreshCarrierAuthSnapshot
-			refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
-				refreshCalls++
-				return nil, errors.New("must not run")
-			}
-			t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
-			var logs []string
-			err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
-				AuthSnapshot:    testCarrierAuthSnapshotAt("cached-token", time.Now().Add(-time.Hour)),
-				ConfigTrustedAt: trustedAt,
-			}, func(format string, arguments ...any) {
-				logs = append(logs, fmt.Sprintf(format, arguments...))
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if refreshCalls != 0 {
-				t.Fatalf("refresh calls=%d", refreshCalls)
-			}
-			if !strings.Contains(strings.Join(logs, "\n"), "reason=config_trust_"+name) {
-				t.Fatalf("trust status missing from logs: %v", logs)
-			}
-		})
+func TestLoadCarrierInlineAuthSnapshotForFallbackDoesNotPersistBeforeConnect(t *testing.T) {
+	path := t.TempDir() + "/auth-snapshot.json"
+	current := testCarrierAuthSnapshot("rejected-current-token")
+	if err := os.WriteFile(path, []byte(current), 0o600); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestCarrierConfigTrustUsesCalendarSixMonthWindow(t *testing.T) {
-	now := time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC)
-	if trusted, _, _ := carrierConfigTrust(time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC).Unix(), now); !trusted {
-		t.Fatal("exact six-month boundary should be trusted")
-	}
-	if trusted, status, _ := carrierConfigTrust(time.Date(2026, time.February, 19, 11, 59, 59, 0, time.UTC).Unix(), now); trusted || status != "expired" {
-		t.Fatalf("older config trusted=%t status=%s", trusted, status)
-	}
-}
-
-func TestFreshProviderBootstrapRequiresRecentConfigTrust(t *testing.T) {
-	cfg := testCarrierClientConfig("fresh-bootstrap-trust-test")
-	if err := requireCarrierBootstrapTrust(cfg, CarrierOptions{}, nil); err == nil || !strings.Contains(err.Error(), "trust missing") {
-		t.Fatalf("missing trust error=%v", err)
-	}
-	if err := requireCarrierBootstrapTrust(cfg, CarrierOptions{ConfigTrustedAt: time.Now().AddDate(0, -6, -1).Unix()}, nil); err == nil || !strings.Contains(err.Error(), "trust expired") {
-		t.Fatalf("expired trust error=%v", err)
-	}
-	if err := requireCarrierBootstrapTrust(cfg, CarrierOptions{ConfigTrustedAt: testConfigTrustedAt()}, nil); err != nil {
-		t.Fatalf("recent config trust rejected: %v", err)
-	}
-}
-
-func TestFetchCarrierAuthSnapshotUsesHTTPSAndBoundsPayload(t *testing.T) {
-	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method != http.MethodGet {
-			t.Fatalf("method=%s, want GET", request.Method)
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"version":1}`)),
-			Request:    request,
-		}, nil
-	})}
-
-	data, err := fetchCarrierAuthSnapshotWithClient(context.Background(), "https://control.example.com/snapshot", client)
+	inline := testCarrierAuthSnapshot("profile-inline-token")
+	loaded, err := loadCarrierInlineAuthSnapshotForFallback(
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{
+			AuthSnapshot:           inline,
+			AuthSnapshotOutputFile: path,
+		},
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != `{"version":1}` {
-		t.Fatalf("snapshot=%q", data)
+	if !loaded {
+		t.Fatal("inline profile snapshot was not loaded")
 	}
-	if _, err := fetchCarrierAuthSnapshot(context.Background(), "http://example.com/snapshot", time.Second); err == nil {
-		t.Fatal("expected non-HTTPS URL rejection")
+	exported, err := carrierengine.ExportAuthSnapshotJSON(*testCarrierClientConfig("restart-snapshot-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(exported), `"anonym_token":"profile-inline-token"`) {
+		t.Fatalf("inline profile snapshot was not imported: %s", exported)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(persisted) != current {
+		t.Fatal("inline fallback replaced current snapshot before a successful connect")
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+func TestExpiredProfileIdentityDoesNotRequirePreconnectRefreshOrCalendarTrust(t *testing.T) {
+	refreshCalls := 0
+	previousRefresh := refreshCarrierAuthSnapshot
+	refreshCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+		refreshCalls++
+		return []byte(testCarrierAuthSnapshot("refreshed-token")), nil
+	}
+	t.Cleanup(func() { refreshCarrierAuthSnapshot = previousRefresh })
+	err := loadCarrierAuthSnapshot(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+		AuthSnapshot: testCarrierAuthSnapshotAt("cached-token", time.Now().AddDate(-2, 0, 0)),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("refresh calls=%d", refreshCalls)
+	}
+}
 
-func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return f(request)
+func TestCarrierBootstrapRequiresDurableProfileIdentity(t *testing.T) {
+	cfg := testCarrierClientConfig("fresh-bootstrap-test")
+	if err := requireCarrierBootstrap(cfg); err == nil || !strings.Contains(err.Error(), "bootstrap unavailable") {
+		t.Fatalf("missing bootstrap error=%v", err)
+	}
+	snapshot := strings.Replace(testCarrierAuthSnapshot("durable-token"), "restart-snapshot-test", cfg.CallID, 1)
+	if err := carrierengine.ImportAuthSnapshotJSON([]byte(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireCarrierBootstrap(cfg); err != nil {
+		t.Fatalf("durable profile bootstrap rejected: %v", err)
+	}
 }
 
 func TestCarrierDefaultsAreIPhoneBounded(t *testing.T) {

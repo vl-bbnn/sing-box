@@ -124,17 +124,15 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 		}
 	}
 	// The carrier must establish traffic without the profile control plane.
-	// auth_snapshot_url remains a compatibility field, but pre-tunnel recovery
-	// is limited to the profile bootstrap and client-persisted auth state.
+	// auth_snapshot_url is parsed only for profile compatibility and is not
+	// passed into this runtime. Recovery is limited to the profile bootstrap,
+	// client-persisted auth state, and the provider itself.
 	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
 		AuthSnapshot:                 s.options.AuthSnapshot,
 		AuthSnapshotFile:             s.options.AuthSnapshotFile,
-		AuthSnapshotURL:              s.options.AuthSnapshotURL,
-		AuthSnapshotFetchTimeout:     time.Duration(s.options.AuthSnapshotFetchTimeout),
 		AuthSnapshotOutputFile:       s.options.AuthSnapshotOutputFile,
-		ConfigTrustedAt:              s.options.ConfigTrustedAt,
 		AuthSnapshotPreferFile:       preferPersistedAuth,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,
