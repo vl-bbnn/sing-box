@@ -35,9 +35,9 @@ func (m *platformDefaultInterfaceMonitor) Start() error {
 	}
 	closeObserver, observerErr := startPhysicalLinkObserver(m)
 	if observerErr != nil {
-		// This observer is diagnostic only. ConnectivityManager remains the
-		// authoritative source for default-network loss and recovery.
-		m.logger.Warn("android physical link observer unavailable diagnostic_only=true: ", observerErr)
+		// This observer is diagnostic only. The platform default-path monitor
+		// remains authoritative for default-network loss and recovery.
+		m.logger.Warn("physical link observer unavailable diagnostic_only=true: ", observerErr)
 	} else {
 		m.closePhysicalLinkObserver = closeObserver
 	}

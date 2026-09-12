@@ -1,4 +1,4 @@
-//go:build !android || !with_wlt
+//go:build (!android && !darwin) || !with_wlt
 
 package libbox
 
