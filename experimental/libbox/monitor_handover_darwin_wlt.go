@@ -5,7 +5,22 @@ package libbox
 import (
 	"sync/atomic"
 	"time"
+
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 )
+
+// Capture at the public entry before any epoch mutex or platform work; emit
+// after the callback returns so diagnostic I/O cannot delay cancellation.
+func traceWLTPublicInterfaceUpdate(m *platformDefaultInterfaceMonitor, index int32) func() {
+	entered := carriercommon.DarwinUptimeNanos()
+	return func() {
+		finished := carriercommon.DarwinUptimeNanos()
+		if m.logger != nil {
+			m.logger.Info("wlt interface public callback index=", index,
+				" entry_uptime_ns=", entered, " return_uptime_ns=", finished)
+		}
+	}
+}
 
 var (
 	wltInterfaceCallbackEpoch    = time.Now()

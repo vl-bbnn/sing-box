@@ -1743,12 +1743,14 @@ func (c *Carrier) close(immediate bool) error {
 		return nil
 	}
 	c.closeOnce.Do(func() {
+		entered := carriercommon.DarwinUptimeNanos()
 		if c.done != nil {
 			close(c.done)
 		}
 		if c.cancel != nil {
 			c.cancel()
 		}
+		canceled := carriercommon.DarwinUptimeNanos()
 		if c.client != nil {
 			var err error
 			if immediate {
@@ -1762,6 +1764,9 @@ func (c *Carrier) close(immediate bool) error {
 		}
 		if c.restoreSocketControl != nil {
 			c.restoreSocketControl()
+		}
+		if entered != 0 && c.logf != nil {
+			c.logf("wlt carrier close immediate=%t entry_uptime_ns=%d canceled_uptime_ns=%d return_uptime_ns=%d", immediate, entered, canceled, carriercommon.DarwinUptimeNanos())
 		}
 	})
 	return c.closeErr

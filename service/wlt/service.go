@@ -506,6 +506,7 @@ func (s *Service) interfaceUpdated(currentInterfaceKey string, goos string, reco
 // closed gate so its final raw runtime counters remain observable until a
 // replacement generation is committed.
 func (s *Service) NetworkUnavailable() {
+	entered := carriercommon.DarwinUptimeNanos()
 	s.access.Lock()
 	if s.stopped || s.interfaceUnavailable {
 		s.access.Unlock()
@@ -521,6 +522,8 @@ func (s *Service) NetworkUnavailable() {
 	restartAttempt := s.restartAttempt
 	carrierStartCancel := s.carrierStartCancel
 	s.carrierStartCancel = nil
+	sealed := carriercommon.DarwinUptimeNanos()
+	generation := s.interfaceGeneration
 	s.access.Unlock()
 
 	if restartAttempt != nil {
@@ -535,6 +538,11 @@ func (s *Service) NetworkUnavailable() {
 	}
 	if carrierStartCancel != nil {
 		carrierStartCancel()
+	}
+	if entered != 0 && s.logger != nil {
+		s.logger.Info("wlt network unavailable generation=", generation,
+			" entry_uptime_ns=", entered, " admission_sealed_uptime_ns=", sealed,
+			" return_uptime_ns=", carriercommon.DarwinUptimeNanos())
 	}
 }
 

@@ -79,6 +79,9 @@ func (m *platformDefaultInterfaceMonitor) UnregisterCallback(element *list.Eleme
 }
 
 func (m *platformDefaultInterfaceMonitor) UpdateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
+	// lx:begin wlt-ingress-diagnostic
+	defer traceWLTPublicInterfaceUpdate(m, interfaceIndex32)()
+	// lx:end wlt-ingress-diagnostic
 	if sFixAndroidStack {
 		done := make(chan struct{})
 		go func() {
