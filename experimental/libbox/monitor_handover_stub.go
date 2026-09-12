@@ -10,4 +10,6 @@ func beginWLTEpoch(*platformDefaultInterfaceMonitor) uint64 { return 0 }
 
 func wltEpochCurrent(*platformDefaultInterfaceMonitor, uint64) bool { return true }
 
+func wltInterfacePublicationBlocked(*platformDefaultInterfaceMonitor, int) bool { return false }
+
 func prepareWLTEarlyHandover(*platformDefaultInterfaceMonitor, string, int32, uint64) {}

@@ -32,14 +32,27 @@ var (
 // The normal nil callback remains the sole owner of WLT admission closure and
 // carrier cancellation.
 func beginWLTEpoch(m *platformDefaultInterfaceMonitor) uint64 {
-	m.defaultInterfaceAccess.Lock()
-	epoch := m.wltHandoverEpoch.Add(1)
-	m.defaultInterfaceAccess.Unlock()
-	return epoch
+	for {
+		m.defaultInterfaceAccess.Lock()
+		pending := m.wltKernelLossDone
+		if pending == nil {
+			epoch := m.wltHandoverEpoch.Add(1)
+			m.defaultInterfaceAccess.Unlock()
+			return epoch
+		}
+		m.defaultInterfaceAccess.Unlock()
+		<-pending
+	}
 }
 
 func wltEpochCurrent(m *platformDefaultInterfaceMonitor, epoch uint64) bool {
 	return m.wltHandoverEpoch.Load() == epoch
+}
+
+// Called with defaultInterfaceAccess held. A stale NWPath snapshot cannot
+// reopen a kernel-retired IPv4 interface before its address is added again.
+func wltInterfacePublicationBlocked(m *platformDefaultInterfaceMonitor, index int) bool {
+	return m.wltRetiredInterfaceIndex == index
 }
 
 func prepareWLTEarlyHandover(m *platformDefaultInterfaceMonitor, interfaceName string, interfaceIndex32 int32, epoch uint64) {

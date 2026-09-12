@@ -24,7 +24,10 @@ type platformDefaultInterfaceMonitor struct {
 	myInterfaces              []string
 	closePhysicalLinkObserver func()
 	// lx:begin interface-loss-priority
-	wltHandoverEpoch atomic.Uint64
+	wltHandoverEpoch          atomic.Uint64
+	wltRetiredInterfaceIndex  int
+	wltRetiredInterfaceByLink bool
+	wltKernelLossDone         chan struct{}
 	// lx:end interface-loss-priority
 }
 
@@ -141,6 +144,10 @@ func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName s
 	}
 	m.defaultInterfaceAccess.Lock()
 	if !wltEpochCurrent(m, wltEpoch) {
+		m.defaultInterfaceAccess.Unlock()
+		return
+	}
+	if wltInterfacePublicationBlocked(m, newInterface.Index) {
 		m.defaultInterfaceAccess.Unlock()
 		return
 	}
