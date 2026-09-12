@@ -129,3 +129,24 @@ func TestDarwinObserverCloseWakesBlockedReader(t *testing.T) {
 		t.Fatal("observer did not join its reader after Close")
 	}
 }
+
+func TestDarwinIPv6DeletionChecksActualIPv4WithoutRetiringPrivacyRotation(t *testing.T) {
+	m := &platformDefaultInterfaceMonitor{platformInterfaceWrapper: &platformInterfaceWrapper{defaultInterface: &control.Interface{Index: 16}}}
+	event := darwinLinkEvent{kind: unix.RTM_DELADDR, index: 16, family: unix.AF_INET6}
+	usable := m.verifyDarwinAddressLoss(event, func(int) (bool, error) { return true, nil })
+	if m.retireDarwinInterface(usable) {
+		t.Fatal("IPv6 rotation retired usable IPv4")
+	}
+	uncertain := m.verifyDarwinAddressLoss(event, func(int) (bool, error) { return false, errors.New("unavailable") })
+	if m.retireDarwinInterface(uncertain) {
+		t.Fatal("query failure treated as confirmed loss")
+	}
+	stale := m.verifyDarwinAddressLoss(event, func(int) (bool, error) { beginWLTEpoch(m); return false, nil })
+	if m.retireDarwinInterface(stale) {
+		t.Fatal("stale observation retired a new callback generation")
+	}
+	lost := m.verifyDarwinAddressLoss(event, func(int) (bool, error) { return false, nil })
+	if !m.retireDarwinInterface(lost) {
+		t.Fatal("confirmed IPv4 absence did not retire old carrier")
+	}
+}

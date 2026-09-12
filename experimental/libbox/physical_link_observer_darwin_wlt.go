@@ -3,20 +3,26 @@
 package libbox
 
 import (
+	"net"
 	"net/netip"
 	"os"
 	"sync"
 
+	"github.com/sagernet/sing/common/control"
 	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 )
 
 type darwinLinkEvent struct {
-	kind    int
-	index   int
-	flags   int
-	address netip.Addr
+	kind            int
+	index           int
+	flags           int
+	address         netip.Addr
+	family          int
+	verifiedLoss    bool
+	verifiedCurrent *control.Interface
+	verifiedEpoch   uint64
 }
 
 func darwinLinkEvents(messages []route.Message) []darwinLinkEvent {
@@ -31,6 +37,9 @@ func darwinLinkEvents(messages []route.Message) []darwinLinkEvent {
 			if m.Type == unix.RTM_DELADDR || m.Type == unix.RTM_NEWADDR {
 				event := darwinLinkEvent{kind: m.Type, index: m.Index, flags: m.Flags}
 				if len(m.Addrs) > unix.RTAX_IFA {
+					if m.Addrs[unix.RTAX_IFA] != nil {
+						event.family = m.Addrs[unix.RTAX_IFA].Family()
+					}
 					if address, ok := m.Addrs[unix.RTAX_IFA].(*route.Inet4Addr); ok {
 						event.address = netip.AddrFrom4(address.IP)
 					}
@@ -84,10 +93,12 @@ func runDarwinLinkObserver(m *platformDefaultInterfaceMonitor, socket *os.File) 
 			}
 			for _, event := range darwinLinkEvents(messages) {
 				sequence++
+				event = m.verifyDarwinAddressLoss(event, darwinInterfaceHasIPv4)
 				retired := m.retireDarwinInterface(event)
 				m.logger.Info("darwin physical link event sequence=", sequence,
 					" read_uptime_ns=", observed, " kind=", event.kind,
 					" index=", event.index, " flags=", event.flags,
+					" address_family=", event.family, " ipv4_path_absent=", event.verifiedLoss,
 					" current_interface_retired=", retired)
 			}
 		}
@@ -97,6 +108,48 @@ func runDarwinLinkObserver(m *platformDefaultInterfaceMonitor, socket *os.File) 
 		<-done
 		m.logger.Info("darwin physical link observer stopped diagnostic_only=true")
 	}
+}
+
+func darwinInterfaceHasIPv4(index int) (bool, error) {
+	iface, err := net.InterfaceByIndex(index)
+	if err != nil {
+		return false, err
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		return false, nil
+	}
+	addresses, err := iface.Addrs()
+	if err != nil {
+		return false, err
+	}
+	for _, address := range addresses {
+		if prefix, ok := address.(*net.IPNet); ok && prefix.IP.To4() != nil && !prefix.IP.IsUnspecified() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Darwin may emit only IPv6 DELADDR entries while withdrawing the complete
+// Wi-Fi path. Confirm the actual IPv4 absence without relying on that payload.
+// Snapshot before the syscall and reject its result if a callback advanced.
+func (m *platformDefaultInterfaceMonitor) verifyDarwinAddressLoss(event darwinLinkEvent, hasIPv4 func(int) (bool, error)) darwinLinkEvent {
+	if event.kind != unix.RTM_DELADDR {
+		return event
+	}
+	m.defaultInterfaceAccess.Lock()
+	current, epoch := m.defaultInterface, m.wltHandoverEpoch.Load()
+	m.defaultInterfaceAccess.Unlock()
+	if current == nil || current.Index != event.index {
+		return event
+	}
+	usable, err := hasIPv4(event.index)
+	if err == nil && !usable {
+		event.verifiedLoss = true
+		event.verifiedCurrent = current
+		event.verifiedEpoch = epoch
+	}
+	return event
 }
 
 func (m *platformDefaultInterfaceMonitor) retireDarwinInterface(event darwinLinkEvent) bool {
@@ -116,6 +169,9 @@ func (m *platformDefaultInterfaceMonitor) retireDarwinInterface(event darwinLink
 	// evidence for the IPv4 TURN socket. Require deletion of an address that
 	// the current interface actually owns, or an administrative link-down.
 	lost := event.kind == unix.RTM_IFINFO && event.flags&unix.IFF_UP == 0
+	if event.verifiedLoss && event.verifiedCurrent == current && event.verifiedEpoch == m.wltHandoverEpoch.Load() {
+		lost = true
+	}
 	if event.kind == unix.RTM_DELADDR && event.address.Is4() {
 		for _, prefix := range current.Addresses {
 			if prefix.Addr().Unmap() == event.address {
