@@ -30,6 +30,8 @@ type Instance struct {
 	urlTestHistoryStorage *urltest.HistoryStorage
 }
 
+func (i *Instance) Context() context.Context { return i.ctx }
+
 func (s *StartedService) CheckConfig(configContent string) error {
 	options, err := parseConfig(s.ctx, configContent)
 	if err != nil {
@@ -126,9 +128,14 @@ func (i *Instance) Start() error {
 }
 
 func (i *Instance) Close() error {
+	// lx:begin wlt - finish admitted OPENs before canceling their parent context.
+	quiesceErr := quiesceWLTServices(i.ctx)
+	// lx:end wlt
 	i.cancel()
 	i.urlTestHistoryStorage.Close()
-	return i.instance.Close()
+	// lx:begin wlt - preserve a drain failure while always closing the instance.
+	return E.Errors(quiesceErr, i.instance.Close())
+	// lx:end wlt
 }
 
 func (i *Instance) Box() *box.Box {

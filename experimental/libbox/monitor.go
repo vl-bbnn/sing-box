@@ -15,16 +15,33 @@ var (
 
 type platformDefaultInterfaceMonitor struct {
 	*platformInterfaceWrapper
-	logger       logger.Logger
-	callbacks    list.List[tun.DefaultInterfaceUpdateCallback]
-	myInterfaces []string
+	logger                    logger.Logger
+	callbacks                 list.List[tun.DefaultInterfaceUpdateCallback]
+	myInterfaces              []string
+	closePhysicalLinkObserver func()
 }
 
 func (m *platformDefaultInterfaceMonitor) Start() error {
-	return m.iif.StartDefaultInterfaceMonitor(m)
+	err := m.iif.StartDefaultInterfaceMonitor(m)
+	if err != nil {
+		return err
+	}
+	closeObserver, observerErr := startPhysicalLinkObserver(m)
+	if observerErr != nil {
+		// This observer is diagnostic only. ConnectivityManager remains the
+		// authoritative source for default-network loss and recovery.
+		m.logger.Warn("android physical link observer unavailable diagnostic_only=true: ", observerErr)
+	} else {
+		m.closePhysicalLinkObserver = closeObserver
+	}
+	return nil
 }
 
 func (m *platformDefaultInterfaceMonitor) Close() error {
+	if m.closePhysicalLinkObserver != nil {
+		m.closePhysicalLinkObserver()
+		m.closePhysicalLinkObserver = nil
+	}
 	return m.iif.CloseDefaultInterfaceMonitor(m)
 }
 
@@ -70,20 +87,29 @@ func (m *platformDefaultInterfaceMonitor) UpdateDefaultInterface(interfaceName s
 func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
 	m.isExpensive = isExpensive
 	m.isConstrained = isConstrained
-	err := m.networkManager.UpdateInterfaces()
-	if err != nil {
-		m.logger.Error(E.Cause(err, "update interfaces"))
-	}
-	m.defaultInterfaceAccess.Lock()
+	// lx:begin interface-loss-priority
+	// Network absence is already authoritative. Stop users of the old
+	// interface before a platform interface refresh can block this callback.
 	if interfaceIndex32 == -1 {
+		m.defaultInterfaceAccess.Lock()
 		m.defaultInterface = nil
 		callbacks := m.callbacks.Array()
 		m.defaultInterfaceAccess.Unlock()
 		for _, callback := range callbacks {
 			callback(nil, 0)
 		}
+		err := m.networkManager.UpdateInterfaces()
+		if err != nil {
+			m.logger.Error(E.Cause(err, "update interfaces"))
+		}
 		return
 	}
+	// lx:end interface-loss-priority
+	err := m.networkManager.UpdateInterfaces()
+	if err != nil {
+		m.logger.Error(E.Cause(err, "update interfaces"))
+	}
+	m.defaultInterfaceAccess.Lock()
 	oldInterface := m.defaultInterface
 	newInterface, err := m.networkManager.InterfaceFinder().ByIndex(int(interfaceIndex32))
 	if err != nil {

@@ -289,7 +289,7 @@ func TestExpiredReserveRefreshesExistingIdentityBeforeFreshAuthorization(t *test
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte, _ func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		if !bytes.Equal(raw, reserve) {
 			t.Fatalf("existing-only refresh received wrong identity")
@@ -409,7 +409,7 @@ func TestReserveRefreshRateLimitPersistsCooldownAndStopsProviderWork(t *testing.
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		return nil, carriercommon.ErrProviderRateLimited
 	}
@@ -482,7 +482,7 @@ func TestSameReserveIdentityRefreshIsNotAmplifiedAcrossSessions(t *testing.T) {
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
 	}
