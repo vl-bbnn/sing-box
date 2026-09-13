@@ -8,6 +8,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/wltdiagnostics"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -152,19 +153,44 @@ func (s *Selector) SelectOutbound(tag string) bool {
 }
 
 func (s *Selector) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	conn, err := s.selected.Load().DialContext(ctx, network, destination)
+	selected := s.selected.Load()
+	conn, err := selected.DialContext(ctx, network, destination)
 	if err != nil {
 		return nil, err
 	}
+	s.logWLTLeaf(ctx, selected, N.NetworkName(network))
 	return s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 }
 
 func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	conn, err := s.selected.Load().ListenPacket(ctx, destination)
+	selected := s.selected.Load()
+	conn, err := selected.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, err
 	}
+	s.logWLTLeaf(ctx, selected, N.NetworkUDP)
 	return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+}
+
+func (s *Selector) logWLTLeaf(ctx context.Context, selected adapter.Outbound, network string) {
+	if !C.WLTDiagnosticsEnabled || selected == nil {
+		return
+	}
+	if _, isGroup := selected.(adapter.OutboundGroup); isGroup {
+		return
+	}
+	metadata := adapter.ContextFrom(ctx)
+	if metadata == nil {
+		return
+	}
+	category := wltdiagnostics.DomainCategory(metadata.Domain)
+	if category == "" {
+		category = wltdiagnostics.DomainCategory(metadata.Destination.Fqdn)
+	}
+	if category == "" {
+		return
+	}
+	s.logger.InfoContext(ctx, "wlt-route-leaf-category=", category, " outbound-class=", wltdiagnostics.OutboundClass(selected.Tag()), " network=", network, " attempt=primary")
 }
 
 func (s *Selector) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
