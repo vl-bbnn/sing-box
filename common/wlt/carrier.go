@@ -27,6 +27,10 @@ import (
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
+type TrafficReadyProvider interface {
+	WaitWltTrafficReady(ctx context.Context, timeoutMillis int64) error
+}
+
 type logfSlogHandler struct {
 	logf     func(string, ...any)
 	observer func(slog.Record)
@@ -149,7 +153,7 @@ type providerCooldownState struct {
 
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
-	refreshExistingCarrierAuthSnapshot  = carrierengine.RefreshExistingAuthSnapshotContext
+	refreshExistingCarrierAuthSnapshot  = carrierengine.RefreshExistingAuthSnapshotContextObserved
 	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuthUnattended
 	prewarmFreshCarrierAuthSnapshot     = carrierengine.PrewarmFreshAuthUnattendedContext
 	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
@@ -427,6 +431,7 @@ type CarrierStats struct {
 type Carrier struct {
 	client               *carrierengine.Client
 	cancel               context.CancelFunc
+	done                 chan struct{}
 	restoreSocketControl func()
 
 	dialRoute func(context.Context, string) (net.Conn, error)
@@ -474,6 +479,38 @@ type Carrier struct {
 	streamsMu            sync.Mutex
 	streams              map[*carrierConn]struct{}
 	pressureIdleReclaims atomic.Int64
+}
+
+// WaitTrafficReady blocks until this carrier generation has received an
+// end-to-end response, or ctx is cancelled.
+func (c *Carrier) WaitTrafficReady(ctx context.Context) error {
+	if c == nil || c.startup == nil || c.startup.trafficReadySignal == nil {
+		return os.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.startup.trafficReadySignal:
+		select {
+		case <-c.done:
+			return net.ErrClosed
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	case <-c.done:
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error) {
@@ -658,6 +695,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	carrier := &Carrier{
 		client:               runtimeClient,
 		cancel:               cancel,
+		done:                 make(chan struct{}),
 		restoreSocketControl: restoreSocketControl,
 		dialRoute:            runtimeClient.DialRouteContext,
 		waitReady:            runtimeClient.WaitReady,
@@ -837,7 +875,9 @@ func refreshExistingCarrierAuthCandidate(ctx context.Context, cfg *carrierconfig
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
 	defer cancel()
-	refreshed, err := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+	refreshed, err := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw, func(event, category string) {
+		logCarrierAuthRefreshLifecycle(logf, event, category)
+	})
 	if err != nil {
 		if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) && logf != nil {
 			logf("WLT carrier auth event=reauthorization_required source=%s", source)
@@ -1207,7 +1247,9 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 			logf("WLT carrier auth event=refresh_started source=%s remaining_ttl_seconds=%d", source, int64(remaining/time.Second))
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
-		refreshed, refreshErr := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+		refreshed, refreshErr := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw, func(event, category string) {
+			logCarrierAuthRefreshLifecycle(logf, event, category)
+		})
 		cancel()
 		if refreshErr != nil {
 			if isProviderRateLimitError(refreshErr) {
@@ -1239,6 +1281,29 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		}
 	}
 	return reportPreparedCarrierAuthSnapshot(raw, source, logf)
+}
+
+func logCarrierAuthRefreshLifecycle(logf func(string, ...any), event, category string) {
+	if logf == nil {
+		return
+	}
+	switch event {
+	case "saved_call_session_accepted", "saved_call_session_rejected",
+		"calls_session_replacement_started", "calls_session_replacement_ready",
+		"calls_session_replacement_rejected", "replacement_call_session_join_succeeded",
+		"replacement_call_session_rejected", "identity_renewal_not_entered",
+		"existing_identity_renewal_started":
+	default:
+		event = "unclassified"
+	}
+	switch category {
+	case "none", "authentication_required", "access_denied", "anonymous_identity_rejected",
+		"challenge_required", "conversation_unavailable", "rate_limited", "request_invalid",
+		"rejected", "temporary_failure":
+	default:
+		category = "unclassified"
+	}
+	logf("WLT carrier auth refresh lifecycle event=%s category=%s", event, category)
 }
 
 func reportPreparedCarrierAuthSnapshot(raw []byte, source string, logf func(string, ...any)) error {
@@ -1536,21 +1601,6 @@ func (c *Carrier) DialStream(ctx context.Context, routeClass string, target stri
 		c.failedStreams.Add(1)
 		return nil, err
 	}
-	activeWaitStartedAt := time.Now()
-	releaseActive, err := c.acquireActiveSlot(ctx, routeClass, target)
-	c.recordDuration(&c.lastActiveWait, &c.maxActiveWait, time.Since(activeWaitStartedAt))
-	if err != nil {
-		return nil, err
-	}
-	openWaitStartedAt := time.Now()
-	releaseOpen, err := c.acquireOpenSlot(ctx, routeClass, target)
-	c.recordDuration(&c.lastOpenWait, &c.maxOpenWait, time.Since(openWaitStartedAt))
-	if err != nil {
-		releaseActive()
-		return nil, err
-	}
-	defer releaseOpen()
-
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if _, ok := dialCtx.Deadline(); !ok && c.connectTimeout > 0 {
@@ -1559,6 +1609,28 @@ func (c *Carrier) DialStream(ctx context.Context, routeClass string, target stri
 		dialCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
+	// Wait for the current carrier generation to prove its bidirectional
+	// control path before consuming admission slots or sending a route OPEN.
+	// The same connect budget covers readiness and the later route open.
+	if c.waitReady != nil {
+		if err := c.waitReady(dialCtx); err != nil {
+			return nil, err
+		}
+	}
+	activeWaitStartedAt := time.Now()
+	releaseActive, err := c.acquireActiveSlot(dialCtx, routeClass, target)
+	c.recordDuration(&c.lastActiveWait, &c.maxActiveWait, time.Since(activeWaitStartedAt))
+	if err != nil {
+		return nil, err
+	}
+	openWaitStartedAt := time.Now()
+	releaseOpen, err := c.acquireOpenSlot(dialCtx, routeClass, target)
+	c.recordDuration(&c.lastOpenWait, &c.maxOpenWait, time.Since(openWaitStartedAt))
+	if err != nil {
+		releaseActive()
+		return nil, err
+	}
+	defer releaseOpen()
 
 	dialStartedAt := time.Now()
 	var (
@@ -1671,6 +1743,9 @@ func (c *Carrier) close(immediate bool) error {
 		return nil
 	}
 	c.closeOnce.Do(func() {
+		if c.done != nil {
+			close(c.done)
+		}
 		if c.cancel != nil {
 			c.cancel()
 		}
@@ -1928,10 +2003,15 @@ func (c *Carrier) routeIDForClass(routeClass string) (string, error) {
 	return "", fmt.Errorf("unknown WLT carrier route class: %s", routeClass)
 }
 
-func withCarrierDefaults(options CarrierOptions) CarrierOptions {
-	if options.ConnectTimeout <= 0 {
-		options.ConnectTimeout = defaultCarrierConnectTimeout
+func CarrierConnectTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return defaultCarrierConnectTimeout
 	}
+	return configured
+}
+
+func withCarrierDefaults(options CarrierOptions) CarrierOptions {
+	options.ConnectTimeout = CarrierConnectTimeout(options.ConnectTimeout)
 	if options.MaxActiveStreams <= 0 {
 		options.MaxActiveStreams = defaultCarrierMaxActive
 	}
@@ -2148,12 +2228,30 @@ func (c *carrierConn) Write(p []byte) (int, error) {
 }
 
 func (c *carrierConn) Close() error {
+	return c.close(false)
+}
+
+// Abort closes only this carrier stream without waiting for a graceful KCP
+// drain. It does not stop or reset the shared carrier generation.
+func (c *carrierConn) Abort() error {
+	return c.close(true)
+}
+
+func (c *carrierConn) close(immediate bool) error {
 	var err error
 	c.closeOnce.Do(func() {
 		if c.idleStop != nil {
 			close(c.idleStop)
 		}
-		err = c.Conn.Close()
+		if immediate {
+			if aborter, isAborter := c.Conn.(interface{ Abort() error }); isAborter {
+				err = aborter.Abort()
+			} else {
+				err = c.Conn.Close()
+			}
+		} else {
+			err = c.Conn.Close()
+		}
 		c.carrier.unregisterStream(c)
 		c.releaseActive()
 		c.carrier.closedStreams.Add(1)

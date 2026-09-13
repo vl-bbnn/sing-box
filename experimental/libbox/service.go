@@ -137,6 +137,7 @@ func (w *platformInterfaceWrapper) NetworkInterfaces() ([]adapter.NetworkInterfa
 		// Why not used?
 		//nolint:staticcheck
 		isDefault := netInterface.Name != w.myTunName && w.defaultInterface != nil && int(netInterface.Index) == w.defaultInterface.Index
+		expensive, constrained := w.isExpensive, w.isConstrained
 		w.defaultInterfaceAccess.Unlock()
 		interfaces = append(interfaces, adapter.NetworkInterface{
 			Interface: control.Interface{
@@ -148,8 +149,8 @@ func (w *platformInterfaceWrapper) NetworkInterfaces() ([]adapter.NetworkInterfa
 			},
 			Type:        C.InterfaceType(netInterface.Type),
 			DNSServers:  iteratorToArray[string](netInterface.DNSServer),
-			Expensive:   netInterface.Metered || isDefault && w.isExpensive,
-			Constrained: isDefault && w.isConstrained,
+			Expensive:   netInterface.Metered || isDefault && expensive,
+			Constrained: isDefault && constrained,
 		})
 	}
 	interfaces = common.UniqBy(interfaces, func(it adapter.NetworkInterface) string {

@@ -5,6 +5,7 @@ package wlt
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 type unavailableCarrierService struct {
 	waitCalled bool
+	lostCalled bool
 }
 
 func (*unavailableCarrierService) Carrier() *wltpkg.Carrier { return nil }
@@ -27,7 +29,13 @@ func (s *unavailableCarrierService) WaitCarrier(context.Context) (*wltpkg.Carrie
 	s.waitCalled = true
 	return nil, context.DeadlineExceeded
 }
-func (*unavailableCarrierService) InterfaceUpdated() {}
+func (s *unavailableCarrierService) DialStream(ctx context.Context, _, _ string) (io.ReadWriteCloser, error) {
+	_, err := s.WaitCarrier(ctx)
+	return nil, err
+}
+
+func (*unavailableCarrierService) InterfaceUpdated()     {}
+func (s *unavailableCarrierService) NetworkUnavailable() { s.lostCalled = true }
 
 type directFallbackDialer struct {
 	destination M.Socksaddr
@@ -96,5 +104,54 @@ func TestWLTOutboundUsesDirectFallbackWithoutWaitingForCarrier(t *testing.T) {
 	}
 	if fallback.destination != proxyServer {
 		t.Fatalf("fallback destination=%s, want %s", fallback.destination, proxyServer)
+	}
+}
+
+func TestWLTOutboundForwardsTrustedNetworkLoss(t *testing.T) {
+	service := &unavailableCarrierService{}
+	outbound := &Outbound{
+		Adapter: outbound.NewAdapter(C.TypeWLT, "wlt-eu", []string{N.NetworkTCP}, nil),
+		logger:  log.NewNOPFactory().Logger(),
+		carrier: service,
+	}
+	outbound.NetworkUnavailable()
+	if !service.lostCalled {
+		t.Fatal("trusted network loss was not forwarded to the resolved carrier service")
+	}
+}
+
+type failedDialCarrierService struct {
+	unavailableCarrierService
+	err   error
+	calls int
+}
+
+func (*failedDialCarrierService) Carrier() *wltpkg.Carrier { return &wltpkg.Carrier{} }
+func (s *failedDialCarrierService) DialStream(context.Context, string, string) (io.ReadWriteCloser, error) {
+	s.calls++
+	return nil, s.err
+}
+
+func TestWLTOutboundNeverFallsBackAfterRecoveryOrCancellation(t *testing.T) {
+	for _, dialError := range []error{context.Canceled, context.DeadlineExceeded, &wltpkg.CarrierRecoveryError{Err: io.EOF}} {
+		t.Run(dialError.Error(), func(t *testing.T) {
+			carrier := &failedDialCarrierService{err: dialError}
+			fallback := &directFallbackDialer{}
+			h := &Outbound{Adapter: outbound.NewAdapter(C.TypeWLT, "wlt-eu", []string{N.NetworkTCP}, nil), logger: log.NewNOPFactory().Logger(), carrier: carrier, route: "eu", directFallback: true, fallbackDialer: fallback}
+			stream, err := h.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("proxy.example.com", 443))
+			if stream != nil || !errors.Is(err, dialError) || carrier.calls != 1 || fallback.destination.IsValid() {
+				t.Fatalf("fallback after terminal recovery: %v destination=%v", err, fallback.destination)
+			}
+		})
+	}
+}
+
+func TestWLTOutboundDisabledFallbackWaitsOnService(t *testing.T) {
+	carrier := &unavailableCarrierService{}
+	fallback := &directFallbackDialer{}
+	h := &Outbound{Adapter: outbound.NewAdapter(C.TypeWLT, "wlt-eu", []string{N.NetworkTCP}, nil), logger: log.NewNOPFactory().Logger(), carrier: carrier, route: "eu", fallbackDialer: fallback}
+	stream, err := h.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddrHostPort("proxy.example.com", 443))
+	if stream != nil || !errors.Is(err, context.DeadlineExceeded) || !carrier.waitCalled || fallback.destination.IsValid() {
+		t.Fatalf("disabled fallback err=%v", err)
 	}
 }
