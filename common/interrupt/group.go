@@ -16,6 +16,13 @@ type Group struct {
 type groupConnItem struct {
 	conn       io.Closer
 	isExternal bool
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (c *groupConnItem) close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.conn.Close() })
+	return c.closeErr
 }
 
 func NewGroup() *Group {
@@ -25,28 +32,33 @@ func NewGroup() *Group {
 func (g *Group) NewConn(conn net.Conn, isExternal bool) net.Conn {
 	g.access.Lock()
 	defer g.access.Unlock()
-	item := g.connections.PushBack(&groupConnItem{conn, isExternal})
+	item := g.connections.PushBack(&groupConnItem{conn: conn, isExternal: isExternal})
 	return &Conn{Conn: conn, group: g, element: item}
 }
 
 func (g *Group) NewPacketConn(conn net.PacketConn, isExternal bool) net.PacketConn {
 	g.access.Lock()
 	defer g.access.Unlock()
-	item := g.connections.PushBack(&groupConnItem{conn, isExternal})
+	item := g.connections.PushBack(&groupConnItem{conn: conn, isExternal: isExternal})
 	return &PacketConn{PacketConn: conn, group: g, element: item}
 }
 
+// Interrupt detaches the selected generation under the group lock. Network
+// teardown can block (TLS close-notify, stream drains); it must not prevent
+// newly established connections from being published to their callers.
 func (g *Group) Interrupt(interruptExternalConnections bool) {
 	g.access.Lock()
-	defer g.access.Unlock()
-	var toDelete []*list.Element[*groupConnItem]
-	for element := g.connections.Front(); element != nil; element = element.Next() {
+	var closing []*groupConnItem
+	for element := g.connections.Front(); element != nil; {
+		next := element.Next()
 		if !element.Value.isExternal || interruptExternalConnections {
-			element.Value.conn.Close()
-			toDelete = append(toDelete, element)
+			closing = append(closing, element.Value)
+			g.connections.Remove(element)
 		}
+		element = next
 	}
-	for _, element := range toDelete {
-		g.connections.Remove(element)
+	g.access.Unlock()
+	for _, item := range closing {
+		_ = item.close()
 	}
 }

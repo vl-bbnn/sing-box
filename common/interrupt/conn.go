@@ -28,9 +28,9 @@ type Conn struct {
 
 func (c *Conn) Close() error {
 	c.group.access.Lock()
-	defer c.group.access.Unlock()
 	c.group.connections.Remove(c.element)
-	return c.Conn.Close()
+	c.group.access.Unlock()
+	return c.element.Value.close()
 }
 
 func (c *Conn) ReaderReplaceable() bool {
@@ -57,9 +57,9 @@ type PacketConn struct {
 
 func (c *PacketConn) Close() error {
 	c.group.access.Lock()
-	defer c.group.access.Unlock()
 	c.group.connections.Remove(c.element)
-	return c.PacketConn.Close()
+	c.group.access.Unlock()
+	return c.element.Value.close()
 }
 
 func (c *PacketConn) ReaderReplaceable() bool {
