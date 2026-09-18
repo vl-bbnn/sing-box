@@ -136,6 +136,10 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			message.Extra[0].Header().Ttl == 0 &&
 			len(message.Extra[0].(*dns.OPT).Option) == 0) &&
 		!options.ClientSubnet.IsValid()
+	// Cache coalescing and the transport share one bounded query budget.
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
 	disableCache := !isSimpleRequest || c.disableCache || options.DisableCache
 	if !disableCache {
 		if c.cache != nil {
@@ -187,7 +191,6 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			return nil, ErrResponseRejectedCached
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	exchangeStartedAt := time.Now()
 	response, err := transport.Exchange(ctx, message)
 	cancel()
