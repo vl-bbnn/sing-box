@@ -42,6 +42,8 @@ type pendingQuery struct {
 	stopConn    func() bool
 }
 
+var errSharedQueryDeadline = errors.New("shared DNS connection expired by another query")
+
 func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 	return &queryMultiplexer{
 		options: options,
@@ -68,7 +70,7 @@ func (m *queryMultiplexer) Reset() {
 
 func (m *queryMultiplexer) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	response, err := m.exchangeOnce(ctx, message)
-	if err == nil || ctx.Err() != nil || (!errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed)) {
+	if err == nil || ctx.Err() != nil || (!errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, errSharedQueryDeadline)) {
 		return response, err
 	}
 
@@ -77,7 +79,9 @@ func (m *queryMultiplexer) Exchange(ctx context.Context, message *mDNS.Msg) (*mD
 	// already invalidated that connection at this point. DNS queries are
 	// idempotent, so retry exactly once on the fresh connection instead of
 	// exposing the stale-pool EOF to the system resolver as a multi-second
-	// lookup failure. Context cancellation and protocol errors are not retried.
+	// lookup failure. An unrelated query may also invalidate the shared
+	// connection on its deadline; a still-live caller retains its own budget
+	// for this one retry. Own cancellation and protocol errors are not retried.
 	return m.exchangeOnce(ctx, message)
 }
 
@@ -202,7 +206,7 @@ func (m *queryMultiplexer) completeContextDone(queryId uint16, ctx context.Conte
 	}
 	err := ctx.Err()
 	if errors.Is(err, context.DeadlineExceeded) && pending.conn.readEpoch.Load() == pending.readEpoch {
-		m.connection.Invalidate(pending.conn, err)
+		m.connection.Invalidate(pending.conn, errors.Join(err, errSharedQueryDeadline))
 	} else {
 		m.connection.Release(pending.conn, true)
 	}
