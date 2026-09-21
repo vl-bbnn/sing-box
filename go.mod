@@ -180,3 +180,6 @@ require (
 // for CI/release once validated against a live AWG2 server. See SPECS/003.
 replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // lx:end awg
+
+// Keep distinct TCP destinations isolated when Android reuses a source port.
+replace github.com/sagernet/sing-tun => github.com/vl-bbnn/sing-tun v0.8.11-0.20260921032538-bb42cd2dd10e
