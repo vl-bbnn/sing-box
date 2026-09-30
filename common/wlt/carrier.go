@@ -1874,15 +1874,7 @@ func (c *Carrier) Stats() CarrierStats {
 }
 
 func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, target string) (func(), error) {
-	acquired := tryAcquire(c.activeSlots)
-	if !acquired {
-		// Under saturation, reclaim only connections that have been idle for a
-		// separately configured pressure interval. The normal idle timeout is
-		// deliberately left untouched so long-lived media is not shortened.
-		if c.reclaimPressureIdleStream(routeClass) {
-			acquired = tryAcquire(c.activeSlots)
-		}
-	}
+	acquired := c.tryAcquireOrReclaimActiveSlot(routeClass)
 	if !acquired {
 		if !tryAcquire(c.pendingSlots) {
 			c.rejectedQueue.Add(1)
@@ -1906,13 +1898,39 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 		}
 		defer cancel()
 
-		select {
-		case c.activeSlots <- struct{}{}:
-			acquired = true
-		case <-waitCtx.Done():
-			c.rejectedActive.Add(1)
-			c.rejectedStreams.Add(1)
-			return nil, fmt.Errorf("WLT carrier active stream limit reached route=%s target=%s: %w", routeClass, target, waitCtx.Err())
+		for !acquired {
+			if err := waitCtx.Err(); err != nil {
+				c.rejectedActive.Add(1)
+				c.rejectedStreams.Add(1)
+				return nil, fmt.Errorf("WLT carrier active stream limit reached route=%s target=%s: %w", routeClass, target, err)
+			}
+			// An occupied stream can cross the pressure-idle threshold while this
+			// dial is queued. Recheck at the next known eligibility time instead
+			// of waiting for another dial to trigger reclaim. The existing queue
+			// deadline still bounds this entire wait.
+			// A normal concurrent close may already have released a slot. Claim
+			// it before considering an abort of another, now-idle stream.
+			acquired = c.tryAcquireOrReclaimActiveSlot(routeClass)
+			if acquired {
+				break
+			}
+			delay, hasCandidate := c.nextPressureIdleReclaimDelay()
+			if !hasCandidate {
+				select {
+				case c.activeSlots <- struct{}{}:
+					acquired = true
+				case <-waitCtx.Done():
+				}
+				continue
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case c.activeSlots <- struct{}{}:
+				acquired = true
+			case <-timer.C:
+			case <-waitCtx.Done():
+			}
+			timer.Stop()
 		}
 	}
 
@@ -1927,6 +1945,19 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 		release(c.activeSlots)
 		c.activeStreams.Add(-1)
 	}, nil
+}
+
+func (c *Carrier) tryAcquireOrReclaimActiveSlot(routeClass string) bool {
+	if tryAcquire(c.activeSlots) {
+		return true
+	}
+	// Under saturation, reclaim only connections that have been idle for a
+	// separately configured pressure interval. The normal idle timeout is
+	// deliberately left untouched so long-lived media is not shortened.
+	if c.reclaimPressureIdleStream(routeClass) {
+		return tryAcquire(c.activeSlots)
+	}
+	return false
 }
 
 func (c *Carrier) acquireOpenSlot(ctx context.Context, routeClass string, target string) (func(), error) {
@@ -2484,4 +2515,36 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	// to discard it.  Abort only this stale flow; normal closes still drain.
 	_ = candidate.Abort()
 	return true
+}
+
+// nextPressureIdleReclaimDelay finds when an occupied stream may first be
+// reclaimed. Activity can extend that time, so admission revalidates the
+// candidate after waking; this function never closes a stream itself.
+func (c *Carrier) nextPressureIdleReclaimDelay() (time.Duration, bool) {
+	if c == nil || c.pressureIdleTimeout <= 0 {
+		return 0, false
+	}
+	now := time.Now()
+	var next time.Duration
+	found := false
+	c.streamsMu.Lock()
+	for stream := range c.streams {
+		if stream.idleClosing.Load() {
+			continue
+		}
+		lastActivity := stream.lastActivity.Load()
+		if lastActivity == 0 {
+			continue
+		}
+		remaining := time.Unix(0, lastActivity).Add(c.pressureIdleTimeout).Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if !found || remaining < next {
+			next = remaining
+			found = true
+		}
+	}
+	c.streamsMu.Unlock()
+	return next, found
 }
