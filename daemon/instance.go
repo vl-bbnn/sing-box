@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/oomkiller"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -97,6 +98,14 @@ func (s *StartedService) newInstance(profileContent string, overrideOptions *Ove
 				Type: C.TypeOOMKiller,
 			})
 		}
+	}
+	if C.IsIos && common.Any(options.Services, func(it option.Service) bool {
+		return it.Type == C.TypeWLT
+	}) {
+		ctx = oomkiller.WithWLTMemoryPressure(ctx)
+		s.wltDiagnostics.Store(true)
+	} else {
+		s.wltDiagnostics.Store(false)
 	}
 	urlTestHistoryStorage := urltest.NewHistoryStorage()
 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)

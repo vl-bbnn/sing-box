@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -32,10 +33,11 @@ var _ StartedServiceServer = (*StartedService)(nil)
 type StartedService struct {
 	ctx context.Context
 	// platform adapter.PlatformInterface
-	handler     PlatformHandler
-	debug       bool
-	logMaxLines int
-	oomKiller   bool
+	handler        PlatformHandler
+	debug          bool
+	logMaxLines    int
+	oomKiller      bool
+	wltDiagnostics atomic.Bool
 	// workingDirectory string
 	// tempDirectory    string
 	// userID           int
@@ -1044,7 +1046,7 @@ func (s *StartedService) WriteMessage(level log.Level, message string) {
 	}
 	s.logAccess.Unlock()
 	s.logSubscriber.Emit(item)
-	if s.debug {
+	if s.debug || (s.wltDiagnostics.Load() && forwardWLTRecoveryDiagnostic(message)) {
 		s.handler.WriteDebugMessage(message)
 	}
 }

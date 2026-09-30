@@ -62,15 +62,17 @@ type Service struct {
 	memoryLimit   uint64
 	hasTimerMode  bool
 	useAvailable  bool
+	wltPressure   bool
 	timerConfig   timerConfig
 	adaptiveTimer *adaptiveTimer
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.OOMKillerServiceOptions) (adapter.Service, error) {
 	s := &Service{
-		Adapter: boxService.NewAdapter(boxConstant.TypeOOMKiller, tag),
-		logger:  logger,
-		router:  service.FromContext[adapter.Router](ctx),
+		Adapter:     boxService.NewAdapter(boxConstant.TypeOOMKiller, tag),
+		logger:      logger,
+		router:      service.FromContext[adapter.Router](ctx),
+		wltPressure: hasWLTMemoryPressure(ctx) && boxConstant.IsIos,
 	}
 
 	if options.MemoryLimit != nil {
@@ -177,9 +179,18 @@ func goMemoryPressureCallback(status C.ulong) {
 			}
 		} else {
 			if isCritical {
-				s.logger.Error("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB, resetting network")
-				s.router.ResetNetwork()
-				freeOSMemory = true
+				if s.wltPressure {
+					after, reset := recoverWLTMemoryPressure(runtimeDebug.FreeOSMemory, memory.Total, s.router.ResetNetwork)
+					if reset {
+						s.logger.Error("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB, after_gc: ", after/(1024*1024), " MiB, resetting network")
+					} else {
+						s.logger.Warn("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB, after_gc: ", after/(1024*1024), " MiB, preserving network")
+					}
+				} else {
+					s.logger.Error("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB, resetting network")
+					s.router.ResetNetwork()
+					freeOSMemory = true
+				}
 			} else if isWarning {
 				s.logger.Warn("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB")
 			} else {
@@ -190,4 +201,20 @@ func goMemoryPressureCallback(status C.ulong) {
 	if freeOSMemory {
 		runtimeDebug.FreeOSMemory()
 	}
+}
+
+const wltCriticalFootprintLimit = 45 * 1024 * 1024
+
+// A critical iOS notification can arrive below the extension's recovery
+// threshold. Reclaim Go pages first without severing active media streams.
+// An unavailable measurement (zero) fails closed to the original reset.
+func recoverWLTMemoryPressure(free func(), measure func() uint64, reset func()) (uint64, bool) {
+	free()
+	after := measure()
+	if after == 0 || after >= wltCriticalFootprintLimit {
+		reset()
+		free() // Preserve the original post-reset reclamation in the emergency path.
+		return after, true
+	}
+	return after, false
 }
