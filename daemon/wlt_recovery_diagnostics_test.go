@@ -5,7 +5,7 @@ package daemon
 import "testing"
 
 func TestRecoveryDiagnosticWhitelist(t *testing.T) {
-	for _, message := range []string{"ERROR [oom-killer]: memory pressure: critical, usage: 40 MiB, resetting network", "INFO wlt service stats opened=1 failed=0", "INFO relay client mux terminal stats opened=1", "INFO relay client peer write terminal stats dropped=0"} {
+	for _, message := range []string{"ERROR [oom-killer]: memory pressure: critical, usage: 40 MiB, resetting network", "INFO wlt service stats opened=1 failed=0", "INFO relay client mux terminal stats opened=1", "INFO relay client peer write terminal stats dropped=0", "INFO wlt payload phase trace_id=1 phase=write_completed bytes=1524 error_class=none"} {
 		if !forwardWLTRecoveryDiagnostic(message) {
 			t.Fatalf("recovery diagnostic rejected: %s", message)
 		}

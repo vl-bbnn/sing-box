@@ -16,7 +16,7 @@ import (
 
 type Client = mux.Client
 
-func NewClientWithOptions(dialer N.Dialer, logger logger.Logger, options option.OutboundMultiplexOptions) (*Client, error) {
+func NewClientWithOptions(dialer N.Dialer, logger logger.Logger, options option.OutboundMultiplexOptions, trace ...*mux.FirstPayloadTraceOptions) (*Client, error) {
 	if !options.Enabled {
 		return nil, nil
 	}
@@ -34,15 +34,20 @@ func NewClientWithOptions(dialer N.Dialer, logger logger.Logger, options option.
 			return nil, E.New("brutal: invalid download speed")
 		}
 	}
+	var firstTrace *mux.FirstPayloadTraceOptions
+	if len(trace) == 1 {
+		firstTrace = trace[0]
+	}
 	return mux.NewClient(mux.Options{
-		Dialer:         &clientDialer{dialer},
-		Logger:         logger,
-		Protocol:       options.Protocol,
-		MaxConnections: options.MaxConnections,
-		MinStreams:     options.MinStreams,
-		MaxStreams:     options.MaxStreams,
-		Padding:        options.Padding,
-		Brutal:         brutalOptions,
+		Dialer:            &clientDialer{dialer},
+		Logger:            logger,
+		Protocol:          options.Protocol,
+		MaxConnections:    options.MaxConnections,
+		MinStreams:        options.MinStreams,
+		MaxStreams:        options.MaxStreams,
+		Padding:           options.Padding,
+		Brutal:            brutalOptions,
+		FirstPayloadTrace: firstTrace,
 	})
 }
 
