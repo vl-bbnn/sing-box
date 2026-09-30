@@ -2445,6 +2445,11 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	var sameRouteCandidate *carrierConn
 	c.streamsMu.Lock()
 	for stream := range c.streams {
+		// Its graceful Close already owns closeOnce. Abort would wait for that
+		// drain instead of freeing a slot before the pending dial times out.
+		if stream.idleClosing.Load() {
+			continue
+		}
 		lastActivity := stream.lastActivity.Load()
 		if lastActivity == 0 || lastActivity > cutoff {
 			continue

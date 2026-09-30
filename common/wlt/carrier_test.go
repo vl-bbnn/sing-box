@@ -1103,10 +1103,14 @@ func TestCarrierReclaimsPressureIdleStream(t *testing.T) {
 type slowGracefulPressureConn struct {
 	net.Conn
 	gracefulRelease <-chan struct{}
-	aborted        atomic.Bool
+	gracefulStarted chan<- struct{}
+	aborted         atomic.Bool
 }
 
 func (c *slowGracefulPressureConn) Close() error {
+	if c.gracefulStarted != nil {
+		c.gracefulStarted <- struct{}{}
+	}
 	<-c.gracefulRelease
 	return c.Conn.Close()
 }
@@ -1145,6 +1149,65 @@ func TestCarrierPressureReclaimDoesNotWaitForGracefulDrain(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("pressure reclaim blocked on graceful drain")
+	}
+}
+
+func TestCarrierPressureReclaimSkipsStreamAlreadyClosing(t *testing.T) {
+	closingLeft, closingRight := net.Pipe()
+	defer closingRight.Close()
+	viableLeft, viableRight := net.Pipe()
+	defer viableRight.Close()
+	gracefulRelease := make(chan struct{})
+	gracefulStarted := make(chan struct{}, 1)
+	underlay := &slowGracefulPressureConn{
+		Conn: closingLeft, gracefulRelease: gracefulRelease, gracefulStarted: gracefulStarted,
+	}
+	carrier := newTestCarrier(2, 1, 1, time.Second, 2*time.Second)
+	carrier.pressureIdleTimeout = 10 * time.Millisecond
+	for range 2 {
+		carrier.activeSlots <- struct{}{}
+	}
+	carrier.activeStreams.Add(2)
+	newStream := func(conn net.Conn) *carrierConn {
+		return &carrierConn{
+			Conn: conn, carrier: carrier, routeClass: "direct",
+			releaseActive: func() { release(carrier.activeSlots); carrier.activeStreams.Add(-1) },
+		}
+	}
+	closing := newStream(underlay)
+	viable := newStream(viableLeft)
+	if !carrier.registerStream(closing) || !carrier.registerStream(viable) {
+		t.Fatal("failed to register pressure candidates")
+	}
+	closing.lastActivity.Store(time.Now().Add(-2 * time.Second).UnixNano())
+	viable.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	closing.idleClosing.Store(true)
+	closeDone := make(chan struct{})
+	go func() { defer close(closeDone); _ = closing.Close() }()
+	select {
+	case <-gracefulStarted:
+	case <-time.After(time.Second):
+		close(gracefulRelease)
+		t.Fatal("graceful close did not start")
+	}
+	reclaimDone := make(chan bool, 1)
+	reclaimFinished := make(chan struct{})
+	go func() {
+		defer close(reclaimFinished)
+		reclaimDone <- carrier.reclaimPressureIdleStream("eu")
+	}()
+	defer func() {
+		close(gracefulRelease)
+		<-closeDone
+		<-reclaimFinished
+	}()
+	select {
+	case reclaimed := <-reclaimDone:
+		if !reclaimed || carrier.activeStreams.Load() != 1 || underlay.aborted.Load() {
+			t.Fatalf("reclaimed=%t active=%d closing_aborted=%t", reclaimed, carrier.activeStreams.Load(), underlay.aborted.Load())
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pressure reclaim waited behind an already-started graceful close")
 	}
 }
 
