@@ -79,7 +79,17 @@ func (s *Store) Start() error {
 		if s.inet6Range.IsValid() {
 			s.inet6Current = s.inet6Range.Addr().Next()
 		}
-		_ = storage.FakeIPReset()
+		preserveBindings := false
+		if metadata == nil {
+			if cache, ok := storage.(interface {
+				FakeIPRangeCompatible(netip.Prefix, netip.Prefix) bool
+			}); ok {
+				preserveBindings = cache.FakeIPRangeCompatible(s.inet4Range, s.inet6Range)
+			}
+		}
+		if !preserveBindings {
+			_ = storage.FakeIPReset()
+		}
 	}
 	s.storage = storage
 	return nil
@@ -94,13 +104,13 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.addressAccess.Lock()
+	defer s.addressAccess.Unlock()
 	metadata := &adapter.FakeIPMetadata{
 		Inet4Range:   s.inet4Range,
 		Inet6Range:   s.inet6Range,
 		Inet4Current: s.inet4Current,
 		Inet6Current: s.inet6Current,
 	}
-	s.addressAccess.Unlock()
 	return s.storage.FakeIPSaveMetadata(metadata)
 }
 
@@ -122,34 +132,55 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 		if !s.inet4Current.IsValid() {
 			return netip.Addr{}, E.New("missing IPv4 fakeip address range")
 		}
-		nextAddress := s.inet4Current.Next()
-		if nextAddress == s.inet4Last || !s.inet4Range.Contains(nextAddress) {
-			nextAddress = s.inet4Range.Addr().Next().Next()
-		}
-		s.inet4Current = nextAddress
-		address = nextAddress
+		address = s.nextUnused(s.inet4Current, s.inet4Last, s.inet4Range)
+		s.inet4Current = address
 	} else {
 		if !s.inet6Current.IsValid() {
 			return netip.Addr{}, E.New("missing IPv6 fakeip address range")
 		}
-		nextAddress := s.inet6Current.Next()
-		if nextAddress == s.inet6Last || !s.inet6Range.Contains(nextAddress) {
-			nextAddress = s.inet6Range.Addr().Next().Next()
-		}
-		s.inet6Current = nextAddress
-		address = nextAddress
+		address = s.nextUnused(s.inet6Current, s.inet6Last, s.inet6Range)
+		s.inet6Current = address
 	}
-	err := s.storage.FakeIPStore(address, domain)
-	if err != nil {
-		s.logger.Warn("save FakeIP cache: ", err)
-	}
-	s.storage.FakeIPSaveMetadataAsync(&adapter.FakeIPMetadata{
+	metadata := &adapter.FakeIPMetadata{
 		Inet4Range:   s.inet4Range,
 		Inet6Range:   s.inet6Range,
 		Inet4Current: s.inet4Current,
 		Inet6Current: s.inet6Current,
-	})
+	}
+	var err error
+	if storage, ok := s.storage.(interface {
+		FakeIPStoreWithMetadata(netip.Addr, string, *adapter.FakeIPMetadata) error
+	}); ok {
+		err = storage.FakeIPStoreWithMetadata(address, domain, metadata)
+	} else {
+		err = s.storage.FakeIPStore(address, domain)
+		if err == nil {
+			s.storage.FakeIPSaveMetadataAsync(metadata)
+		}
+	}
+	if err != nil {
+		s.logger.Warn("save FakeIP cache: ", err)
+	}
 	return address, nil
+}
+
+func (s *Store) nextUnused(current, last netip.Addr, addressRange netip.Prefix) netip.Addr {
+	var first netip.Addr
+	for {
+		current = current.Next()
+		if current == last || !addressRange.Contains(current) {
+			current = addressRange.Addr().Next().Next()
+		}
+		if !first.IsValid() {
+			first = current
+		} else if current == first {
+			// The range is full; preserve the existing wrap-and-reuse behavior.
+			return current
+		}
+		if _, occupied := s.storage.FakeIPLoad(current); !occupied {
+			return current
+		}
+	}
 }
 
 func (s *Store) Lookup(address netip.Addr) (string, bool) {

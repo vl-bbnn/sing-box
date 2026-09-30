@@ -4,7 +4,10 @@ package wlt
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -24,10 +27,16 @@ import (
 type carrierService interface {
 	Carrier() *wltpkg.Carrier
 	WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error)
+	DialStream(ctx context.Context, routeClass string, target string) (io.ReadWriteCloser, error)
 	InterfaceUpdated()
+	NetworkUnavailable()
 }
 
 var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+
+// PriorityInterfaceUpdate lets the network manager close the WLT dial gate
+// before nested transports synchronously drain streams from the old carrier.
+func (*Outbound) PriorityInterfaceUpdate() {}
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.WLTOutboundOptions](registry, C.TypeWLT, NewOutbound)
@@ -107,6 +116,7 @@ func (h *Outbound) resolveCarrier() (carrierService, error) {
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	admissionTarget := wltAdmissionTarget(ctx, destination)
+	originalMetadata := adapter.ContextFrom(ctx)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -122,14 +132,23 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		h.logger.WarnContext(ctx, "WLT carrier unavailable; using encrypted upstream direct fallback")
 		return h.fallbackDialer.DialContext(ctx, network, destination)
 	}
-	carrier, err = carrierService.WaitCarrier(ctx)
-	if err != nil {
-		return nil, E.Cause(err, "wait for wlt carrier")
+	if C.WLTDiagnosticsEnabled && admissionTarget.Fqdn == "cp.cloudflare.com" && admissionTarget.Port == 443 {
+		fakeIP := "none"
+		if originalMetadata != nil && originalMetadata.FakeIP && netip.MustParsePrefix("198.18.0.0/15").Contains(originalMetadata.OriginDestination.Addr) {
+			fakeIP = originalMetadata.OriginDestination.Addr.String()
+		}
+		routeClass := "other"
+		switch h.route {
+		case "eu", "ru", "direct":
+			routeClass = h.route
+		}
+		h.logger.InfoContext(ctx, "wlt-fixture phase=before-open fake_ip=", fakeIP, " domain=cp.cloudflare.com target=cp.cloudflare.com:443 route_class=", routeClass)
 	}
 	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
-	stream, err := carrier.DialStream(ctx, h.route, admissionTarget.String())
+	stream, err := carrierService.DialStream(ctx, h.route, admissionTarget.String())
 	if err != nil {
-		if h.directFallback {
+		var recoveryError *wltpkg.CarrierRecoveryError
+		if h.directFallback && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &recoveryError) {
 			h.logger.WarnContext(ctx, "WLT carrier stream unavailable; using encrypted upstream direct fallback")
 			return h.fallbackDialer.DialContext(ctx, network, destination)
 		}
@@ -162,6 +181,15 @@ func (h *Outbound) InterfaceUpdated() {
 		return
 	}
 	carrierService.InterfaceUpdated()
+}
+
+func (h *Outbound) NetworkUnavailable() {
+	carrierService, err := h.resolveCarrier()
+	if err != nil {
+		h.logger.Warn("notify WLT carrier about network loss: ", err)
+		return
+	}
+	carrierService.NetworkUnavailable()
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

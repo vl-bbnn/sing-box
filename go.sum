@@ -361,6 +361,8 @@ github.com/vishvananda/netns v0.0.5 h1:DfiHV+j8bA32MFM7bfEunvT8IAqQ/NzSJHtcmW5zd
 github.com/vishvananda/netns v0.0.5/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
 github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1 h1:XmjntW9riXvB2Nh9uYKW2x8iuxxHCtyd5xicpFVsklE=
 github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
+github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20260924013426-a0918ea9f352 h1:ytGPFCzDxPqGfIXKG0fi8+H4glfDQfT2rWD+lj3XakM=
+github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20260924013426-a0918ea9f352/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260826155302-5f55b50a657a h1:uAjxIjcB1ihWrW5CeG98FUHdxdFNBe6IZCJkOD1cNT0=
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260826155302-5f55b50a657a/go.mod h1:yog9+x5bx4OshyHRks20MJu2y8hlZ1U8MnDsktiwwK8=
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20260827102709-b30364039021 h1:+/fhIkqPMycw8/AYT/LW2ahNxIsPpJEN7hdzgPhbkhc=

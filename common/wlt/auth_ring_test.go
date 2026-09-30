@@ -5,6 +5,7 @@ package wlt
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -289,7 +290,7 @@ func TestExpiredReserveRefreshesExistingIdentityBeforeFreshAuthorization(t *test
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte, _ func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		if !bytes.Equal(raw, reserve) {
 			t.Fatalf("existing-only refresh received wrong identity")
@@ -409,7 +410,7 @@ func TestReserveRefreshRateLimitPersistsCooldownAndStopsProviderWork(t *testing.
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		return nil, carriercommon.ErrProviderRateLimited
 	}
@@ -482,7 +483,7 @@ func TestSameReserveIdentityRefreshIsNotAmplifiedAcrossSessions(t *testing.T) {
 	fullRefreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
-	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
 		existingRefreshCalls++
 		return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
 	}
@@ -589,6 +590,21 @@ func TestRecoveryUsesReserveBeforeProviderAuthorization(t *testing.T) {
 }
 
 func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"timeout", context.DeadlineExceeded},
+		{"ended_signaling_session", fmt.Errorf("connect: %w", carriercommon.ErrSignalingSessionEnded)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testTransportRecoveryExhaustsLocalRing(t, tc.err)
+		})
+	}
+}
+
+func testTransportRecoveryExhaustsLocalRing(t *testing.T, connectErr error) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
 	active := []byte(testCarrierAuthSnapshot("active-token"))
 	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
@@ -602,10 +618,16 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 		t.Fatal(err)
 	}
 
+	previousExisting := refreshExistingCarrierAuthSnapshot
 	previousRefresh := refreshCarrierAuthSnapshot
 	previousPrewarm := prewarmCarrierAuthSnapshot
 	previousConnect := connectCarrierClientForStart
 	previousIndependent := carrierAuthSnapshotsIndependent
+	existingCalls := 0
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
+		existingCalls++
+		return nil, context.DeadlineExceeded
+	}
 	refreshCalls := 0
 	prewarmCalls := 0
 	connectCalls := 0
@@ -619,12 +641,13 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 	}
 	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
 		connectCalls++
-		return nil, context.DeadlineExceeded
+		return nil, connectErr
 	}
 	carrierAuthSnapshotsIndependent = func(_ carrierconfig.ClientConfig, left []byte, right []byte) (bool, error) {
 		return !bytes.Equal(left, right), nil
 	}
 	t.Cleanup(func() {
+		refreshExistingCarrierAuthSnapshot = previousExisting
 		refreshCarrierAuthSnapshot = previousRefresh
 		prewarmCarrierAuthSnapshot = previousPrewarm
 		connectCarrierClientForStart = previousConnect
@@ -648,7 +671,7 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 		context.Background(),
 		testCarrierClientConfig("transport-local-only-test"),
 		options,
-		context.DeadlineExceeded,
+		connectErr,
 		rejectedIdentity,
 		false,
 		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
@@ -659,12 +682,72 @@ func TestTransportRecoveryExhaustsLocalRingWithoutProviderAuthorization(t *testi
 	if connectCalls != 1 || refreshCalls != 0 || prewarmCalls != 0 {
 		t.Fatalf("connect=%d refresh=%d prewarm=%d", connectCalls, refreshCalls, prewarmCalls)
 	}
+	wantExisting := 0
+	if errors.Is(connectErr, carriercommon.ErrSignalingSessionEnded) {
+		wantExisting = 2 // current and independent reserve, once each
+	}
+	if existingCalls != wantExisting {
+		t.Fatalf("existing refresh calls=%d, want %d", existingCalls, wantExisting)
+	}
 	joined := strings.Join(logs, "\n")
 	if !strings.Contains(joined, "candidate_rejected_same_identity source=previous") ||
 		!strings.Contains(joined, "fallback_started source=reserve") ||
 		!strings.Contains(joined, "candidate_rejected_same_identity source=inline") ||
 		!strings.Contains(joined, "provider_fallback_skipped reason=local_only") {
 		t.Fatalf("local-only transport recovery evidence missing: %s", joined)
+	}
+}
+
+func TestExplicitLocalTURNRejectionPromotesProviderRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
+	if err := os.WriteFile(path+authSnapshotReserveSuffix, reserve, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousExistingRefresh := refreshExistingCarrierAuthSnapshot
+	previousConnect := connectCarrierClientForStart
+	refreshCalls := 0
+	connectCalls := 0
+	refreshExistingCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig, []byte, func(string, string)) ([]byte, error) {
+		refreshCalls++
+		return []byte(testCarrierAuthSnapshot("reserve-refreshed-token")), nil
+	}
+	connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+		connectCalls++
+		if connectCalls == 1 {
+			return nil, carriercommon.ErrAuthSnapshotReauthorizationRequired
+		}
+		return &carrierengine.Client{}, nil
+	}
+	t.Cleanup(func() {
+		refreshExistingCarrierAuthSnapshot = previousExistingRefresh
+		connectCarrierClientForStart = previousConnect
+	})
+
+	var logs []string
+	client, err := recoverCarrierAuthAfterRejection(
+		context.Background(),
+		testCarrierClientConfig("restart-snapshot-test"),
+		CarrierOptions{
+			AuthSnapshotFile:       path,
+			AuthSnapshotOutputFile: path,
+			ConnectTimeout:         time.Second,
+		},
+		context.DeadlineExceeded,
+		nil,
+		false,
+		func(format string, arguments ...any) { logs = append(logs, fmt.Sprintf(format, arguments...)) },
+	)
+	if err != nil || client == nil {
+		t.Fatalf("client=%v err=%v", client, err)
+	}
+	if connectCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("connect_calls=%d refresh_calls=%d, want one rejected candidate and one refreshed candidate", connectCalls, refreshCalls)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "provider_recovery_promoted source=reserve reason=explicit_auth_rejection") {
+		t.Fatalf("explicit auth rejection did not promote recovery: %s", joined)
 	}
 }
 
@@ -763,7 +846,7 @@ func TestValidatedReserveReplenishmentRetiresQuarantine(t *testing.T) {
 		ConnectTimeout:         time.Second,
 		startup:                newCarrierStartupTelemetry(time.Now(), nil),
 	}
-	if err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, nil); err != nil {
+	if _, err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, nil); err != nil {
 		t.Fatal(err)
 	}
 	reserve, err := os.ReadFile(path + authSnapshotReserveSuffix)
@@ -799,7 +882,7 @@ func TestReserveReplenishmentSkipsProviderDuringCooldown(t *testing.T) {
 	t.Cleanup(func() { prewarmFreshCarrierAuthSnapshot = previousFresh })
 	startup := newCarrierStartupTelemetry(time.Now(), nil)
 	startup.markProviderRateLimited()
-	if err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+	if _, err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotOutputFile: path,
 		startup:                startup,
@@ -822,7 +905,7 @@ func TestReserveReplenishmentPersistsNewProviderCooldown(t *testing.T) {
 	}
 	t.Cleanup(func() { prewarmFreshCarrierAuthSnapshot = previousFresh })
 	startup := newCarrierStartupTelemetry(time.Now(), nil)
-	err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
+	_, err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotOutputFile: path,
 		startup:                startup,
@@ -838,31 +921,107 @@ func TestReserveReplenishmentPersistsNewProviderCooldown(t *testing.T) {
 	}
 }
 
-func TestCrashRecoveryRetiresQuarantineOnlyWithIndependentReserve(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "auth-snapshot.json")
-	active := []byte(testCarrierAuthSnapshot("active-token"))
-	reserve := []byte(testCarrierAuthSnapshot("reserve-token"))
-	quarantine := []byte(testCarrierAuthSnapshot("rejected-token"))
-	for suffix, content := range map[string][]byte{
-		"":                           active,
-		authSnapshotReserveSuffix:    reserve,
-		authSnapshotQuarantineSuffix: quarantine,
+func TestIndependentReserveRequiresLiveValidationBeforeRetiringQuarantine(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		connectErr                        error
+		refreshFails, cooldown, wantReady bool
+		wantConnect, wantRefresh          int
+	}{
+		{name: "saved_reserve_connects", wantReady: true, wantConnect: 1},
+		{name: "expired_session_renews_existing", connectErr: carriercommon.ErrSignalingSessionEnded, wantReady: true, wantConnect: 2, wantRefresh: 1},
+		{name: "transport_failure_preserves_reserve", connectErr: context.DeadlineExceeded, wantConnect: 1},
+		{name: "renewal_unreachable_preserves_reserve", connectErr: carriercommon.ErrSignalingSessionEnded, refreshFails: true, wantConnect: 1, wantRefresh: 1},
+		{name: "cooldown_never_reports_ready", connectErr: carriercommon.ErrAuthSnapshotReauthorizationRequired, cooldown: true, wantConnect: 1},
 	} {
-		if err := os.WriteFile(path+suffix, content, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	previousIndependent := carrierAuthSnapshotsIndependent
-	carrierAuthSnapshotsIndependent = func(carrierconfig.ClientConfig, []byte, []byte) (bool, error) {
-		return true, nil
-	}
-	t.Cleanup(func() { carrierAuthSnapshotsIndependent = previousIndependent })
-	options := CarrierOptions{AuthSnapshotFile: path, AuthSnapshotOutputFile: path}
-	if err := replenishCarrierAuthReserve(context.Background(), testCarrierClientConfig("restart-snapshot-test"), options, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path + authSnapshotQuarantineSuffix); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("validated reserve did not retire quarantine: %v", err)
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth-snapshot.json")
+			active := []byte(testCarrierAuthSnapshot("active-token"))
+			var document map[string]any
+			if err := json.Unmarshal([]byte(testCarrierAuthSnapshot("reserve-token")), &document); err != nil {
+				t.Fatal(err)
+			}
+			document["expires_at"] = "2000-01-01T00:00:00Z"
+			document["validated_at"] = "2000-01-01T00:00:00Z"
+			reserve, err := json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			quarantine := []byte(testCarrierAuthSnapshot("rejected-token"))
+			for suffix, content := range map[string][]byte{"": active, authSnapshotReserveSuffix: reserve, authSnapshotQuarantineSuffix: quarantine} {
+				if err := os.WriteFile(path+suffix, content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldIndependent, oldConnect := carrierAuthSnapshotsIndependent, connectCarrierClientForStart
+			oldPromote, oldExisting, oldFresh := promoteCarrierAuthSnapshot, refreshExistingCarrierAuthSnapshot, prewarmFreshCarrierAuthSnapshot
+			t.Cleanup(func() {
+				carrierAuthSnapshotsIndependent, connectCarrierClientForStart = oldIndependent, oldConnect
+				promoteCarrierAuthSnapshot, refreshExistingCarrierAuthSnapshot, prewarmFreshCarrierAuthSnapshot = oldPromote, oldExisting, oldFresh
+			})
+			carrierAuthSnapshotsIndependent = func(carrierconfig.ClientConfig, []byte, []byte) (bool, error) { return true, nil }
+			connects, refreshes := 0, 0
+			connectCarrierClientForStart = func(context.Context, *carrierconfig.ClientConfig, time.Duration, func(string, ...any)) (*carrierengine.Client, error) {
+				connects++
+				if connects == 1 && tc.connectErr != nil {
+					return nil, tc.connectErr
+				}
+				return &carrierengine.Client{}, nil
+			}
+			promoteCarrierAuthSnapshot = func(carrierconfig.ClientConfig) error { return nil }
+			refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, raw []byte, _ func(string, string)) ([]byte, error) {
+				refreshes++
+				if !bytes.Equal(raw, reserve) {
+					t.Fatal("renewal changed reserve identity")
+				}
+				if tc.refreshFails {
+					return nil, context.DeadlineExceeded
+				}
+				return raw, nil
+			}
+			prewarmFreshCarrierAuthSnapshot = func(context.Context, carrierconfig.ClientConfig) ([]byte, error) {
+				t.Fatal("unproven reserve failure started fresh authorization")
+				return nil, errors.New("unexpected fresh identity")
+			}
+			options := CarrierOptions{AuthSnapshotFile: path, AuthSnapshotOutputFile: path, ConnectTimeout: time.Second, startup: newCarrierStartupTelemetry(time.Now(), nil)}
+			if tc.cooldown {
+				recordProviderRateLimit(options, nil)
+			}
+			var logs []string
+			cfg := testCarrierClientConfig("restart-snapshot-test")
+			ready, err := replenishCarrierAuthReserve(context.Background(), cfg, options, func(f string, args ...any) { logs = append(logs, fmt.Sprintf(f, args...)) })
+			if ready != tc.wantReady || (ready && err != nil) {
+				t.Fatalf("ready=%v error=%v, want %v", ready, err, tc.wantReady)
+			}
+			if connects != tc.wantConnect || refreshes != tc.wantRefresh {
+				t.Fatalf("connect=%d refresh=%d, want %d/%d", connects, refreshes, tc.wantConnect, tc.wantRefresh)
+			}
+			current, readErr := os.ReadFile(path)
+			if readErr != nil || !bytes.Equal(current, active) {
+				t.Fatal("reserve validation changed persisted active")
+			}
+			cached, exportErr := carrierengine.ExportAuthSnapshotJSON(*cfg)
+			if exportErr != nil || !strings.Contains(string(cached), "active-token") {
+				t.Fatalf("active cache not restored: %v", exportErr)
+			}
+			q, qErr := os.ReadFile(path + authSnapshotQuarantineSuffix)
+			if ready {
+				if !errors.Is(qErr, os.ErrNotExist) {
+					t.Fatalf("validated reserve did not retire quarantine: %v", qErr)
+				}
+			} else {
+				if qErr != nil || !bytes.Equal(q, quarantine) {
+					t.Fatal("unvalidated reserve retired quarantine")
+				}
+				r, readErr := os.ReadFile(path + authSnapshotReserveSuffix)
+				if readErr != nil || !bytes.Equal(r, reserve) {
+					t.Fatal("failure replaced saved reserve")
+				}
+				if strings.Contains(strings.Join(logs, "\n"), "event=reserve_validated") || strings.Contains(strings.Join(logs, "\n"), "event=reserve_ready") {
+					t.Fatal("failed reserve reported ready")
+				}
+			}
+		})
 	}
 }
 
@@ -880,13 +1039,13 @@ func TestReserveReplenishmentWaitsForTrafficReady(t *testing.T) {
 	t.Cleanup(func() { prewarmFreshCarrierAuthSnapshot = previousFresh })
 	startup := newCarrierStartupTelemetry(time.Now(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	options := CarrierOptions{
 		AuthSnapshotFile:       path,
 		AuthSnapshotOutputFile: path,
 		startup:                startup,
 	}
-	scheduleCarrierAuthReserve(ctx, testCarrierClientConfig("restart-snapshot-test"), options, nil)
+	done := scheduleCarrierAuthReserve(ctx, testCarrierClientConfig("restart-snapshot-test"), options, nil)
+	defer func() { cancel(); <-done }()
 	select {
 	case <-called:
 		t.Fatal("reserve replenishment ran before traffic_ready")
