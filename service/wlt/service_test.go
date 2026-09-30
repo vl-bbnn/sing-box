@@ -1067,3 +1067,27 @@ func TestDuplicateInterfaceDuringStartDoesNotCancelSameGeneration(t *testing.T) 
 		t.Fatal("duplicate callback canceled same-interface startup")
 	}
 }
+
+func TestHeartbeatIncidentCannotOverrideCurrentCounters(t *testing.T) {
+	incident := "rejected_delta=2 active=49\tpending=7\rfailed=3\nmux_open_errors=4"
+	message := formatWLTStatsHeartbeat("wlt service stats active=", 1, " pending=", 0,
+		" last_incident=", formatWLTStatsIncident(incident), " failed=", 0, " mux_open_errors=", 0)
+	fields := make(map[string]string)
+	for _, token := range strings.Fields(message) {
+		pair := strings.SplitN(token, "=", 2)
+		if len(pair) == 2 {
+			fields[pair[0]] = pair[1]
+		}
+	}
+	for name, want := range map[string]string{"active": "1", "pending": "0", "failed": "0", "mux_open_errors": "0"} {
+		if fields[name] != want {
+			t.Fatalf("%s=%s, want %s", name, fields[name], want)
+		}
+	}
+	if _, injected := fields["rejected_delta"]; injected {
+		t.Fatal("incident injected a counter")
+	}
+	if fields["last_incident"] != "rejected_delta=2%20active=49%09pending=7%0Dfailed=3%0Amux_open_errors=4" {
+		t.Fatal("incident context lost or not encoded")
+	}
+}

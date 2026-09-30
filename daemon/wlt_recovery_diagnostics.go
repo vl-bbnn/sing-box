@@ -14,7 +14,7 @@ func forwardWLTRecoveryDiagnostic(message string) bool {
 		"wlt service restarting carrier ", "wlt service carrier restarted",
 		"wlt service old carrier abort", "wlt service stats ",
 		"relay client mux diagnostics registered", "relay client mux terminal stats",
-		"relay client mux lifetime", "relay client peer terminal stats",
+		"relay client mux lifetime", "relay client peer write terminal stats",
 		"memory pressure: ", "memory threshold reached,",
 	} {
 		if strings.Contains(message, marker) {
