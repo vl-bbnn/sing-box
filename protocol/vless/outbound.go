@@ -48,8 +48,8 @@ type Outbound struct {
 	xudp            bool
 	// encryption is the VLESS post-quantum layer, nil unless `encryption` is
 	// configured. It wraps the dialed conn beneath the vless client (lx: SPEC 032).
-	encryption *encryption.ClientInstance
-	logConnections  bool
+	encryption     *encryption.ClientInstance
+	logConnections bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
