@@ -41,7 +41,7 @@ func TestWLTProbeWorkerObserverSeparatesRealBodyFromUnfinishedClose(t *testing.T
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer closeServer()
-	events := make(chan wltProbeWorkerEvent, 16)
+	events := make(chan wltProbeWorkerEvent, 24)
 	observer := &wltProbeWorkerObserver{hash: strings.Repeat("a", 64), started: time.Now(), sink: func(e wltProbeWorkerEvent) { events <- e }}
 	ctx = context.WithValue(ctx, wltProbeWorkerObserverKey{}, observer)
 	entered, release := make(chan struct{}, 2), make(chan struct{})
@@ -126,7 +126,7 @@ func TestWLTProbeWorkerObserverSeparatesRealBodyFromUnfinishedClose(t *testing.T
 }
 
 func TestWLTProbeWorkerObserverRetainsErrorAndRedactsOpaqueInput(t *testing.T) {
-	events := make(chan wltProbeWorkerEvent, 16)
+	events := make(chan wltProbeWorkerEvent, 24)
 	ctx := context.WithValue(context.Background(), wltProbeWorkerObserverKey{}, &wltProbeWorkerObserver{
 		hash: "private-request", started: time.Now(), sink: func(e wltProbeWorkerEvent) { events <- e },
 	})

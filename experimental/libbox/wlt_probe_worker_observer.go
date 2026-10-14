@@ -48,7 +48,7 @@ func withWLTProbeWorkerObserver(ctx context.Context, factory L.Factory, hash str
 // original result, renew a deadline, or print request/profile/auth/error text.
 func observeWLTProbeWorker(ctx context.Context, event string, result wltProbeResult, err error) {
 	observer, _ := ctx.Value(wltProbeWorkerObserverKey{}).(*wltProbeWorkerObserver)
-	if observer == nil || observer.count.Add(1) > 16 {
+	if observer == nil || observer.count.Add(1) > 24 {
 		return
 	}
 	digest := observer.hash
