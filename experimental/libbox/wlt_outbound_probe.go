@@ -374,7 +374,9 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 	if port == "" {
 		port = "443"
 	}
+	observeWLTProbeWorker(ctx, "https_dial_start", *result, nil)
 	conn, err := leaf.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(parsed.Hostname(), port))
+	observeWLTProbeWorker(ctx, "https_dial_return", *result, err)
 	if err != nil {
 		result.ErrorCode = contextWLTErrorCode(ctx, "https_request_failed")
 		return
@@ -422,24 +424,32 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName: parsed.Hostname(), RootCAs: adapter.RootPoolFromContext(ctx), MinVersion: tls.VersionTLS12,
 	})
+	observeWLTProbeWorker(ctx, "https_tls_start", *result, nil)
 	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		observeWLTProbeWorker(ctx, "https_tls_return", *result, err)
 		result.ErrorCode = contextWLTErrorCode(ctx, "https_request_failed")
 		return
 	}
+	observeWLTProbeWorker(ctx, "https_tls_return", *result, nil)
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.URL, nil)
 	if err != nil {
 		result.ErrorCode = "https_request_invalid"
 		return
 	}
 	httpRequest.Close = true
+	observeWLTProbeWorker(ctx, "https_write_start", *result, nil)
 	if err = httpRequest.Write(tlsConn); err != nil {
+		observeWLTProbeWorker(ctx, "https_write_return", *result, err)
 		result.ErrorCode = contextWLTErrorCode(ctx, "https_request_failed")
 		return
 	}
+	observeWLTProbeWorker(ctx, "https_write_return", *result, nil)
 	responseReader := bufio.NewReader(&wltProbeHTTPHeaderReader{
 		reader: tlsConn, remaining: wltProbeMaxHTTPHeader, inHeader: true,
 	})
+	observeWLTProbeWorker(ctx, "https_headers_start", *result, nil)
 	response, err := http.ReadResponse(responseReader, httpRequest)
+	observeWLTProbeWorker(ctx, "https_headers_return", *result, err)
 	if err != nil {
 		result.ErrorCode = contextWLTErrorCode(ctx, "https_request_failed")
 		return
@@ -448,6 +458,7 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 	// unread or excess response can never be drained beyond MaxReadBytes.
 	responseBody = response.Body
 	*result.HTTPStatus = response.StatusCode
+	observeWLTProbeWorker(ctx, "https_body_start", *result, nil)
 	var read int64
 	if request.ExpectedBytes == 0 {
 		_, err = responseReader.ReadByte()
@@ -464,6 +475,7 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 		responseComplete = bodyReader.eof || (response.ContentLength >= 0 && read == response.ContentLength)
 	}
 	*result.BytesRead = read
+	observeWLTProbeWorker(ctx, "https_body_return", *result, err)
 	if err != nil {
 		result.ErrorCode = contextWLTErrorCode(ctx, "https_read_failed")
 		return
