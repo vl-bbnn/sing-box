@@ -207,10 +207,11 @@ replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // inherited, so the executable module pins the matching fork explicitly.
 replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261014041752-8244750b3da0
 
-
 replace github.com/sagernet/sing-mux => github.com/vl-bbnn/sing-mux v0.3.5-0.20261014071557-597b92fb7426
 
 // lx:end awg
 
 // Keep distinct TCP destinations isolated when Android reuses a source port.
 replace github.com/sagernet/sing-tun => github.com/vl-bbnn/sing-tun v0.8.11-0.20261014071605-b427ba0daf18
+
+replace github.com/sagernet/sing-vmess => github.com/vl-bbnn/sing-vmess v0.2.8-0.20261014121436-f7bf6240ff3f
