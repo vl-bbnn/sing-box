@@ -1,0 +1,216 @@
+//go:build with_wlt
+
+package wlt
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/netip"
+	"sync"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
+	wltpkg "github.com/sagernet/sing-box/common/wlt"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
+)
+
+type carrierService interface {
+	Carrier() *wltpkg.Carrier
+	WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error)
+	DialStream(ctx context.Context, routeClass string, target string) (io.ReadWriteCloser, error)
+	InterfaceUpdated()
+	NetworkUnavailable()
+}
+
+var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+
+// PriorityInterfaceUpdate lets the network manager close the WLT dial gate
+// before nested transports synchronously drain streams from the old carrier.
+func (*Outbound) PriorityInterfaceUpdate() {}
+
+func RegisterOutbound(registry *outbound.Registry) {
+	outbound.Register[option.WLTOutboundOptions](registry, C.TypeWLT, NewOutbound)
+}
+
+type Outbound struct {
+	outbound.Adapter
+	logger         logger.ContextLogger
+	serviceManager adapter.ServiceManager
+	serviceTag     string
+	carrierAccess  sync.RWMutex
+	carrier        carrierService
+	route          string
+	directFallback bool
+	fallbackDialer N.Dialer
+}
+
+func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.WLTOutboundOptions) (adapter.Outbound, error) {
+	if options.Service == "" {
+		return nil, E.New("wlt outbound requires service")
+	}
+	if options.Route == "" {
+		return nil, E.New("wlt outbound requires route")
+	}
+	for _, network := range options.BuildNetwork() {
+		if network != N.NetworkTCP {
+			return nil, E.New("wlt outbound supports tcp network only")
+		}
+	}
+	serviceManager := service.FromContext[adapter.ServiceManager](ctx)
+	if serviceManager == nil {
+		return nil, E.New("missing service manager")
+	}
+	fallbackDialer, err := dialer.NewWithOptions(dialer.Options{
+		Context:        ctx,
+		RemoteIsDomain: true,
+		DirectOutbound: true,
+	})
+	if err != nil {
+		return nil, E.Cause(err, "create WLT direct fallback dialer")
+	}
+	return &Outbound{
+		Adapter:        outbound.NewAdapter(C.TypeWLT, tag, []string{N.NetworkTCP}, nil),
+		logger:         logger,
+		serviceManager: serviceManager,
+		serviceTag:     options.Service,
+		route:          options.Route,
+		directFallback: options.DirectFallbackEnabled(),
+		fallbackDialer: fallbackDialer,
+	}, nil
+}
+
+func (h *Outbound) resolveCarrier() (carrierService, error) {
+	h.carrierAccess.RLock()
+	if h.carrier != nil {
+		carrier := h.carrier
+		h.carrierAccess.RUnlock()
+		return carrier, nil
+	}
+	h.carrierAccess.RUnlock()
+	h.carrierAccess.Lock()
+	defer h.carrierAccess.Unlock()
+	if h.carrier != nil {
+		return h.carrier, nil
+	}
+	rawService, loaded := h.serviceManager.Get(h.serviceTag)
+	if !loaded {
+		return nil, E.New("wlt service not found: ", h.serviceTag)
+	}
+	carrier, ok := rawService.(carrierService)
+	if !ok {
+		return nil, E.New("service ", h.serviceTag, " is not a wlt carrier service")
+	}
+	h.carrier = carrier
+	return carrier, nil
+}
+
+func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	admissionTarget := wltAdmissionTarget(ctx, destination)
+	originalMetadata := adapter.ContextFrom(ctx)
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	if N.NetworkName(network) != N.NetworkTCP {
+		return nil, E.New("wlt outbound supports tcp connections only")
+	}
+	ctx, dialBinding := wltpkg.BeginDialBinding(ctx, h.route)
+	if dialBinding.ID != 0 {
+		h.logger.InfoContext(ctx, "WLT dial entry dial_id=", dialBinding.ID,
+			" entry_unix_ns=", dialBinding.EntryUnixNS, " route=", dialBinding.EntryRoute)
+	}
+	carrierService, err := h.resolveCarrier()
+	if err != nil {
+		return nil, err
+	}
+	carrier := carrierService.Carrier()
+	if carrier == nil && h.directFallback {
+		h.logger.WarnContext(ctx, "WLT carrier unavailable; using encrypted upstream direct fallback")
+		return h.fallbackDialer.DialContext(ctx, network, destination)
+	}
+	if C.WLTDiagnosticsEnabled && admissionTarget.Fqdn == "cp.cloudflare.com" && admissionTarget.Port == 443 {
+		fakeIP := "none"
+		if originalMetadata != nil && originalMetadata.FakeIP && netip.MustParsePrefix("198.18.0.0/15").Contains(originalMetadata.OriginDestination.Addr) {
+			fakeIP = originalMetadata.OriginDestination.Addr.String()
+		}
+		routeClass := "other"
+		switch h.route {
+		case "eu", "ru", "direct":
+			routeClass = h.route
+		}
+		h.logger.InfoContext(ctx, "wlt-fixture phase=before-open fake_ip=", fakeIP, " domain=cp.cloudflare.com target=cp.cloudflare.com:443 route_class=", routeClass)
+	}
+	h.logger.DebugContext(ctx, "outbound WLT connection route=", h.route, " to ", destination)
+	stream, err := carrierService.DialStream(ctx, h.route, admissionTarget.String())
+	if err != nil {
+		var recoveryError *wltpkg.CarrierRecoveryError
+		if h.directFallback && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &recoveryError) {
+			h.logger.WarnContext(ctx, "WLT carrier stream unavailable; using encrypted upstream direct fallback")
+			return h.fallbackDialer.DialContext(ctx, network, destination)
+		}
+		return nil, err
+	}
+	conn, ok := stream.(net.Conn)
+	if !ok {
+		_ = stream.Close()
+		return nil, E.New("wlt carrier returned non-network stream")
+	}
+	return conn, nil
+}
+
+// wltAdmissionTarget preserves the destination that caused a nested outbound
+// (normally VLESS) to dial its WLT detour. The immediate destination passed to
+// this outbound is the proxy endpoint, which hides DNS :53/:853 traffic from
+// class-aware carrier admission and makes every open look like ordinary HTTPS.
+func wltAdmissionTarget(ctx context.Context, immediate M.Socksaddr) M.Socksaddr {
+	metadata := adapter.ContextFrom(ctx)
+	if metadata != nil && metadata.Destination.IsValid() {
+		return metadata.Destination
+	}
+	return immediate
+}
+
+func (h *Outbound) InterfaceUpdated() {
+	carrierService, err := h.resolveCarrier()
+	if err != nil {
+		h.logger.Warn("notify WLT carrier about interface update: ", err)
+		return
+	}
+	carrierService.InterfaceUpdated()
+}
+
+func (h *Outbound) NetworkUnavailable() {
+	carrierService, err := h.resolveCarrier()
+	if err != nil {
+		h.logger.Warn("notify WLT carrier about network loss: ", err)
+		return
+	}
+	carrierService.NetworkUnavailable()
+}
+
+func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	h.logger.DebugContext(ctx, "rejected WLT packet connection to ", destination)
+	return nil, E.New("wlt outbound does not support packet connections; use VLESS/XUDP over TCP")
+}
+
+// Structural core contract: no carrier API is exposed to native applications.
+func (h *Outbound) WLTNetworkResetRetained() bool {
+	service, err := h.resolveCarrier()
+	if err != nil {
+		return false
+	}
+	owner, ok := service.(interface{ WLTNetworkResetRetained() bool })
+	return ok && owner.WLTNetworkResetRetained()
+}
