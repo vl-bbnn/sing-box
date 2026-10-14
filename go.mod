@@ -179,4 +179,7 @@ require (
 // Local-path replace for iteration; switch to a pinned Leadaxe/wireguard-go commit
 // for CI/release once validated against a live AWG2 server. See SPECS/003.
 replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
+
 // lx:end awg
+
+replace github.com/sagernet/sing-vmess => github.com/vl-bbnn/sing-vmess v0.2.8-0.20261014121436-f7bf6240ff3f
