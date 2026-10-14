@@ -137,7 +137,7 @@ func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 			}
 		}
 	}
-	if l.platformWriter != nil {
+	if l.platformWriter != nil && level <= l.level {
 		l.platformWriter.WriteMessage(level, l.platformFormatter.Format(ctx, level, l.tag, F.ToString(args...), nowTime))
 	}
 }
