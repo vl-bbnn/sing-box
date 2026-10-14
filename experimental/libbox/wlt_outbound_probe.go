@@ -110,7 +110,7 @@ func (s *CommandServer) ProbeWltOutbound(requestJSON string) (string, error) {
 	}
 	return executeWLTProbe(
 		instance,
-		instance.Context(),
+		withWLTProbeWorkerObserver(instance.Context(), instance.Box().LogFactory(), requestHash),
 		instance.Box().Outbound(),
 		func() bool { return s.StartedService.Instance() == instance },
 		request,
@@ -303,7 +303,9 @@ func executeWLTProbe(
 		} else {
 			runWLTDNSProbe(ctx, leaf, request, &result)
 		}
+		observeWLTProbeWorker(ctx, "worker_before_finalize", result, nil)
 		finishWLTProbeResult(&result, ctx, instanceCurrent, started, "timeout")
+		observeWLTProbeWorker(ctx, "worker_complete", result, nil)
 		wltProbeBusy.Delete(instanceKey)
 		completed <- result
 	}()
@@ -320,6 +322,7 @@ func executeWLTProbe(
 		default:
 			result := newWLTProbeResult(request, requestHash)
 			finishWLTProbeResult(&result, ctx, instanceCurrent, started, "timeout_cleanup_pending")
+			observeWLTProbeWorker(ctx, "outer_timeout_pending", result, nil)
 			return encodeWLTProbeResult(result)
 		}
 	}
@@ -385,12 +388,14 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 		if deadline, exists := ctx.Deadline(); exists && !time.Now().Before(deadline) {
 			live = false
 		}
+		observeWLTProbeWorker(ctx, "socket_close_start", *result, nil)
 		var closeErr error
 		if result.Status == "success" && responseComplete && live {
 			closeErr = conn.Close()
 		} else {
 			closeErr = closeWLTProbeConn(conn)
 		}
+		observeWLTProbeWorker(ctx, "socket_close_return", *result, closeErr)
 		// The owned socket must close first. Body.Close cannot read an unread
 		// response beyond MaxReadBytes, and the original context can interrupt
 		// an in-progress graceful Close through the same scoped Abort path.
@@ -399,7 +404,9 @@ func runWLTHTTPSProbe(ctx context.Context, leaf adapter.Outbound, request wltPro
 		// beyond the original limit on a socket we deliberately closed.
 		// Complete bodies still close normally and retain genuine errors.
 		if responseBody != nil && responseComplete {
+			observeWLTProbeWorker(ctx, "body_close_start", *result, nil)
 			closeErr = errors.Join(closeErr, responseBody.Close())
+			observeWLTProbeWorker(ctx, "body_close_return", *result, closeErr)
 		}
 		if result.Status == "success" && closeErr != nil {
 			result.Status = "failed"
