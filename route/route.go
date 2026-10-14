@@ -10,6 +10,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/sniff"
+	"github.com/sagernet/sing-box/common/wltdiagnostics"
 	C "github.com/sagernet/sing-box/constant"
 	R "github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing-mux"
@@ -149,6 +150,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	r.logWLTDomainRoute(ctx, metadata, selectedOutbound)
+	r.logWLTFixtureRoute(ctx, metadata, selectedOutbound)
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -275,6 +278,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
+	r.logWLTDomainRoute(ctx, metadata, selectedOutbound)
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
@@ -287,6 +291,46 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		r.connection.NewPacketConnection(ctx, selectedOutbound, conn, metadata, onClose)
 	}
 	return nil
+}
+
+// logWLTDomainRoute emits a diagnostics-only route classification.
+// It intentionally never includes the destination, rule text, or outbound tag.
+// The line is safe for the bounded mobile log ring and allows a Dev WLT build
+// to prove whether Meta-family traffic selected RU, EU, direct, or an
+// unexpected outbound.
+func (r *Router) logWLTDomainRoute(ctx context.Context, metadata adapter.InboundContext, outbound adapter.Outbound) {
+	if !C.WLTDiagnosticsEnabled || outbound == nil {
+		return
+	}
+	category := wltdiagnostics.DomainCategory(metadata.Domain)
+	if category == "" {
+		category = wltdiagnostics.DomainCategory(metadata.Destination.Fqdn)
+	}
+	if category == "" {
+		return
+	}
+	class := wltdiagnostics.OutboundClass(outbound.Tag())
+	if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+		class = "group"
+	}
+	r.logger.InfoContext(ctx, "wlt-route-policy-category=", category, " outbound-class=", class)
+}
+
+// logWLTFixtureRoute records only the fixed public TLS fixture. The FakeIP is
+// shown only inside the standard benchmark range, never for a real endpoint.
+func (r *Router) logWLTFixtureRoute(ctx context.Context, metadata adapter.InboundContext, outbound adapter.Outbound) {
+	if !C.WLTDiagnosticsEnabled || outbound == nil || metadata.Destination.Fqdn != "cp.cloudflare.com" || metadata.Destination.Port != 443 {
+		return
+	}
+	fakeIP := "none"
+	if metadata.FakeIP && netip.MustParsePrefix("198.18.0.0/15").Contains(metadata.OriginDestination.Addr) {
+		fakeIP = metadata.OriginDestination.Addr.String()
+	}
+	class := wltdiagnostics.OutboundClass(outbound.Tag())
+	if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+		class = "group"
+	}
+	r.logger.InfoContext(ctx, "wlt-fixture phase=route fake_ip=", fakeIP, " domain=cp.cloudflare.com outbound_class=", class)
 }
 
 func (r *Router) PreMatch(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration, supportBypass bool) (tun.DirectRouteDestination, error) {

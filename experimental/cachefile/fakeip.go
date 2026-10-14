@@ -3,11 +3,9 @@ package cachefile
 import (
 	"net/netip"
 	"os"
-	"time"
 
 	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -23,7 +21,7 @@ var (
 
 func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 	var metadata adapter.FakeIPMetadata
-	err := c.batch(func(tx *bbolt.Tx) error {
+	err := c.view(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketFakeIP)
 		if bucket == nil {
 			return os.ErrNotExist
@@ -32,16 +30,36 @@ func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 		if len(metadataBinary) == 0 {
 			return os.ErrInvalid
 		}
-		err := bucket.Delete(keyMetadata)
-		if err != nil {
-			return err
-		}
 		return metadata.UnmarshalBinary(metadataBinary)
 	})
 	if err != nil {
 		return nil
 	}
 	return &metadata
+}
+
+// FakeIPRangeCompatible permits recovery of legacy caches whose metadata was
+// consumed on startup, provided every stored address belongs to today's ranges.
+func (c *CacheFile) FakeIPRangeCompatible(inet4Range, inet6Range netip.Prefix) bool {
+	compatible := false
+	err := c.view(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketFakeIP)
+		if bucket == nil {
+			return nil
+		}
+		compatible = true
+		return bucket.ForEach(func(key, value []byte) error {
+			if string(key) == string(keyMetadata) {
+				return nil
+			}
+			address, ok := netip.AddrFromSlice(key)
+			if !ok || len(value) == 0 || !(inet4Range.Contains(address) || inet6Range.Contains(address)) {
+				compatible = false
+			}
+			return nil
+		})
+	})
+	return err == nil && compatible
 }
 
 func (c *CacheFile) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
@@ -59,16 +77,21 @@ func (c *CacheFile) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
 }
 
 func (c *CacheFile) FakeIPSaveMetadataAsync(metadata *adapter.FakeIPMetadata) {
-	if c.saveMetadataTimer == nil {
-		c.saveMetadataTimer = time.AfterFunc(C.FakeIPMetadataSaveInterval, func() {
-			_ = c.FakeIPSaveMetadata(metadata)
-		})
-	} else {
-		c.saveMetadataTimer.Reset(C.FakeIPMetadataSaveInterval)
-	}
+	// Keep the compatibility method durable; delaying this write can persist an
+	// obsolete cursor after the corresponding address bindings have been saved.
+	_ = c.FakeIPSaveMetadata(metadata)
 }
 
 func (c *CacheFile) FakeIPStore(address netip.Addr, domain string) error {
+	return c.fakeIPStore(address, domain, nil)
+}
+
+// FakeIPStoreWithMetadata commits the new binding and allocation cursor together.
+func (c *CacheFile) FakeIPStoreWithMetadata(address netip.Addr, domain string, metadata *adapter.FakeIPMetadata) error {
+	return c.fakeIPStore(address, domain, metadata)
+}
+
+func (c *CacheFile) fakeIPStore(address netip.Addr, domain string, metadata *adapter.FakeIPMetadata) error {
 	return c.batch(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketFakeIP)
 		if err != nil {
@@ -92,7 +115,17 @@ func (c *CacheFile) FakeIPStore(address netip.Addr, domain string) error {
 				return err
 			}
 		}
-		return bucket.Put([]byte(domain), address.AsSlice())
+		if err := bucket.Put([]byte(domain), address.AsSlice()); err != nil {
+			return err
+		}
+		if metadata == nil {
+			return nil
+		}
+		metadataBinary, err := metadata.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketFakeIP).Put(keyMetadata, metadataBinary)
 	})
 }
 
