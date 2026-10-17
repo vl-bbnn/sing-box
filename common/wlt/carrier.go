@@ -1982,7 +1982,9 @@ func (c *Carrier) close(immediate bool) error {
 	aborting := channelClosed(c.abortRequested)
 	c.closeStateMu.Unlock()
 	if !aborting && c.client != nil {
-		streamErr = errors.Join(streamErr, c.client.Stop())
+		engineErr := c.client.Stop()
+		c.logCloseDiagnostic("engine_stop", engineErr)
+		streamErr = errors.Join(streamErr, engineErr)
 	}
 	// Stop can itself be preempted by Abort. Serialize the final decision with
 	// requestAbort so no force worker outlives the carrier close owner.
