@@ -9,6 +9,9 @@ type SelectorOutboundOptions struct {
 }
 
 type URLTestOutboundOptions struct {
+	// lx:begin wlt body-health options
+	WLTURLTestOptions
+	// lx:end wlt body-health options
 	Outbounds                 []string           `json:"outbounds"`
 	URL                       string             `json:"url,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`
