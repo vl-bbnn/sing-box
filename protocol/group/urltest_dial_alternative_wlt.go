@@ -33,6 +33,9 @@ func (g *URLTestGroup) dialAlternative(ctx context.Context, network string, unav
 	if selected := g.invalidateAndSelectAlternative(network, unavailable); selected != nil {
 		return selected
 	}
+	if g.wltBodyProbe != nil {
+		return nil
+	}
 	if !g.preferFirstAvailable {
 		return nil
 	}

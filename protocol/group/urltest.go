@@ -41,6 +41,9 @@ const (
 )
 
 type URLTest struct {
+	// lx:begin wlt body-health options
+	bodyOptions option.WLTURLTestOptions
+	// lx:end wlt body-health options
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
@@ -57,7 +60,15 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	// lx:begin wlt body-health validation
+	if err := validateWLTBodyProbeOptions(options.WLTURLTestOptions, options.Outbounds, time.Duration(options.Interval)); err != nil {
+		return nil, err
+	}
+	// lx:end wlt body-health validation
 	outbound := &URLTest{
+		// lx:begin wlt body-health options
+		bodyOptions: options.WLTURLTestOptions,
+		// lx:end wlt body-health options
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
@@ -90,6 +101,11 @@ func (s *URLTest) Start() error {
 	if err != nil {
 		return err
 	}
+	// lx:begin wlt body-health configuration
+	if err = group.configureWLTBodyProbe(s.bodyOptions); err != nil {
+		return err
+	}
+	// lx:end wlt body-health configuration
 	s.group = group
 	return nil
 }
@@ -289,6 +305,9 @@ func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, rout
 }
 
 type URLTestGroup struct {
+	// lx:begin wlt body-health state
+	wltBodyProbe *wltBodyProbe
+	// lx:end wlt body-health state
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
 	pause                        pause.Manager
@@ -384,6 +403,9 @@ func (g *URLTestGroup) Touch() {
 }
 
 func (g *URLTestGroup) Close() error {
+	// lx:begin wlt body-health retirement
+	g.closeWLTBodyProbe()
+	// lx:end wlt body-health retirement
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.ticker != nil {
@@ -399,6 +421,13 @@ func (g *URLTestGroup) Close() error {
 // selectedOutbounds returns a consistent interface snapshot. Interface values
 // have multiple words and must not race with background route publication.
 func (g *URLTestGroup) selectedOutbounds() (adapter.Outbound, adapter.Outbound) {
+	// lx:begin wlt body-health selection
+	if g.wltBodyProbe != nil {
+		tcp, _ := g.selectWLTBodyProbe(N.NetworkTCP, nil)
+		udp, _ := g.selectWLTBodyProbe(N.NetworkUDP, nil)
+		return tcp, udp
+	}
+	// lx:end wlt body-health selection
 	g.selectedAccess.RLock()
 	defer g.selectedAccess.RUnlock()
 	return g.selectedOutboundTCP, g.selectedOutboundUDP
@@ -417,6 +446,11 @@ func (g *URLTestGroup) selectedOutbound(network string) adapter.Outbound {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	// lx:begin wlt body-health selection
+	if g.wltBodyProbe != nil {
+		return g.selectWLTBodyProbe(network, nil)
+	}
+	// lx:end wlt body-health selection
 	if g.preferFirstAvailable {
 		for _, detour := range g.outbounds {
 			if !common.Contains(detour.Network(), network) {
@@ -498,6 +532,9 @@ func (g *URLTestGroup) CheckOutbounds(force bool) {
 // that an update arriving during an in-flight check receives a later check.
 func (g *URLTestGroup) InterfaceUpdated() {
 	g.interfaceUpdateGeneration.Add(1)
+	// lx:begin wlt body-health interface retirement
+	g.invalidateWLTBodyProbeInterface()
+	// lx:end wlt body-health interface retirement
 	if !g.interfaceUpdatePending.CompareAndSwap(false, true) {
 		return
 	}
@@ -574,6 +611,11 @@ func (g *URLTestGroup) tryURLTest(ctx context.Context, force bool) (map[string]u
 		return result, nil, false
 	}
 	defer g.checking.Store(false)
+	// lx:begin wlt body-health execution
+	if g.wltBodyProbe != nil {
+		return g.tryWLTBodyProbe(ctx, force)
+	}
+	// lx:end wlt body-health execution
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
@@ -641,6 +683,11 @@ func (g *URLTestGroup) performUpdateCheck() {
 }
 
 func (g *URLTestGroup) invalidateAndSelectAlternative(network string, unavailable adapter.Outbound) adapter.Outbound {
+	// lx:begin wlt body-health invalidation
+	if g.wltBodyProbe != nil {
+		return g.alternativeWLTBodyProbe(network, unavailable)
+	}
+	// lx:end wlt body-health invalidation
 	g.history.DeleteURLTestHistory(RealTag(unavailable))
 	g.performUpdateCheck()
 	selected := g.selectedOutbound(network)
