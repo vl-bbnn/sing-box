@@ -71,4 +71,6 @@
 | **013** | PACKAGE_NAME_REGEX_RULE_ITEM | **C** | ✅ **Код+тесты, сборки/vet/gofmt зелёные.** Бэкпорт апстрим-фичи 1.14 ([941ce58b](https://github.com/SagerNet/sing-box/commit/941ce58b)) на базу 1.13.13 **без** полной миграции: rule-item `package_name_regex` (regex-матчинг Android-пакета) для route/DNS/headless. Новый `route/rule/rule_item_package_name_regex.go` + поля/регистрация/cond в 6 файлах роутинга. Хунк `RuleSetVersion5` из коммита НЕ переносился (это rule-set v5, не фича). Полная миграция на 1.14 отложена до **v1.14.0 stable** (feasibility: ~1,5–2 дня, риск — ребейз AWG-подмодуля; `lx-rebase.yml` сам исключает alpha) |
 | **014** | WLT_BODY_HEALTH | **O** | Изолированный opt-in WLT body health; host/native acceptance открыты. |
 
+| **015** | WLT_APPLICATION_CLOSE | **O** | Полное клиентское закрытие DATA; host/native/physical acceptance открыты. |
+
 > **Вне этого репозитория:** потребление ядра лаунчером (`singbox-launcher`) — парсинг `type=xhttp` в реальный XHTTP-транспорт (сейчас `023` маппит его в `httpupgrade`), AWG-поля в визарде, замена `bin/sing-box`. Это отдельные задачи в репозитории лаунчера.

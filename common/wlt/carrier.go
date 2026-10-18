@@ -2539,7 +2539,7 @@ func (c *carrierConn) finishClose(immediate bool) error {
 			err = c.Conn.Close()
 		}
 	} else {
-		err = c.Conn.Close()
+		err = closeApplicationStream(c.Conn)
 	}
 	if c.carrier != nil {
 		c.carrier.unregisterStream(c)
