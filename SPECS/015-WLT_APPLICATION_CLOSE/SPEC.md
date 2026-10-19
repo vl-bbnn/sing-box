@@ -17,3 +17,9 @@
 Приёмка: normal/race и старые lifecycle tests; byte-exact обычные сборки по
 source scope; опубликованный carrier pin, native сборка и новый физический
 прогон с актуальным state. Host pass не закрывает физическую приёмку.
+
+Дополнение scoped read retirement: отдельный opt-in `scoped_application_read_retirement`
+(по умолчанию false, требует data_half_close). До публикации DATA активировать
+carrier capability; отказ или исходный dial deadline завершают исходное владение
+и освобождают допуск. Legacy CloseApplication и immediate Abort не меняются.
+Полная physical/media приёмка остаётся открытой.

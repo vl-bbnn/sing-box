@@ -18,3 +18,19 @@ r4094 не установлена. Здесь требуется новый по
 
 Задача остаётся OPEN: native сборка и новая физическая приёмка ещё не выполнены.
 Ни телефоны, ни серверы, ни обычные/default ветки этим шагом не меняются.
+
+
+## Scoped application read retirement
+
+Добавлен отдельный `scoped_application_read_retirement`, default false, только
+with_wlt; он требует data_half_close. Активация capability происходит до
+публикации потока, с исходным dial context; отказ завершает исходное соединение
+и освобождает admission. Выбор Close хранится на конкретном потоке. Legacy
+helper и immediate Abort сохранены; исходные ошибки не нормализуются.
+
+Host: все 368 прежних WLT случаев плюс 17 новых проходят normal и race;
+32 default случая неизменны, оба vet проходят. Проверены JSON/service bridge,
+обычный Read после активации, один Close/slot owner, raw admission/disposal
+ошибки, cancellation/deadline и generation/Close/Abort races. Обычные target
+зависимости не включают carrier/KCP. Native/physical и resolved integration
+приёмка остаются открытыми; host pass не является полевой квалификацией.

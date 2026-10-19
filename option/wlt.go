@@ -13,10 +13,11 @@ import (
 )
 
 type WLTServiceOptions struct {
-	Transport         string `json:"transport,omitempty"`
-	CarrierConfig     string `json:"carrier_config,omitempty"`
-	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
-	AuthSnapshot      string `json:"auth_snapshot,omitempty"`
+	ScopedApplicationReadRetirement bool   `json:"scoped_application_read_retirement,omitempty"`
+	Transport                       string `json:"transport,omitempty"`
+	CarrierConfig                   string `json:"carrier_config,omitempty"`
+	CarrierConfigFile               string `json:"carrier_config_file,omitempty"`
+	AuthSnapshot                    string `json:"auth_snapshot,omitempty"`
 	// AuthReserveSnapshot is an independently authorized bootstrap identity.
 	// It is consumed into the private local auth ring once and is never fetched
 	// again during startup or failover.
@@ -79,6 +80,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if transport != "wlt" && transport != "carrier" && transport != "turnable" {
 		return E.New("unsupported wlt service transport: ", o.Transport)
+	}
+	if o.ScopedApplicationReadRetirement && !o.DataHalfClose {
+		return E.New("scoped application read retirement requires data_half_close")
 	}
 	o.CarrierConfig = strings.TrimSpace(o.CarrierConfig)
 	o.CarrierConfigFile = strings.TrimSpace(o.CarrierConfigFile)

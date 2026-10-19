@@ -163,8 +163,9 @@ var (
 )
 
 type CarrierOptions struct {
-	Config     string
-	ConfigFile string
+	ScopedApplicationReadRetirement bool
+	Config                          string
+	ConfigFile                      string
 
 	AuthSnapshot             string
 	AuthReserveSnapshot      string
@@ -432,6 +433,7 @@ type CarrierStats struct {
 }
 
 type Carrier struct {
+	scopedReadRetirement bool
 	client               *carrierengine.Client
 	cancel               context.CancelFunc
 	done                 chan struct{}
@@ -537,6 +539,9 @@ func (c *Carrier) WaitTrafficReady(ctx context.Context) error {
 }
 
 func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error) {
+	if err := validateScopedApplicationReadOptions(options); err != nil {
+		return nil, err
+	}
 	logf := options.Logger
 	if logf == nil {
 		logf = log.Printf
@@ -726,6 +731,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	carrier := &Carrier{
+		scopedReadRetirement: options.ScopedApplicationReadRetirement,
 		client:               runtimeClient,
 		cancel:               cancel,
 		done:                 make(chan struct{}),
@@ -1791,6 +1797,13 @@ reconnectLoop:
 		c.failedStreams.Add(1)
 		return nil, errors.New("WLT carrier returned nil stream")
 	}
+	scoped, selectionErr := prepareScopedApplicationRead(dialCtx, conn, c.scopedReadRetirement)
+	if selectionErr != nil {
+		disposalErr := disposeScopedApplicationAdmission(conn)
+		releaseActive()
+		c.failedStreams.Add(1)
+		return nil, errors.Join(selectionErr, disposalErr)
+	}
 	if dialElapsed > 1500*time.Millisecond {
 		if c.logf != nil {
 			c.logf("WLT stream open slow route=%s target=%s elapsed=%s", routeClass, target, dialElapsed)
@@ -1812,11 +1825,12 @@ reconnectLoop:
 	}
 	c.openedStreams.Add(1)
 	stream := &carrierConn{
-		Conn:          conn,
-		carrier:       c,
-		releaseActive: releaseActive,
-		idleTimeout:   c.idleTimeout,
-		routeClass:    normalizeCarrierRouteClass(routeClass),
+		scopedApplicationClose: scoped,
+		Conn:                   conn,
+		carrier:                c,
+		releaseActive:          releaseActive,
+		idleTimeout:            c.idleTimeout,
+		routeClass:             normalizeCarrierRouteClass(routeClass),
 	}
 	if !c.registerStream(stream) {
 		_ = stream.Close()
@@ -2438,6 +2452,7 @@ func release(ch chan struct{}) {
 }
 
 type carrierConn struct {
+	scopedApplicationClose bool
 	net.Conn
 	carrier          *Carrier
 	releaseActive    func()
@@ -2539,7 +2554,7 @@ func (c *carrierConn) finishClose(immediate bool) error {
 			err = c.Conn.Close()
 		}
 	} else {
-		err = closeApplicationStream(c.Conn)
+		err = closeSelectedApplicationStream(c.Conn, c.scopedApplicationClose)
 	}
 	if c.carrier != nil {
 		c.carrier.unregisterStream(c)
