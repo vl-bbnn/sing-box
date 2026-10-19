@@ -6,3 +6,7 @@
 - [x] Carrier full gates r4088, recovery r4089/r4092 и published pin r4093.
 - [ ] Native source integration и сборка.
 - [ ] Новый физический прогон и проверка исходного Close/Stop/media.
+
+- [x] Scoped opt-in core selection, service/JSON validation и host gates (385 normal/race, 32 default).
+- [ ] Resolved integration/branch contracts, recovery и native artifacts.
+- [ ] Fresh Pixel field validation; iPhone только после нового возврата.

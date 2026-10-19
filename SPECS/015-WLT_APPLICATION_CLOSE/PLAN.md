@@ -8,3 +8,8 @@
    собрать native, пройти новый допуск и физическую проверку Pixel.
 
 Upstream-файлы не меняются. Интеграционную ветку не использовать для разработки.
+
+Scoped successor: новые with_wlt helpers, минимальные поля/швы в WLT-only
+option/service/carrier файлах; отдельный dependency pin. Не разрабатывать
+на resolved integration. Проверить actual service forwarding, pre-exposure
+activation, cancellation/deadline, disposal, один slot/Close owner и Abort.
