@@ -375,6 +375,8 @@ github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019081456-db66206a18ce h1:ifniPC6/V5
 github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019081456-db66206a18ce/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
 github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019125242-045957eaaeeb h1:9SFjQDGzkC9JzhsS0soNCZciAt/jc8mjuAP2hXAxCOA=
 github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019125242-045957eaaeeb/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
+github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019202100-d3c031bd2386 h1:kq/aTkORe6rbmufcUdb0ENAVpY8oRHdReNJ01JQGF9c=
+github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019202100-d3c031bd2386/go.mod h1:9O3D8WR+cyyUjGiTILYfg17vn72otWuXK2AFfqIe6CM=
 github.com/vl-bbnn/sing-mux v0.3.5-0.20261014071557-597b92fb7426 h1:SMijviqqU+UVtcMgKWe+NUrbiAaNTL8KSuYliRhKYVw=
 github.com/vl-bbnn/sing-mux v0.3.5-0.20261014071557-597b92fb7426/go.mod h1:QvlKMyNBNrQoyX4x+gq028uPbLM2XeRpWtDsWBJbFSk=
 github.com/vl-bbnn/sing-tun v0.8.11-0.20260921032538-bb42cd2dd10e h1:FjcMzMl1CONAPZUVUwp19OK5P2ATIMn/oVmDpIiZUnU=
@@ -419,6 +421,8 @@ github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019151927-cea0fa282981 h1:Vbb9msAx
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019151927-cea0fa282981/go.mod h1:N5A27J6e85d3SXgbEOTdQhcfgUwnEHplVb0lD71bRJg=
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019183713-12e546bbe48f h1:i7uTMqpacwIDXR1eaXPCKB+LOTL9pE/t12k0zQ1rGMg=
 github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019183713-12e546bbe48f/go.mod h1:N5A27J6e85d3SXgbEOTdQhcfgUwnEHplVb0lD71bRJg=
+github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019212110-cc113d8a6889 h1:yrPLkjXVI4SG6ImNb9cp4STRvR3RE/UJbZToyh4Wd18=
+github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019212110-cc113d8a6889/go.mod h1:dEJzvUkEft9bVSNCLThDF3fmJFXmWbu37LJIy95ms6E=
 github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
 github.com/wlynxg/anet v0.0.5/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
