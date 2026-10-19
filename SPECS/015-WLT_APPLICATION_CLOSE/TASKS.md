@@ -16,3 +16,9 @@
 - [x] Focused normal/race, реальные повторные VLESS/KCP сценарии и negatives.
 - [ ] Полные host regression gates и immutable dependency/source binding.
 - [ ] Подписанные native artifacts и свежая physical/media квалификация.
+
+- [x] First-prior field audit: 17 доказанных неизменённых внутренних 30s idle read caps.
+- [x] KCP pending-I/O deadline bug: 232 normal/race, 1/6 GiB, два negative mutants.
+- [x] Same-KCP idle-owner baseline/candidate normal/race, сохранён unknown initial caller cap.
+- [ ] Immutable core feature regression/source recovery, merge-only native integration.
+- [ ] Новая physical/media приёмка; прежние 28 Close и 6 EPIPE не считать исправленными.

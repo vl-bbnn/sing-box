@@ -34,3 +34,28 @@ Host: все 368 прежних WLT случаев плюс 17 новых про
 ошибки, cancellation/deadline и generation/Close/Abort races. Обычные target
 зависимости не включают carrier/KCP. Native/physical и resolved integration
 приёмка остаются открытыми; host pass не является полевой квалификацией.
+
+## Scoped idle read ownership и pending caller deadlines
+
+В scoped режиме Read deadline принадлежит caller. Idle activity меняет только
+write limit, а существующий watchdog владеет idle Close и передачей чтения.
+Carrier/Close/retirement и прежние write budgets не менялись. Явные и неизвестные
+начальные read caps, исходные Timeout/EOF/EPIPE не скрываются.
+
+KCP prerequisite: исправлены wake-up из initial-zero и channel rearm после clear;
+232 normal/race, исходные 1/6 GiB, два negative mutants и vet прошли. Carrier
+с неизменённым runtime прошёл 1711 identities в трёх режимах и mandatory check.
+Whole-mux fixture теперь требует фактического завершения original Close и DATA
+workers, исходных nil errors и неизменённого cap, сохраняя raw aborted/session_closed.
+Старый и новый KCP воспроизвели прежний racy status assertion; 160 наблюдений
+подтвердили фактические join, а исходный failed run сохранён.
+
+Core: 470 original/new identities normal/race, 32 default и оба vet пройдены
+с точными опубликованными зависимостями. Раздельные атомарные коммиты содержат
+WLT policy/tests/docs и помеченные dependency pins. Другие upstream зоны не
+менялись; риска ребейза добавляют только уже существующие WLT dependency строки.
+
+Задача остаётся open: нужны source recovery, merge-only product integration,
+ordinary/tagged/native builds и новая физическая приёмка. Предыдущие 28 client
+Close errors и 6 server EPIPE остаются FAIL; это разные наборы flows. Строгий
+browser verdict также остаётся FAIL. Ускорение и полная стабильность не заявлены.

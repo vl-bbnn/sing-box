@@ -4,12 +4,11 @@ package wlt
 
 import "time"
 
-// Explicit caller deadlines and the carrier idle limit are separate authorities.
-// This policy is selected only by scoped_application_read_retirement. Ordinary
-// and default WLT retain the original direct forwarding paths.
-type carrierApplicationDeadlinePolicy struct {
-	read, write, idle time.Time
-}
+// Caller read deadlines are independent of idle expiry. The existing carrier
+// idle watchdog owns scoped idle closure and its read handoff. Internal activity
+// never creates, clears or extends an application read deadline.
+// Writes keep their existing minimum of caller and idle deadlines.
+type carrierApplicationDeadlinePolicy struct{ read, write, idle time.Time }
 
 func earlierCarrierDeadline(a, b time.Time) time.Time {
 	if a.IsZero() {
@@ -20,36 +19,24 @@ func earlierCarrierDeadline(a, b time.Time) time.Time {
 	}
 	return b
 }
-func (c *carrierConn) setEffectiveReadDeadline(d time.Time, idle bool) error {
-	if idle {
-		if reporter, ok := c.Conn.(interface{ SetIdleReadDeadline(time.Time) error }); ok {
-			return reporter.SetIdleReadDeadline(d)
-		}
-	}
-	return c.Conn.SetReadDeadline(d)
-}
-func (c *carrierConn) setEffectiveBothDeadline(d time.Time, idle bool) error {
-	if idle {
-		if reporter, ok := c.Conn.(interface{ SetIdleDeadline(time.Time) error }); ok {
-			return reporter.SetIdleDeadline(d)
-		}
-	}
-	return c.Conn.SetDeadline(d)
-}
-
 func (c *carrierConn) SetDeadline(d time.Time) error {
 	if !c.scopedApplicationClose {
 		return c.Conn.SetDeadline(d)
 	}
 	c.applicationDeadlineMu.Lock()
 	defer c.applicationDeadlineMu.Unlock()
-	effective := earlierCarrierDeadline(d, c.applicationDeadline.idle)
-	err := c.setEffectiveBothDeadline(effective, !c.applicationDeadline.idle.IsZero() && effective.Equal(c.applicationDeadline.idle))
-	if err == nil {
-		c.applicationDeadline.read = d
-		c.applicationDeadline.write = d
+	if e := c.Conn.SetDeadline(d); e != nil {
+		return e
 	}
-	return err
+	// The original caller operation already applied both caps. Preserve that
+	// authority even if the subsequent write-only idle rebalance fails.
+	c.applicationDeadline.read = d
+	c.applicationDeadline.write = d
+	write := earlierCarrierDeadline(d, c.applicationDeadline.idle)
+	if !write.Equal(d) {
+		return c.Conn.SetWriteDeadline(write)
+	}
+	return nil
 }
 func (c *carrierConn) SetReadDeadline(d time.Time) error {
 	if !c.scopedApplicationClose {
@@ -57,12 +44,11 @@ func (c *carrierConn) SetReadDeadline(d time.Time) error {
 	}
 	c.applicationDeadlineMu.Lock()
 	defer c.applicationDeadlineMu.Unlock()
-	effective := earlierCarrierDeadline(d, c.applicationDeadline.idle)
-	err := c.setEffectiveReadDeadline(effective, !c.applicationDeadline.idle.IsZero() && effective.Equal(c.applicationDeadline.idle))
-	if err == nil {
+	e := c.Conn.SetReadDeadline(d)
+	if e == nil {
 		c.applicationDeadline.read = d
 	}
-	return err
+	return e
 }
 func (c *carrierConn) SetWriteDeadline(d time.Time) error {
 	if !c.scopedApplicationClose {
@@ -77,18 +63,10 @@ func (c *carrierConn) SetWriteDeadline(d time.Time) error {
 	}
 	return err
 }
-
 func (c *carrierConn) refreshScopedApplicationDeadline() {
 	c.applicationDeadlineMu.Lock()
 	defer c.applicationDeadlineMu.Unlock()
 	idle := time.Now().Add(c.idleTimeout)
 	c.applicationDeadline.idle = idle
-	read := earlierCarrierDeadline(c.applicationDeadline.read, idle)
-	write := earlierCarrierDeadline(c.applicationDeadline.write, idle)
-	if read.Equal(write) {
-		_ = c.setEffectiveBothDeadline(read, read.Equal(idle))
-		return
-	}
-	_ = c.setEffectiveReadDeadline(read, read.Equal(idle))
-	_ = c.Conn.SetWriteDeadline(write)
+	_ = c.Conn.SetWriteDeadline(earlierCarrierDeadline(c.applicationDeadline.write, idle))
 }

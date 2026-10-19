@@ -1874,13 +1874,25 @@ func TestCarrierIdleWatchExtendsDeadlineOnActivity(t *testing.T) {
 	default:
 	}
 
+	closeDeadline := time.Now().Add(time.Second)
 	select {
 	case err := <-readDone:
 		if err == nil {
 			t.Fatal("expected idle watch to close transport after activity stopped")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(time.Until(closeDeadline)):
 		t.Fatal("idle watch did not close transport after activity stopped")
+	}
+	conn.closeMu.Lock()
+	closeDone := conn.closeDone
+	conn.closeMu.Unlock()
+	if closeDone == nil {
+		t.Fatal("original idle Close owner missing")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Until(closeDeadline)):
+		t.Fatal("idle Close owner did not complete within original budget")
 	}
 	if carrier.activeStreams.Load() != 0 {
 		t.Fatalf("active=%d, want 0 after idle close", carrier.activeStreams.Load())
