@@ -171,7 +171,7 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
-	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019082421-b5c7a31bd0ec
+	github.com/vl-bbnn/wlt-carrier v0.1.21-0.20261019151927-cea0fa282981
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
@@ -205,7 +205,7 @@ replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // WLT carrier v0.1.17 needs the public UDPSession.WaitSnd API for exact
 // acknowledgement-based KCP draining. Dependency replace directives are not
 // inherited, so the executable module pins the matching fork explicitly.
-replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019081456-db66206a18ce
+replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261019125242-045957eaaeeb
 
 replace github.com/sagernet/sing-mux => github.com/vl-bbnn/sing-mux v0.3.5-0.20261014071557-597b92fb7426
 
