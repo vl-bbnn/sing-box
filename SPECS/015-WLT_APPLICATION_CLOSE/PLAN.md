@@ -13,3 +13,9 @@ Scoped successor: новые with_wlt helpers, минимальные поля/�
 option/service/carrier файлах; отдельный dependency pin. Не разрабатывать
 на resolved integration. Проверить actual service forwarding, pre-exposure
 activation, cancellation/deadline, disposal, один slot/Close owner и Abort.
+
+Продолжение: раздельные caller read/write и idle deadlines под локальным mutex,
+только в уже выбранном scoped режиме; исходные setter ошибки сохраняются.
+Первая исходная ошибка Read и её bounded provenance неизменяемы после записи.
+Двойное наблюдение EOF заменить одним, сохраняя ordinary EOF и original close caps.
+Контрольный host interleaving и repeated actual VLESS/KCP precede full gates.

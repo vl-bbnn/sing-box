@@ -23,3 +23,10 @@ source scope; опубликованный carrier pin, native сборка и �
 carrier capability; отказ или исходный dial deadline завершают исходное владение
 и освобождают допуск. Legacy CloseApplication и immediate Abort не меняются.
 Полная physical/media приёмка остаётся открытой.
+
+Диагностика первой исходной ошибки Read сохраняет её идентичность и ограниченные
+снимки дедлайна/источника setter; конкурентные setter помечаются неопределёнными.
+В scoped режиме явные дедлайны чтения/записи ограничивают обновления idle,
+очистка caller deadline сохраняет idle limit. Обычный режим forwarding неизменён.
+Retained DATA Read использует один снимок remote EOF: приход FIN между проверками
+не должен переводить сохранённый receiver в обычное закрытие.

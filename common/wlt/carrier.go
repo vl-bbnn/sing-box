@@ -2452,6 +2452,8 @@ func release(ch chan struct{}) {
 }
 
 type carrierConn struct {
+	applicationDeadlineMu  sync.Mutex
+	applicationDeadline    carrierApplicationDeadlinePolicy
 	scopedApplicationClose bool
 	net.Conn
 	carrier          *Carrier
@@ -2579,6 +2581,10 @@ func (c *carrierConn) finishClose(immediate bool) error {
 
 func (c *carrierConn) refreshDeadline() {
 	if c.idleTimeout <= 0 {
+		return
+	}
+	if c.scopedApplicationClose {
+		c.refreshScopedApplicationDeadline()
 		return
 	}
 	_ = c.Conn.SetDeadline(time.Now().Add(c.idleTimeout))

@@ -10,3 +10,9 @@
 - [x] Scoped opt-in core selection, service/JSON validation и host gates (385 normal/race, 32 default).
 - [ ] Resolved integration/branch contracts, recovery и native artifacts.
 - [ ] Fresh Pixel field validation; iPhone только после нового возврата.
+
+- [x] Host воспроизведение подмены request deadline и первой Read ошибки.
+- [x] Детерминированное воспроизведение retained EOF interleaving и source fix.
+- [x] Focused normal/race, реальные повторные VLESS/KCP сценарии и negatives.
+- [ ] Полные host regression gates и immutable dependency/source binding.
+- [ ] Подписанные native artifacts и свежая physical/media квалификация.

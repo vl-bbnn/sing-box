@@ -43,4 +43,7 @@ func addApplicationReadDeadlineKeys(numbers map[string]int64) {
 	} {
 		numbers[key] = 0
 	}
+	for _, key := range priorReadDiagnosticNames {
+		numbers[key] = 0
+	}
 }
