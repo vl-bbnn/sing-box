@@ -11,6 +11,9 @@ type PlatformInterface interface {
 	FindConnectionOwner(ipProtocol int32, sourceAddress string, sourcePort int32, destinationAddress string, destinationPort int32) (*ConnectionOwner, error)
 	StartDefaultInterfaceMonitor(listener InterfaceUpdateListener) error
 	CloseDefaultInterfaceMonitor(listener InterfaceUpdateListener) error
+	StartNeighborMonitor(listener NeighborUpdateListener) error
+	CloseNeighborMonitor(listener NeighborUpdateListener) error
+	RegisterMyInterface(name string)
 	GetInterfaces() (NetworkInterfaceIterator, error)
 	UnderNetworkExtension() bool
 	IncludeAllNetworks() bool
@@ -37,6 +40,10 @@ func (c *ConnectionOwner) AndroidPackageNames() StringIterator {
 
 type InterfaceUpdateListener interface {
 	UpdateDefaultInterface(interfaceName string, interfaceIndex int32, isExpensive bool, isConstrained bool)
+}
+
+type NeighborUpdateListener interface {
+	UpdateNeighborTable(entries NeighborEntryIterator)
 }
 
 const (
@@ -69,6 +76,17 @@ func NewWIFIState(wifiSSID string, wifiBSSID string) *WIFIState {
 
 type NetworkInterfaceIterator interface {
 	Next() *NetworkInterface
+	HasNext() bool
+}
+
+type NeighborEntry struct {
+	Address    string
+	MacAddress string
+	Hostname   string
+}
+
+type NeighborEntryIterator interface {
+	Next() *NeighborEntry
 	HasNext() bool
 }
 

@@ -90,6 +90,9 @@ func OutboundRegistry() *outbound.Registry {
 	shadowtls.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
+	// 2b2n:begin wlt
+	registerWLTOutbound(registry)
+	// 2b2n:end wlt
 
 	registerQUICOutbounds(registry)
 	registerStubForRemovedOutbounds(registry)
@@ -130,6 +133,9 @@ func ServiceRegistry() *service.Registry {
 
 	resolved.RegisterService(registry)
 	ssmapi.RegisterService(registry)
+	// 2b2n:begin wlt
+	registerWLTService(registry)
+	// 2b2n:end wlt
 
 	registerDERPService(registry)
 	registerCCMService(registry)
