@@ -99,6 +99,7 @@ func (c *Carrier) logStreamCloseDiagnostic(component string, err error, flowID u
 	observed := false
 	var pending, calls, elapsed int64
 	result := "unknown"
+	retirementResult := "unknown"
 	numbers := map[string]int64{"kcp_lifetime_id": 0, "kcp_lifetime_process_id": 0, "kcp_lifetime_started_unix_ms": 0, "kcp_drain_snapshot_observed": 0, "kcp_drain_snapshot_call": 0, "kcp_drain_snapshot_unix_ms": 0, "kcp_drain_input_ended": 0, "kcp_drain_remote_data_close": 0, "kcp_drain_pending_mux": 0, "kcp_drain_pending_kcp": 0}
 	protocol, inputError := "unknown", "unknown"
 	if reporter, ok := conn.(interface{ DiagnosticFields() []any }); ok {
@@ -107,6 +108,10 @@ func (c *Carrier) logStreamCloseDiagnostic(component string, err error, flowID u
 		for i := 0; i+1 < len(fields); i += 2 {
 			key, ok := fields[i].(string)
 			if !ok {
+				continue
+			}
+			if key == "kcp_retirement_result" {
+				retirementResult = closeRetirementResult(fields[i+1])
 				continue
 			}
 			if key == "kcp_drain_result" {
@@ -158,5 +163,7 @@ func (c *Carrier) logStreamCloseDiagnostic(component string, err error, flowID u
 			}
 		}
 	}
-	c.logf("WLT close diagnostic component=%s flow_id=%d carrier_abort_requested=%t error_classes=%s returned_error=%t transport_diagnostics=%t kcp_wait_snd=%d kcp_drain_calls=%d kcp_drain_ms=%d kcp_drain_result=%s kcp_lifetime_id=%d kcp_lifetime_process_id=%d kcp_lifetime_started_unix_ms=%d kcp_drain_snapshot_observed=%d kcp_drain_snapshot_call=%d kcp_drain_snapshot_unix_ms=%d kcp_drain_input_ended=%d kcp_drain_remote_data_close=%d kcp_drain_pending_mux=%d kcp_drain_pending_kcp=%d kcp_drain_protocol=%s kcp_drain_input_error=%s", component, flowID, abortRequested, closeErrorClasses(err), err != nil, observed, pending, calls, elapsed, result, numbers["kcp_lifetime_id"], numbers["kcp_lifetime_process_id"], numbers["kcp_lifetime_started_unix_ms"], numbers["kcp_drain_snapshot_observed"], numbers["kcp_drain_snapshot_call"], numbers["kcp_drain_snapshot_unix_ms"], numbers["kcp_drain_input_ended"], numbers["kcp_drain_remote_data_close"], numbers["kcp_drain_pending_mux"], numbers["kcp_drain_pending_kcp"], protocol, inputError)
+	timeoutSeen, timeoutComplete := closeTimeoutObservation(err)
+	applicationRead := observeApplicationReadRetirement(conn)
+	c.logf("WLT close diagnostic component=%s flow_id=%d carrier_abort_requested=%t error_classes=%s returned_error=%t transport_diagnostics=%t kcp_wait_snd=%d kcp_drain_calls=%d kcp_drain_ms=%d kcp_drain_result=%s kcp_lifetime_id=%d kcp_lifetime_process_id=%d kcp_lifetime_started_unix_ms=%d kcp_drain_snapshot_observed=%d kcp_drain_snapshot_call=%d kcp_drain_snapshot_unix_ms=%d kcp_drain_input_ended=%d kcp_drain_remote_data_close=%d kcp_drain_pending_mux=%d kcp_drain_pending_kcp=%d kcp_drain_protocol=%s kcp_drain_input_error=%s error_timeout_observed=%t error_timeout_walk_complete=%t kcp_retirement_result=%s application_read_retirement_observed=%t application_read_retired_bytes_valid=%t application_read_retired_bytes=%d application_read_retirement_joined=%t", component, flowID, abortRequested, closeErrorClasses(err), err != nil, observed, pending, calls, elapsed, result, numbers["kcp_lifetime_id"], numbers["kcp_lifetime_process_id"], numbers["kcp_lifetime_started_unix_ms"], numbers["kcp_drain_snapshot_observed"], numbers["kcp_drain_snapshot_call"], numbers["kcp_drain_snapshot_unix_ms"], numbers["kcp_drain_input_ended"], numbers["kcp_drain_remote_data_close"], numbers["kcp_drain_pending_mux"], numbers["kcp_drain_pending_kcp"], protocol, inputError, timeoutSeen, timeoutComplete, retirementResult, applicationRead.observed, applicationRead.bytesValid, applicationRead.bytes, applicationRead.joined)
 }
