@@ -26,7 +26,13 @@ carrier capability; отказ или исходный dial deadline завер�
 
 Диагностика первой исходной ошибки Read сохраняет её идентичность и ограниченные
 снимки дедлайна/источника setter; конкурентные setter помечаются неопределёнными.
-В scoped режиме явные дедлайны чтения/записи ограничивают обновления idle,
-очистка caller deadline сохраняет idle limit. Обычный режим forwarding неизменён.
+В scoped режиме Read deadline принадлежит только caller; idle activity его не
+создаёт, не очищает и не продлевает. Idle закрывает существующий idleWatchLoop,
+а write limit остаётся минимумом caller и idle. Обычный forwarding неизменён.
 Retained DATA Read использует один снимок remote EOF: приход FIN между проверками
 не должен переводить сохранённый receiver в обычное закрытие.
+
+Новый caller deadline должен прерывать уже ожидающий KCP Read/Write; после
+clear/rearm timer channel восстанавливается. Не менять raw Timeout/EOF/EPIPE,
+исходные close budgets, FIN/ACK/Abort и retained read retirement. Физическая
+приёмка текущего результата r4513 остаётся FAIL: 28 Close, 6 EPIPE, media verdict.

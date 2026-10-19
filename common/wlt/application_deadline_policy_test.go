@@ -75,15 +75,15 @@ func TestCarrierApplicationDeadline4479RequestCaps(t *testing.T) {
 		t.Fatal(e)
 	}
 	r, w = recorder.deadlines()
-	if !r.Equal(c.applicationDeadline.idle) || !w.Equal(write) {
-		t.Fatal("read clear removed idle limit or changed write budget", r, w)
+	if !r.IsZero() || !w.Equal(write) {
+		t.Fatal("explicit caller read clear was not preserved or write cap changed", r, w)
 	}
 	if e := c.SetDeadline(time.Time{}); e != nil {
 		t.Fatal(e)
 	}
 	r, w = recorder.deadlines()
-	if !r.Equal(c.applicationDeadline.idle) || !w.Equal(r) {
-		t.Fatal("both clear disabled idle limit")
+	if !r.IsZero() || !w.Equal(c.applicationDeadline.idle) {
+		t.Fatal("explicit caller read clear or write idle limit changed")
 	}
 }
 func TestCarrierApplicationDeadline4479IdleAndExplicitReplacement(t *testing.T) {
@@ -91,12 +91,13 @@ func TestCarrierApplicationDeadline4479IdleAndExplicitReplacement(t *testing.T) 
 	c := &carrierConn{Conn: recorder, scopedApplicationClose: true, idleTimeout: time.Second}
 	c.refreshDeadline()
 	idle := c.applicationDeadline.idle
-	if e := c.SetDeadline(time.Now().Add(time.Hour)); e != nil {
+	caller := time.Now().Add(time.Hour)
+	if e := c.SetDeadline(caller); e != nil {
 		t.Fatal(e)
 	}
 	r, w := recorder.deadlines()
-	if !r.Equal(idle) || !w.Equal(idle) {
-		t.Fatal("long caller deadline disabled idle constraint")
+	if !r.Equal(caller) || !w.Equal(idle) {
+		t.Fatal("caller read cap or write idle constraint changed")
 	}
 	expired := time.Now().Add(-time.Second)
 	if e := c.SetReadDeadline(expired); e != nil {

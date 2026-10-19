@@ -226,13 +226,13 @@ func TestDeadlineLifecycle4479ActualManagerEOF(t *testing.T) {
 	}
 	var refresh bool
 	for _, e := range o.snapshot() {
-		if e.Kind == "SetReadDeadline" && !strings.Contains(strings.Join(e.Stack, " "), "wlt.(*carrierConn).refreshScopedApplicationDeadline") {
-			t.Fatal("unattributed ReadDeadline setter", e)
+		if (e.Kind == "SetReadDeadline" || e.Kind == "SetDeadline") && strings.Contains(strings.Join(e.Stack, " "), "wlt.(*carrierConn).refreshScopedApplicationDeadline") {
+			t.Fatal("idle activity changed application read deadline", e)
 		}
 		if strings.Contains(strings.Join(e.Stack, " "), "network.CloseRead") {
 			t.Fatal("unexpected CloseRead setter", e)
 		}
-		if e.Kind == "SetDeadline" && strings.Contains(strings.Join(e.Stack, " "), "wlt.(*carrierConn).refreshDeadline") {
+		if e.Kind == "SetWriteDeadline" && strings.Contains(strings.Join(e.Stack, " "), "wlt.(*carrierConn).refreshScopedApplicationDeadline") {
 			refresh = true
 		}
 	}
@@ -274,8 +274,8 @@ func TestDeadlineLifecycle4479GenuineTimeoutSurvivesIdleActivity(t *testing.T) {
 	if !errors.As(original, &timeout) || !timeout.Timeout() || prior4479(ck) != original {
 		t.Fatal("original timeout not retained", original)
 	}
-	// A later real Write refreshes the shared deadline. This must not erase an
-	// already-returned Read error even if retirement observes a future deadline.
+	// A later real Write refreshes only its write deadline. It must not erase
+	// the already-returned raw Read error or its original caller cap.
 	if _, e := app.Write([]byte("after-timeout")); e != nil {
 		t.Fatal(e)
 	}
@@ -353,13 +353,21 @@ func checkPrior4479(t *testing.T, c net.Conn, deadline time.Time, original error
 			}
 		}
 	}
-	for _, name := range []string{"kcp_prior_read_observed", "kcp_prior_read_start_setter_certain", "kcp_prior_read_return_setter_certain"} {
+	for _, name := range []string{"kcp_prior_read_observed", "kcp_prior_read_return_setter_certain"} {
 		if numbers[name] != 1 {
 			t.Fatal("actual provenance not coherent", name, numbers)
 		}
 	}
-	if numbers["kcp_prior_read_start_setter_origin"] != 3 || numbers["kcp_prior_read_return_setter_origin"] != 2 {
+	if numbers["kcp_prior_read_start_setter_origin"] != 0 || numbers["kcp_prior_read_return_setter_origin"] != 2 {
 		t.Fatal("idle refresh and actual application setter conflated", numbers)
+	}
+	for _, name := range []string{"kcp_prior_read_start_setter_certain", "kcp_prior_read_start_setter_sequence", "kcp_prior_read_start_setters_started", "kcp_prior_read_start_setters_active", "kcp_prior_read_start_deadline_observed", "kcp_prior_read_start_deadline_set", "kcp_prior_read_start_deadline_unix_ns"} {
+		if numbers[name] != 0 {
+			t.Fatal("pending Read fabricated an initial caller deadline", name, numbers)
+		}
+	}
+	if numbers["kcp_prior_read_return_setter_sequence"] != 1 || numbers["kcp_prior_read_return_setters_started"] != 1 || numbers["kcp_prior_read_return_setters_active"] != 0 || numbers["kcp_prior_read_return_setter_completed_unix_ns"] <= numbers["kcp_prior_read_start_sample_unix_ns"] {
+		t.Fatal("actual first caller setter during pending Read not retained", numbers)
 	}
 	if numbers["kcp_prior_read_return_deadline_unix_ns"] != deadline.UnixNano() || numbers["kcp_prior_read_return_sample_unix_ns"] < deadline.UnixNano() {
 		t.Fatal("first prior Read snapshot replaced by later future deadline", numbers)

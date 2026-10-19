@@ -19,3 +19,9 @@ activation, cancellation/deadline, disposal, один slot/Close owner и Abort.
 Первая исходная ошибка Read и её bounded provenance неизменяемы после записи.
 Двойное наблюдение EOF заменить одним, сохраняя ordinary EOF и original close caps.
 Контрольный host interleaving и repeated actual VLESS/KCP precede full gates.
+
+Scoped idle-read successor: сохранить только write-only idle deadline;
+Read/shared setters пересылают caller cap без idle подмены. Сохранить применённый
+caller cap даже при сбое последующей write-only rebalance. Реальный watchdog
+остаётся без изменений. Один fixed KCP для old/candidate causal fixture,
+затем immutable pins и полные original regression gates.
