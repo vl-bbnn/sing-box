@@ -182,4 +182,4 @@ replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 
 // lx:end awg
 
-replace github.com/sagernet/sing-vmess => github.com/vl-bbnn/sing-vmess v0.2.8-0.20261014121436-f7bf6240ff3f
+replace github.com/sagernet/sing-vmess => github.com/vl-bbnn/sing-vmess v0.2.8-0.20261020035113-7950333dcb4f
