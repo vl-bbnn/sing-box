@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,29 +35,33 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
+	ctx               context.Context
 	logger            logger.ContextLogger
 	interfaceFinder   *control.DefaultInterfaceFinder
 	networkInterfaces common.TypedValue[[]adapter.NetworkInterface]
 
-	autoDetectInterface    bool
-	defaultOptions         adapter.NetworkOptions
-	autoRedirectOutputMark uint32
-	networkMonitor         tun.NetworkUpdateMonitor
-	interfaceMonitor       tun.DefaultInterfaceMonitor
-	packageManager         tun.PackageManager
-	powerListener          winpowrprof.EventListener
-	pauseManager           pause.Manager
-	platformInterface      adapter.PlatformInterface
-	connectionManager      adapter.ConnectionManager
-	endpoint               adapter.EndpointManager
-	inbound                adapter.InboundManager
-	outbound               adapter.OutboundManager
-	needWIFIState          bool
-	wifiMonitor            settings.WIFIMonitor
-	wifiState              adapter.WIFIState
-	wifiStateMutex         sync.RWMutex
-	started                bool
+	autoDetectInterface      bool
+	defaultOptions           adapter.NetworkOptions
+	autoRedirectOutputMark   uint32
+	networkMonitor           tun.NetworkUpdateMonitor
+	interfaceMonitor         tun.DefaultInterfaceMonitor
+	packageManager           tun.PackageManager
+	powerListener            winpowrprof.EventListener
+	pauseManager             pause.Manager
+	platformInterface        adapter.PlatformInterface
+	connectionManager        adapter.ConnectionManager
+	endpoint                 adapter.EndpointManager
+	inbound                  adapter.InboundManager
+	outbound                 adapter.OutboundManager
+	needWIFIState            bool
+	wifiMonitor              settings.WIFIMonitor
+	wifiState                adapter.WIFIState
+	wifiStateMutex           sync.RWMutex
+	interfaceResetGeneration atomic.Uint64
+	started                  bool
 }
+
+const androidInterfaceSettledResetDelay = 3 * time.Second
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
 	defaultDomainResolver := common.PtrValueOrDefault(options.DefaultDomainResolver)
@@ -70,6 +75,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 		return nil, E.New("`default_mark` is only supported on linux")
 	}
 	nm := &NetworkManager{
+		ctx:                 ctx,
 		logger:              logger,
 		interfaceFinder:     control.NewDefaultInterfaceFinder(),
 		autoDetectInterface: options.AutoDetectInterface,
@@ -452,9 +458,21 @@ func (r *NetworkManager) UpdateWIFIState() {
 }
 
 func (r *NetworkManager) ResetNetwork() {
-	if r.connectionManager != nil {
-		r.connectionManager.CloseAll()
+	// lx:begin wlt
+	var outbounds []adapter.Outbound
+	if !notifyInterfaceListenersBeforeConnectionClose {
+		if r.connectionManager != nil {
+			r.connectionManager.CloseAll()
+		}
 	}
+	// Notify WLT before other listeners because a nested VLESS multiplex reset
+	// can spend its full graceful-drain timeout closing the old WLT stream.
+	// The WLT service must close its dial gate before those synchronous closes.
+	if notifyInterfaceListenersBeforeConnectionClose {
+		outbounds = r.outbound.Outbounds()
+		notifyPriorityInterfaceUpdateListeners(outbounds)
+	}
+	// lx:end wlt
 
 	for _, endpoint := range r.endpoint.Endpoints() {
 		listener, isListener := endpoint.(adapter.InterfaceUpdateListener)
@@ -470,16 +488,53 @@ func (r *NetworkManager) ResetNetwork() {
 		}
 	}
 
-	for _, outbound := range r.outbound.Outbounds() {
+	// lx:begin wlt
+	if outbounds == nil {
+		outbounds = r.outbound.Outbounds()
+	}
+	// lx:end wlt
+	for _, outbound := range outbounds {
 		listener, isListener := outbound.(adapter.InterfaceUpdateListener)
 		if isListener {
+			// lx:begin wlt
+			if isPriorityInterfaceUpdateListener(listener) {
+				continue
+			}
+			// lx:end wlt
 			listener.InterfaceUpdated()
 		}
 	}
+
+	// lx:begin wlt
+	if notifyInterfaceListenersBeforeConnectionClose {
+		// Gate WLT dials before closing tracked connections because a graceful
+		// connection shutdown can keep the obsolete carrier reachable for seconds.
+		if r.connectionManager != nil {
+			r.connectionManager.CloseAll()
+		}
+	}
+	// lx:end wlt
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
 	if defaultInterface == nil {
+		// lx:begin wlt
+		if notifyInterfaceListenersBeforeConnectionClose && r.started {
+			// A settled reset for the previous interface must not fire while
+			// Android has no physical network. Only WLT needs this loss edge:
+			// its live UDP carrier otherwise starts reconnecting against the
+			// absent underlay before the replacement network exists.
+			r.interfaceResetGeneration.Add(1)
+		}
+		// The interface monitor starts before outbounds and services. Forward the
+		// trusted absence edge to the structural WLT listener even before PostStart
+		// so its Initialize-stage carrier cannot open on a missing underlay.
+		if notifyInterfaceListenersBeforeConnectionClose && r.outbound != nil {
+			notifyPriorityNetworkUnavailableListeners(r.outbound.Outbounds())
+		}
+		// lx:end wlt
+		// Pause subscribers and log sinks may block. WLT must close admission
+		// and cancel its obsolete carrier before either can delay the loss edge.
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
 		return
@@ -516,9 +571,43 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	r.UpdateWIFIState()
 
 	if !r.started {
+		// lx:begin wlt
+		// Pair a pre-PostStart nil edge with its physical-network return. Ordinary
+		// listeners retain their existing post-start reset ordering.
+		if notifyInterfaceListenersBeforeConnectionClose && r.outbound != nil {
+			notifyPriorityInterfaceUpdateListeners(r.outbound.Outbounds())
+		}
+		// lx:end wlt
 		return
 	}
 	r.ResetNetwork()
+	if C.IsAndroid {
+		r.scheduleAndroidSettledReset()
+	}
+}
+
+// Android can report the new default Network before sockets created through
+// it are consistently usable. Keep the immediate reset for fast recovery, then
+// coalesce interface-update bursts into one settled reset so transports opened
+// inside that short transition window cannot remain pinned until their own
+// long timeout. WLT's listener ignores this second callback when the physical
+// interface identity is unchanged.
+func (r *NetworkManager) scheduleAndroidSettledReset() {
+	generation := r.interfaceResetGeneration.Add(1)
+	go func() {
+		timer := time.NewTimer(androidInterfaceSettledResetDelay)
+		defer timer.Stop()
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if r.interfaceResetGeneration.Load() != generation || !r.started {
+			return
+		}
+		r.logger.Info("resetting Android transports after interface settle")
+		r.ResetNetwork()
+	}()
 }
 
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {

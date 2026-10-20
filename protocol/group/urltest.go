@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/common/wltdiagnostics"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -29,9 +30,20 @@ func RegisterURLTest(registry *outbound.Registry) {
 	outbound.Register[option.URLTestOutboundOptions](registry, C.TypeURLTest, NewURLTest)
 }
 
-var _ adapter.OutboundGroup = (*URLTest)(nil)
+var (
+	_ adapter.OutboundGroup           = (*URLTest)(nil)
+	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
+)
+
+const (
+	urlTestInterfaceUpdateDebounce      = 100 * time.Millisecond
+	urlTestInterfaceUpdateFollowupDelay = 5 * time.Second
+)
 
 type URLTest struct {
+	// lx:begin wlt body-health options
+	bodyOptions option.WLTURLTestOptions
+	// lx:end wlt body-health options
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
@@ -41,13 +53,22 @@ type URLTest struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	preferFirstAvailable         bool
 	idleTimeout                  time.Duration
 	group                        *URLTestGroup
 	interruptExternalConnections bool
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	// lx:begin wlt body-health validation
+	if err := validateWLTBodyProbeOptions(options.WLTURLTestOptions, options.Outbounds, time.Duration(options.Interval)); err != nil {
+		return nil, err
+	}
+	// lx:end wlt body-health validation
 	outbound := &URLTest{
+		// lx:begin wlt body-health options
+		bodyOptions: options.WLTURLTestOptions,
+		// lx:end wlt body-health options
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
@@ -57,6 +78,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
+		preferFirstAvailable:         options.PreferFirstAvailable,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
 	}
@@ -75,10 +97,15 @@ func (s *URLTest) Start() error {
 		}
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.preferFirstAvailable, s.idleTimeout, s.interruptExternalConnections)
 	if err != nil {
 		return err
 	}
+	// lx:begin wlt body-health configuration
+	if err = group.configureWLTBodyProbe(s.bodyOptions); err != nil {
+		return err
+	}
+	// lx:end wlt body-health configuration
 	s.group = group
 	return nil
 }
@@ -95,10 +122,11 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
+	tcp, udp := s.group.selectedOutbounds()
+	if tcp != nil {
+		return tcp.Tag()
+	} else if udp != nil {
+		return udp.Tag()
 	}
 	return ""
 }
@@ -115,14 +143,21 @@ func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
 }
 
+func (s *URLTest) InterfaceUpdated() {
+	if s.group != nil {
+		s.group.InterfaceUpdated()
+	}
+}
+
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
 	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
+	networkName := N.NetworkName(network)
+	switch networkName {
 	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
+		outbound = s.group.selectedOutbound(N.NetworkTCP)
 	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
+		outbound = s.group.selectedOutbound(N.NetworkUDP)
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
@@ -132,18 +167,48 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	var dialStarted time.Time
+	if C.WLTDiagnosticsEnabled && networkName == N.NetworkTCP {
+		dialStarted = time.Now()
+	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		s.logWLTLeaf(ctx, outbound, networkName, "primary", elapsedOpenMS(dialStarted))
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	// lx:begin wlt recovery boundary
+	if !dialFailureAllowsAlternative(ctx, err) {
+		return nil, err
+	}
+	// lx:end wlt recovery boundary
+	fallback := s.group.dialAlternative(ctx, networkName, outbound)
+	if fallback == nil {
+		return nil, err
+	}
+	s.logger.WarnContext(ctx, "selected outbound unavailable; retrying configured alternative")
+	var fallbackStarted time.Time
+	if C.WLTDiagnosticsEnabled && networkName == N.NetworkTCP {
+		fallbackStarted = time.Now()
+	}
+	conn, fallbackErr := fallback.DialContext(ctx, network, destination)
+	if fallbackErr == nil {
+		s.group.fallbackConnected(networkName, fallback)
+		s.logWLTLeaf(ctx, fallback, networkName, "fallback", elapsedOpenMS(fallbackStarted))
+		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	}
+	s.logger.ErrorContext(ctx, fallbackErr)
+	// lx:begin wlt recovery boundary
+	if dialFailureAllowsAlternative(ctx, fallbackErr) {
+		s.group.invalidateAndSelectAlternative(networkName, fallback)
+	}
+	// lx:end wlt recovery boundary
+	return nil, E.Errors(err, fallbackErr)
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
+	outbound := s.group.selectedOutbound(N.NetworkUDP)
 	if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
@@ -152,11 +217,66 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		s.logWLTLeaf(ctx, outbound, N.NetworkUDP, "primary", nil)
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	// lx:begin wlt recovery boundary
+	if !dialFailureAllowsAlternative(ctx, err) {
+		return nil, err
+	}
+	// lx:end wlt recovery boundary
+	fallback := s.group.dialAlternative(ctx, N.NetworkUDP, outbound)
+	if fallback == nil {
+		return nil, err
+	}
+	s.logger.WarnContext(ctx, "selected outbound unavailable; retrying configured alternative")
+	conn, fallbackErr := fallback.ListenPacket(ctx, destination)
+	if fallbackErr == nil {
+		s.group.fallbackConnected(N.NetworkUDP, fallback)
+		s.logWLTLeaf(ctx, fallback, N.NetworkUDP, "fallback", nil)
+		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+	}
+	s.logger.ErrorContext(ctx, fallbackErr)
+	// lx:begin wlt recovery boundary
+	if dialFailureAllowsAlternative(ctx, fallbackErr) {
+		s.group.invalidateAndSelectAlternative(N.NetworkUDP, fallback)
+	}
+	// lx:end wlt recovery boundary
+	return nil, E.Errors(err, fallbackErr)
+}
+
+func elapsedOpenMS(startedAt time.Time) *int64 {
+	if startedAt.IsZero() {
+		return nil
+	}
+	elapsed := time.Since(startedAt).Milliseconds()
+	return &elapsed
+}
+
+func (s *URLTest) logWLTLeaf(ctx context.Context, outbound adapter.Outbound, network string, attempt string, openMS *int64) {
+	if !C.WLTDiagnosticsEnabled || outbound == nil {
+		return
+	}
+	if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+		return
+	}
+	metadata := adapter.ContextFrom(ctx)
+	if metadata == nil {
+		return
+	}
+	category := wltdiagnostics.DomainCategory(metadata.Domain)
+	if category == "" {
+		category = wltdiagnostics.DomainCategory(metadata.Destination.Fqdn)
+	}
+	if category == "" {
+		return
+	}
+	if openMS != nil && network == N.NetworkTCP && category == "twitch-family" {
+		s.logger.InfoContext(ctx, "wlt-route-leaf-category=", category, " outbound-class=", wltdiagnostics.OutboundClass(outbound.Tag()), " network=", network, " attempt=", attempt, " open_ms=", *openMS)
+		return
+	}
+	s.logger.InfoContext(ctx, "wlt-route-leaf-category=", category, " outbound-class=", wltdiagnostics.OutboundClass(outbound.Tag()), " network=", network, " attempt=", attempt)
 }
 
 func (s *URLTest) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -171,7 +291,7 @@ func (s *URLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
 	s.group.Touch()
-	selected := s.group.selectedOutboundTCP
+	selected := s.group.selectedOutbound(N.NetworkTCP)
 	if selected == nil {
 		selected, _ = s.group.Select(N.NetworkTCP)
 	}
@@ -185,6 +305,9 @@ func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, rout
 }
 
 type URLTestGroup struct {
+	// lx:begin wlt body-health state
+	wltBodyProbe *wltBodyProbe
+	// lx:end wlt body-health state
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
 	pause                        pause.Manager
@@ -194,9 +317,15 @@ type URLTestGroup struct {
 	link                         string
 	interval                     time.Duration
 	tolerance                    uint16
+	preferFirstAvailable         bool
 	idleTimeout                  time.Duration
 	history                      adapter.URLTestHistoryStorage
 	checking                     atomic.Bool
+	interfaceUpdatePending       atomic.Bool
+	interfaceUpdateGeneration    atomic.Uint64
+	interfaceUpdateFollowupDelay time.Duration
+	selectionUpdateAccess        sync.Mutex
+	selectedAccess               sync.RWMutex
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -204,11 +333,12 @@ type URLTestGroup struct {
 	access                       sync.Mutex
 	ticker                       *time.Ticker
 	close                        chan struct{}
+	closeOnce                    sync.Once
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, preferFirstAvailable bool, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -237,9 +367,11 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		link:                         link,
 		interval:                     interval,
 		tolerance:                    tolerance,
+		preferFirstAvailable:         preferFirstAvailable,
 		idleTimeout:                  idleTimeout,
 		history:                      history,
 		close:                        make(chan struct{}),
+		interfaceUpdateFollowupDelay: urlTestInterfaceUpdateFollowupDelay,
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
@@ -255,11 +387,11 @@ func (g *URLTestGroup) PostStart() {
 }
 
 func (g *URLTestGroup) Touch() {
+	g.access.Lock()
+	defer g.access.Unlock()
 	if !g.started {
 		return
 	}
-	g.access.Lock()
-	defer g.access.Unlock()
 	if g.ticker != nil {
 		g.lastActive.Store(time.Now())
 		return
@@ -271,36 +403,70 @@ func (g *URLTestGroup) Touch() {
 }
 
 func (g *URLTestGroup) Close() error {
+	// lx:begin wlt body-health retirement
+	g.closeWLTBodyProbe()
+	// lx:end wlt body-health retirement
 	g.access.Lock()
 	defer g.access.Unlock()
-	if g.ticker == nil {
-		return nil
+	if g.ticker != nil {
+		g.ticker.Stop()
+		g.ticker = nil
+		g.pause.UnregisterCallback(g.pauseCallback)
+		g.pauseCallback = nil
 	}
-	g.ticker.Stop()
-	g.ticker = nil
-	g.pause.UnregisterCallback(g.pauseCallback)
-	g.pauseCallback = nil
-	close(g.close)
+	g.closeOnce.Do(func() { close(g.close) })
 	return nil
 }
 
-func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
-	var minDelay uint16
-	var minOutbound adapter.Outbound
+// selectedOutbounds returns a consistent interface snapshot. Interface values
+// have multiple words and must not race with background route publication.
+func (g *URLTestGroup) selectedOutbounds() (adapter.Outbound, adapter.Outbound) {
+	// lx:begin wlt body-health selection
+	if g.wltBodyProbe != nil {
+		tcp, _ := g.selectWLTBodyProbe(N.NetworkTCP, nil)
+		udp, _ := g.selectWLTBodyProbe(N.NetworkUDP, nil)
+		return tcp, udp
+	}
+	// lx:end wlt body-health selection
+	g.selectedAccess.RLock()
+	defer g.selectedAccess.RUnlock()
+	return g.selectedOutboundTCP, g.selectedOutboundUDP
+}
+
+func (g *URLTestGroup) selectedOutbound(network string) adapter.Outbound {
+	tcp, udp := g.selectedOutbounds()
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
-				minDelay = history.Delay
+		return tcp
+	case N.NetworkUDP:
+		return udp
+	default:
+		return nil
+	}
+}
+
+func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	// lx:begin wlt body-health selection
+	if g.wltBodyProbe != nil {
+		return g.selectWLTBodyProbe(network, nil)
+	}
+	// lx:end wlt body-health selection
+	if g.preferFirstAvailable {
+		for _, detour := range g.outbounds {
+			if !common.Contains(detour.Network(), network) {
+				continue
+			}
+			if g.history.LoadURLTestHistory(RealTag(detour)) != nil {
+				return detour, true
 			}
 		}
-	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
-				minDelay = history.Delay
-			}
+	}
+	var minDelay uint16
+	var minOutbound adapter.Outbound
+	if selected := g.selectedOutbound(network); selected != nil {
+		if history := g.history.LoadURLTestHistory(RealTag(selected)); history != nil {
+			minOutbound = selected
+			minDelay = history.Delay
 		}
 	}
 	for _, detour := range g.outbounds {
@@ -358,16 +524,98 @@ func (g *URLTestGroup) CheckOutbounds(force bool) {
 	_, _ = g.urlTest(g.ctx, force)
 }
 
+// InterfaceUpdated forces a fresh availability decision after the underlying
+// network changes. Child outbounds already reset their transports from the
+// same NetworkManager notification, but cached URL-test history is scoped to
+// the previous interface and otherwise keeps a stale ordinary/WLT choice until
+// the periodic interval expires. Coalesce callback bursts while guaranteeing
+// that an update arriving during an in-flight check receives a later check.
+func (g *URLTestGroup) InterfaceUpdated() {
+	g.interfaceUpdateGeneration.Add(1)
+	// lx:begin wlt body-health interface retirement
+	g.invalidateWLTBodyProbeInterface()
+	// lx:end wlt body-health interface retirement
+	if !g.interfaceUpdatePending.CompareAndSwap(false, true) {
+		return
+	}
+	go g.runInterfaceUpdateChecks()
+}
+
+func (g *URLTestGroup) runInterfaceUpdateChecks() {
+	for {
+		generation := g.interfaceUpdateGeneration.Load()
+		if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
+			g.interfaceUpdatePending.Store(false)
+			return
+		}
+		if !g.runInterfaceUpdateCheck() {
+			g.interfaceUpdatePending.Store(false)
+			return
+		}
+		// Child transports receive the same interface notification and can take
+		// several seconds to rebuild. The immediate check preserves a fast
+		// already-usable ordinary path; this mandatory settled check prevents a
+		// transient WLT restart from being cached until the periodic interval.
+		if !g.waitInterfaceUpdateDelay(g.interfaceUpdateFollowupDelay) ||
+			!g.runInterfaceUpdateCheck() {
+			g.interfaceUpdatePending.Store(false)
+			return
+		}
+		if g.interfaceUpdateGeneration.Load() == generation {
+			g.interfaceUpdatePending.Store(false)
+			if g.interfaceUpdateGeneration.Load() == generation ||
+				!g.interfaceUpdatePending.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}
+}
+
+func (g *URLTestGroup) runInterfaceUpdateCheck() bool {
+	for {
+		_, _, started := g.tryURLTest(g.ctx, true)
+		if started {
+			return true
+		}
+		if !g.waitInterfaceUpdateDelay(urlTestInterfaceUpdateDebounce) {
+			return false
+		}
+	}
+}
+
+func (g *URLTestGroup) waitInterfaceUpdateDelay(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-g.ctx.Done():
+		return false
+	case <-g.close:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return g.urlTest(ctx, false)
 }
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+	result, err, _ := g.tryURLTest(ctx, force)
+	return result, err
+}
+
+func (g *URLTestGroup) tryURLTest(ctx context.Context, force bool) (map[string]uint16, error, bool) {
 	result := make(map[string]uint16)
-	if g.checking.Swap(true) {
-		return result, nil
+	if !g.checking.CompareAndSwap(false, true) {
+		return result, nil, false
 	}
 	defer g.checking.Store(false)
+	// lx:begin wlt body-health execution
+	if g.wltBodyProbe != nil {
+		return g.tryWLTBodyProbe(ctx, force)
+	}
+	// lx:end wlt body-health execution
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
@@ -408,24 +656,43 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	}
 	b.Wait()
 	g.performUpdateCheck()
-	return result, nil
+	return result, nil, true
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
+	// Serialize publishers while keeping outbound/history callbacks outside the
+	// snapshot lock. Readers may keep using the prior complete selection.
+	g.selectionUpdateAccess.Lock()
+	tcp, tcpExists := g.Select(N.NetworkTCP)
+	udp, udpExists := g.Select(N.NetworkUDP)
 	var updated bool
-	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
-		if g.selectedOutboundTCP != nil {
-			updated = true
-		}
-		g.selectedOutboundTCP = outbound
+	g.selectedAccess.Lock()
+	if tcp != nil && (g.selectedOutboundTCP == nil || (tcpExists && tcp != g.selectedOutboundTCP)) {
+		updated = g.selectedOutboundTCP != nil
+		g.selectedOutboundTCP = tcp
 	}
-	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
-		if g.selectedOutboundUDP != nil {
-			updated = true
-		}
-		g.selectedOutboundUDP = outbound
+	if udp != nil && (g.selectedOutboundUDP == nil || (udpExists && udp != g.selectedOutboundUDP)) {
+		updated = updated || g.selectedOutboundUDP != nil
+		g.selectedOutboundUDP = udp
 	}
+	g.selectedAccess.Unlock()
+	g.selectionUpdateAccess.Unlock()
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}
+}
+
+func (g *URLTestGroup) invalidateAndSelectAlternative(network string, unavailable adapter.Outbound) adapter.Outbound {
+	// lx:begin wlt body-health invalidation
+	if g.wltBodyProbe != nil {
+		return g.alternativeWLTBodyProbe(network, unavailable)
+	}
+	// lx:end wlt body-health invalidation
+	g.history.DeleteURLTestHistory(RealTag(unavailable))
+	g.performUpdateCheck()
+	selected := g.selectedOutbound(network)
+	if selected == unavailable {
+		return nil
+	}
+	return selected
 }

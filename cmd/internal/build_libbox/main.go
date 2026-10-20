@@ -104,6 +104,30 @@ func filterTags(tags []string, exclude ...string) []string {
 	return result
 }
 
+// 2b2n:begin wlt
+func appendExtraTags(tags []string) []string {
+	extraTags := strings.FieldsFunc(os.Getenv("SING_BOX_EXTRA_TAGS"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	if len(extraTags) == 0 {
+		return tags
+	}
+	seen := make(map[string]bool, len(tags)+len(extraTags))
+	for _, tag := range tags {
+		seen[tag] = true
+	}
+	for _, tag := range extraTags {
+		if tag == "" || seen[tag] {
+			continue
+		}
+		tags = append(tags, tag)
+		seen[tag] = true
+	}
+	return tags
+}
+
+// 2b2n:end wlt
+
 func checkJavaVersion() {
 	var javaPath string
 	javaHome := os.Getenv("JAVA_HOME")
@@ -179,6 +203,9 @@ func buildAndroid() {
 	// Build main variant (SDK 23)
 	mainTags := append([]string{}, sharedTags...)
 	// mainTags = append(mainTags, memcTags...)
+	// 2b2n:begin wlt
+	mainTags = appendExtraTags(mainTags)
+	// 2b2n:end wlt
 	if debugEnabled {
 		mainTags = append(mainTags, debugTags...)
 	}
@@ -191,6 +218,9 @@ func buildAndroid() {
 	// Build legacy variant (SDK 21, no naive outbound)
 	legacyTags := filterTags(sharedTags, "with_naive_outbound")
 	// legacyTags = append(legacyTags, memcTags...)
+	// 2b2n:begin wlt
+	legacyTags = appendExtraTags(legacyTags)
+	// 2b2n:end wlt
 	if debugEnabled {
 		legacyTags = append(legacyTags, debugTags...)
 	}
@@ -218,6 +248,13 @@ func buildApple() {
 		"-libname=box",
 		"-tags-not-macos=with_low_memory",
 	}
+	bindOutput := os.Getenv("SING_BOX_APPLE_BIND_OUTPUT")
+	if bindOutput != "" {
+		if !filepath.IsAbs(bindOutput) || !strings.HasSuffix(bindOutput, ".xcframework") {
+			log.Fatal("SING_BOX_APPLE_BIND_OUTPUT must be an absolute .xcframework path")
+		}
+		args = append(args, "-o", bindOutput)
+	}
 	//if !withTailscale {
 	//	args = append(args, "-tags-macos="+strings.Join(memcTags, ","))
 	//}
@@ -228,10 +265,14 @@ func buildApple() {
 		args = append(args, debugFlags...)
 	}
 
-	tags := append(sharedTags, darwinTags...)
+	tags := append([]string{}, sharedTags...)
+	tags = append(tags, darwinTags...)
 	//if withTailscale {
 	//	tags = append(tags, memcTags...)
 	//}
+	// 2b2n:begin wlt
+	tags = appendExtraTags(tags)
+	// 2b2n:end wlt
 	if debugEnabled {
 		tags = append(tags, debugTags...)
 	}
@@ -245,6 +286,10 @@ func buildApple() {
 	err := command.Run()
 	if err != nil {
 		log.Fatal(err)
+	}
+	if bindOutput != "" {
+		log.Info("built at ", bindOutput)
+		return
 	}
 
 	copyPath := filepath.Join("..", "sing-box-for-apple")

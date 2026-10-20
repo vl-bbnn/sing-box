@@ -116,16 +116,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			cacheContext.Close()
 		}
 		r.network.Initialize(r.ruleSets)
-		needFindProcess := r.needFindProcess
-		for _, ruleSet := range r.ruleSets {
-			metadata := ruleSet.Metadata()
-			if metadata.ContainsProcessRule {
-				needFindProcess = true
-			}
-		}
-		if C.IsAndroid && r.platformInterface != nil {
-			needFindProcess = true
-		}
+		needFindProcess := processLookupRequired(r.needFindProcess, r.ruleSets)
 		r.needFindProcess = needFindProcess
 		if needFindProcess {
 			if r.platformInterface != nil && r.platformInterface.UsePlatformConnectionOwnerFinder() {
@@ -177,6 +168,18 @@ func (r *Router) Start(stage adapter.StartStage) error {
 		runtime.GC()
 	}
 	return nil
+}
+
+func processLookupRequired(configured bool, ruleSets []adapter.RuleSet) bool {
+	if configured {
+		return true
+	}
+	for _, ruleSet := range ruleSets {
+		if ruleSet.Metadata().ContainsProcessRule {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Router) Close() error {

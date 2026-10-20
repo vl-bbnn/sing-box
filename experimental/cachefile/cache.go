@@ -38,21 +38,20 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx               context.Context
-	path              string
-	cacheID           []byte
-	storeFakeIP       bool
-	storeRDRC         bool
-	rdrcTimeout       time.Duration
-	DB                *bbolt.DB
-	resetAccess       sync.Mutex
-	saveMetadataTimer *time.Timer
-	saveFakeIPAccess  sync.RWMutex
-	saveDomain        map[netip.Addr]string
-	saveAddress4      map[string]netip.Addr
-	saveAddress6      map[string]netip.Addr
-	saveRDRCAccess    sync.RWMutex
-	saveRDRC          map[saveRDRCCacheKey]bool
+	ctx              context.Context
+	path             string
+	cacheID          []byte
+	storeFakeIP      bool
+	storeRDRC        bool
+	rdrcTimeout      time.Duration
+	DB               *bbolt.DB
+	resetAccess      sync.Mutex
+	saveFakeIPAccess sync.RWMutex
+	saveDomain       map[netip.Addr]string
+	saveAddress4     map[string]netip.Addr
+	saveAddress6     map[string]netip.Addr
+	saveRDRCAccess   sync.RWMutex
+	saveRDRC         map[saveRDRCCacheKey]bool
 }
 
 type saveRDRCCacheKey struct {
