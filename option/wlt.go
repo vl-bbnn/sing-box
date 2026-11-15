@@ -54,6 +54,7 @@ type WLTServiceOptions struct {
 	TinyMuxPingTimeout           badoption.Duration `json:"tiny_mux_ping_timeout,omitempty"`
 	PeerIncomingBuffer           int                `json:"peer_incoming_buffer,omitempty"`
 	PeerWriteBuffer              int                `json:"peer_write_buffer,omitempty"`
+	RedundantControl             bool               `json:"redundant_control,omitempty"`
 	AdaptivePeerData             bool               `json:"adaptive_peer_data,omitempty"`
 	AdaptivePeerThresholdBytes   int                `json:"adaptive_peer_threshold_bytes_per_second,omitempty"`
 	AdaptivePeerIdleTimeout      badoption.Duration `json:"adaptive_peer_idle_timeout,omitempty"`
