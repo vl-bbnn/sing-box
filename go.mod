@@ -205,6 +205,13 @@ replace github.com/sagernet/wireguard-go => ./submodules/wireguard-go
 // WLT carrier v0.1.17 needs the public UDPSession.WaitSnd API for exact
 // acknowledgement-based KCP draining. Dependency replace directives are not
 // inherited, so the executable module pins the matching fork explicitly.
-replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.72-wlt.1
+replace github.com/xtaci/kcp-go/v5 => github.com/vl-bbnn/kcp-go/v5 v5.6.73-0.20261005034544-15b1b571ae61
+
+replace github.com/vl-bbnn/wlt-carrier => ../wlt-carrier
+
+replace github.com/sagernet/sing-mux => ../sing-mux
 
 // lx:end awg
+
+// Keep distinct TCP destinations isolated when Android reuses a source port.
+replace github.com/sagernet/sing-tun => github.com/vl-bbnn/sing-tun v0.8.11-0.20260921032538-bb42cd2dd10e
