@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 	carrierconfig "github.com/vl-bbnn/wlt-carrier/pkg/config"
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
@@ -530,92 +531,160 @@ func recoverCarrierAuthQuarantine(cfg *carrierconfig.ClientConfig, options Carri
 	return nil
 }
 
-func replenishCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) error {
+// validateCarrierAuthReserveCandidate proves a relay connection using this
+// identity. Stopping the validation connection can end its signaling session;
+// this proves identity recovery, not that an idle signaling socket stays live.
+func validateCarrierAuthReserveCandidate(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, raw []byte, logf func(string, ...any)) ([]byte, error) {
+	if err := carrierengine.ImportAuthSnapshotJSON(raw); err != nil {
+		return nil, fmt.Errorf("import reserve identity: %w", err)
+	}
+	client, err := connectCarrierClientForStart(ctx, cfg, options.ConnectTimeout, logf)
+	if err != nil && (errors.Is(err, carriercommon.ErrSignalingSessionEnded) || errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired)) {
+		if options.startup != nil && options.startup.providerRateLimited() {
+			return nil, err
+		}
+		if refreshErr := refreshExistingCarrierAuthCandidate(ctx, cfg, raw, "reserve_validation", logf); refreshErr != nil {
+			return nil, refreshErr
+		}
+		client, err = connectCarrierClientForStart(ctx, cfg, options.ConnectTimeout, logf)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("validate reserve carrier: %w", err)
+	}
+	defer func() {
+		if ctx.Err() != nil {
+			_ = client.Abort()
+		} else {
+			_ = client.Stop()
+		}
+	}()
+	if err := promoteCarrierAuthSnapshot(*cfg); err != nil {
+		return nil, fmt.Errorf("promote reserve identity: %w", err)
+	}
+	return carrierengine.ExportAuthSnapshotJSON(*cfg)
+}
+
+func replenishCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) (ready bool, resultErr error) {
 	if cfg == nil || carrierAuthSnapshotPath(options) == "" {
-		return nil
+		return false, nil
 	}
-	independent, err := carrierAuthReserveIndependent(cfg, options)
-	if err == nil && independent {
-		if err := retireCarrierAuthQuarantine(options); err != nil {
-			return err
-		}
-		if logf != nil {
-			logf("WLT carrier auth ring event=reserve_ready")
-		}
-		return nil
-	}
-	if err := recoverCarrierAuthQuarantine(cfg, options, logf); err != nil {
-		return fmt.Errorf("recover auth ring quarantine: %w", err)
-	}
-	if options.startup != nil && options.startup.providerRateLimited() {
-		if logf != nil {
-			logf("WLT carrier auth ring event=replenish_deferred reason=provider_rate_limited")
-		}
-		return nil
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
 	active, err := os.ReadFile(carrierAuthSnapshotPath(options))
 	if err != nil {
-		return fmt.Errorf("read active auth snapshot: %w", err)
+		return false, fmt.Errorf("read active auth snapshot: %w", err)
 	}
-	if logf != nil {
-		logf("WLT carrier auth ring event=replenish_started")
-	}
-	fresh, err := prewarmFreshCarrierAuthSnapshot(ctx, *cfg)
+	serialized, err := carrierengine.AuthSnapshotRequiresSerializedRecovery(*cfg, active)
 	if err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		if isProviderRateLimitError(err) {
-			recordProviderRateLimit(options, logf)
-		}
-		return fmt.Errorf("create reserve auth identity: %w", err)
+		return false, fmt.Errorf("inspect reserve concurrency policy: %w", err)
 	}
-	independent, err = carrierAuthSnapshotsIndependent(*cfg, active, fresh)
-	if err != nil || !independent {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
+	if serialized {
+		// A bearer reserve is a saved fallback, not a concurrently usable
+		// identity. Even prewarm may join the call and evict the active client.
+		// Recovery validates it only after the old carrier has stopped.
+		if logf != nil {
+			logf("WLT carrier auth ring event=replenish_deferred reason=serialized_bearer_identity")
+		}
+		return false, nil
+	}
+	independent, err := carrierAuthReserveIndependent(cfg, options)
+	if err != nil {
+		return false, fmt.Errorf("inspect reserve identity: %w", err)
+	}
+	// Restore active after the validation client is fully stopped, on all exits.
+	defer func() {
+		if err := carrierengine.ImportAuthSnapshotJSON(active); err != nil {
+			ready = false
+			resultErr = errors.Join(resultErr, fmt.Errorf("restore active auth identity: %w", err))
+		}
+	}()
+	var validated []byte
+	if independent {
+		raw, err := os.ReadFile(carrierAuthReservePath(options))
 		if err != nil {
-			return errors.New("validate reserve auth identity failed")
+			return false, err
 		}
-		return errors.New("reserve auth identity is not independent")
+		validated, err = validateCarrierAuthReserveCandidate(ctx, cfg, options, raw, logf)
+		if err != nil {
+			if isProviderRateLimitError(err) {
+				recordProviderRateLimit(options, logf)
+			}
+			// Expiry, closed signaling, and transport failure do not prove
+			// identity revocation. Preserve the reserve for later retry.
+			if !errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+				return false, err
+			}
+		}
 	}
-	if err := carrierengine.ImportAuthSnapshotJSON(fresh); err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		return fmt.Errorf("import reserve auth identity: %w", err)
+	if validated == nil {
+		if options.startup != nil && options.startup.providerRateLimited() {
+			if logf != nil {
+				logf("WLT carrier auth ring event=replenish_deferred reason=provider_rate_limited")
+			}
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if err := recoverCarrierAuthQuarantine(cfg, options, logf); err != nil {
+			return false, fmt.Errorf("recover auth ring quarantine: %w", err)
+		}
+		if err := carrierengine.ImportAuthSnapshotJSON(active); err != nil {
+			return false, err
+		}
+		if logf != nil {
+			logf("WLT carrier auth ring event=replenish_started")
+		}
+		fresh, err := prewarmFreshCarrierAuthSnapshot(ctx, *cfg)
+		if err != nil {
+			if isProviderRateLimitError(err) {
+				recordProviderRateLimit(options, logf)
+			}
+			return false, fmt.Errorf("create reserve auth identity: %w", err)
+		}
+		independent, err = carrierAuthSnapshotsIndependent(*cfg, active, fresh)
+		if err != nil || !independent {
+			return false, errors.New("fresh reserve identity is not independently verified")
+		}
+		validated, err = validateCarrierAuthReserveCandidate(ctx, cfg, options, fresh, logf)
+		if err != nil {
+			if isProviderRateLimitError(err) {
+				recordProviderRateLimit(options, logf)
+			}
+			return false, err
+		}
 	}
-	validationClient, err := connectCarrierClientForStart(ctx, cfg, options.ConnectTimeout, logf)
-	if err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		return fmt.Errorf("validate reserve carrier: %w", err)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
-	defer validationClient.Stop()
-	if err := promoteCarrierAuthSnapshot(*cfg); err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		return fmt.Errorf("promote reserve auth identity: %w", err)
-	}
-	validated, err := carrierengine.ExportAuthSnapshotJSON(*cfg)
-	if err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		return fmt.Errorf("export reserve auth identity: %w", err)
-	}
-	if err := writeCarrierAuthReserve(options, validated); err != nil {
-		_ = carrierengine.ImportAuthSnapshotJSON(active)
-		return err
+	independent, err = carrierAuthSnapshotsIndependent(*cfg, active, validated)
+	if err != nil || !independent {
+		return false, errors.New("validated reserve identity is not independent")
 	}
 	if err := carrierengine.ImportAuthSnapshotJSON(active); err != nil {
-		return fmt.Errorf("restore active auth identity: %w", err)
+		return false, fmt.Errorf("restore active before reserve promotion: %w", err)
+	}
+	if err := writeCarrierAuthReserve(options, validated); err != nil {
+		return false, err
 	}
 	if err := retireCarrierAuthQuarantine(options); err != nil {
-		return err
+		return false, err
 	}
 	if logf != nil {
-		logf("WLT carrier auth ring event=reserve_validated")
+		logf("WLT carrier auth ring event=reserve_validated scope=identity_recovery")
 	}
-	return nil
+	return true, nil
 }
 
-func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) {
+func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, logf func(string, ...any)) <-chan struct{} {
+	done := make(chan struct{})
 	if cfg == nil || options.startup == nil || carrierAuthSnapshotPath(options) == "" {
-		return
+		close(done)
+		return done
 	}
 	go func() {
+		defer close(done)
 		timer := time.NewTimer(authReserveReadyWait)
 		defer timer.Stop()
 		select {
@@ -630,15 +699,10 @@ func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientCo
 		}
 		retryDelay := authReserveRetryInitial
 		for {
-			err := replenishCarrierAuthReserve(ctx, cfg, options, logf)
-			if err == nil {
-				ready, readyErr := carrierAuthReserveIndependent(cfg, options)
-				if readyErr == nil && ready {
-					return
-				}
-				if readyErr != nil {
-					err = readyErr
-				}
+			ready, err := replenishCarrierAuthReserve(ctx, cfg, options, logf)
+			if ready && err == nil {
+				// Recheck during long sessions as well as on service restart.
+				retryDelay = authReserveRetryInitial
 			}
 			if err != nil && logf != nil {
 				// The active carrier remains authoritative. Reserve replenishment is
@@ -651,7 +715,7 @@ func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientCo
 				wait = remaining
 			}
 			if logf != nil {
-				logf("WLT carrier auth ring event=replenish_deferred retry_seconds=%d", int64(wait/time.Second))
+				logf("WLT carrier auth ring event=replenish_deferred retry_seconds=%d validated=%t", int64(wait/time.Second), ready)
 			}
 			timer := time.NewTimer(wait)
 			select {
@@ -662,7 +726,7 @@ func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientCo
 				}
 				return
 			}
-			if retryDelay < authReserveRetryMaximum {
+			if !ready && retryDelay < authReserveRetryMaximum {
 				retryDelay *= 2
 				if retryDelay > authReserveRetryMaximum {
 					retryDelay = authReserveRetryMaximum
@@ -670,4 +734,5 @@ func scheduleCarrierAuthReserve(ctx context.Context, cfg *carrierconfig.ClientCo
 			}
 		}
 	}()
+	return done
 }

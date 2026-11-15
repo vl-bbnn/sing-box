@@ -27,6 +27,10 @@ import (
 	carrierengine "github.com/vl-bbnn/wlt-carrier/pkg/engine"
 )
 
+type TrafficReadyProvider interface {
+	WaitWltTrafficReady(ctx context.Context, timeoutMillis int64) error
+}
+
 type logfSlogHandler struct {
 	logf     func(string, ...any)
 	observer func(slog.Record)
@@ -149,7 +153,7 @@ type providerCooldownState struct {
 
 var (
 	refreshCarrierAuthSnapshot          = carrierengine.RefreshAuthSnapshotContext
-	refreshExistingCarrierAuthSnapshot  = carrierengine.RefreshExistingAuthSnapshotContext
+	refreshExistingCarrierAuthSnapshot  = carrierengine.RefreshExistingAuthSnapshotContextObserved
 	prewarmCarrierAuthSnapshot          = carrierengine.PrewarmAuthUnattended
 	prewarmFreshCarrierAuthSnapshot     = carrierengine.PrewarmFreshAuthUnattendedContext
 	promoteCarrierAuthSnapshot          = carrierengine.PromoteAuthSnapshot
@@ -192,6 +196,7 @@ type CarrierOptions struct {
 	TinyMuxPingTimeout           time.Duration
 	PeerIncomingBuffer           int
 	PeerWriteBuffer              int
+	RedundantControl             bool
 	AdaptivePeerData             bool
 	AdaptivePeerThresholdBytes   int
 	AdaptivePeerIdleTimeout      time.Duration
@@ -427,6 +432,8 @@ type CarrierStats struct {
 type Carrier struct {
 	client               *carrierengine.Client
 	cancel               context.CancelFunc
+	done                 chan struct{}
+	authReserveDone      <-chan struct{}
 	restoreSocketControl func()
 
 	dialRoute func(context.Context, string) (net.Conn, error)
@@ -445,35 +452,70 @@ type Carrier struct {
 	pendingSlots        chan struct{}
 	routeByClass        map[string]string
 
-	activeStreams        atomic.Int64
-	peakActiveStreams    atomic.Int64
-	pendingDials         atomic.Int64
-	peakPendingDials     atomic.Int64
-	openAttempts         atomic.Int64
-	dnsOpenRequests      atomic.Int64
-	dnsOpenQueued        atomic.Int64
-	dnsOpenRejected      atomic.Int64
-	openedStreams        atomic.Int64
-	closedStreams        atomic.Int64
-	queuedDials          atomic.Int64
-	rejectedStreams      atomic.Int64
-	rejectedQueue        atomic.Int64
-	rejectedActive       atomic.Int64
-	rejectedOpen         atomic.Int64
-	failedStreams        atomic.Int64
-	lastActiveWait       atomic.Int64
-	maxActiveWait        atomic.Int64
-	lastOpenWait         atomic.Int64
-	maxOpenWait          atomic.Int64
-	lastDialDuration     atomic.Int64
-	maxDialDuration      atomic.Int64
-	reconnectRetries     atomic.Int64
-	reconnectWait        atomic.Int64
-	closeOnce            sync.Once
-	closeErr             error
-	streamsMu            sync.Mutex
-	streams              map[*carrierConn]struct{}
-	pressureIdleReclaims atomic.Int64
+	activeStreams             atomic.Int64
+	peakActiveStreams         atomic.Int64
+	pendingDials              atomic.Int64
+	peakPendingDials          atomic.Int64
+	openAttempts              atomic.Int64
+	dnsOpenRequests           atomic.Int64
+	dnsOpenQueued             atomic.Int64
+	dnsOpenRejected           atomic.Int64
+	openedStreams             atomic.Int64
+	closedStreams             atomic.Int64
+	queuedDials               atomic.Int64
+	rejectedStreams           atomic.Int64
+	rejectedQueue             atomic.Int64
+	rejectedActive            atomic.Int64
+	rejectedOpen              atomic.Int64
+	failedStreams             atomic.Int64
+	lastActiveWait            atomic.Int64
+	maxActiveWait             atomic.Int64
+	lastOpenWait              atomic.Int64
+	maxOpenWait               atomic.Int64
+	lastDialDuration          atomic.Int64
+	maxDialDuration           atomic.Int64
+	reconnectRetries          atomic.Int64
+	reconnectWait             atomic.Int64
+	closeOnce                 sync.Once
+	closeErr                  error
+	streamsMu                 sync.Mutex
+	streams                   map[*carrierConn]struct{}
+	idleWatchOnce             sync.Once
+	idleWake                  chan struct{}
+	pressureIdleReclaims      atomic.Int64
+	admissionDiagnosticEvents atomic.Uint64
+}
+
+// WaitTrafficReady blocks until this carrier generation has received an
+// end-to-end response, or ctx is cancelled.
+func (c *Carrier) WaitTrafficReady(ctx context.Context) error {
+	if c == nil || c.startup == nil || c.startup.trafficReadySignal == nil {
+		return os.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-c.done:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.startup.trafficReadySignal:
+		select {
+		case <-c.done:
+			return net.ErrClosed
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	case <-c.done:
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error) {
@@ -580,7 +622,11 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 	allowProviderRecovery := carrierAuthRecoveryRequired(err)
 	localTransportRecovery := false
-	if err != nil && !allowProviderRecovery && runCtx.Err() == nil {
+	if errors.Is(err, carriercommon.ErrSignalingSessionEnded) && runCtx.Err() == nil {
+		// Only the call session ended. Keep the durable identity eligible for
+		// existing-only renewal even when there is no independent reserve.
+		localTransportRecovery = true
+	} else if err != nil && !allowProviderRecovery && runCtx.Err() == nil {
 		reserveIndependent, reserveErr := carrierAuthReserveIndependent(cfg, options)
 		if reserveErr != nil {
 			if logf != nil {
@@ -658,6 +704,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	carrier := &Carrier{
 		client:               runtimeClient,
 		cancel:               cancel,
+		done:                 make(chan struct{}),
 		restoreSocketControl: restoreSocketControl,
 		dialRoute:            runtimeClient.DialRouteContext,
 		waitReady:            runtimeClient.WaitReady,
@@ -677,6 +724,7 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	if options.DNSOpenReserve > 0 {
 		carrier.openGate = newPrioritySlotGate(options.MaxOpenAttempts, options.DNSOpenReserve)
 	}
+	carrier.authReserveDone = scheduleCarrierAuthReserve(runCtx, cfg, options, logf)
 	go func() {
 		<-runCtx.Done()
 		_ = carrier.Close()
@@ -709,7 +757,6 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		transportOptions.RelayBandwidthBytesPerSecond,
 	)
 	startup.markCarrierReady()
-	scheduleCarrierAuthReserve(runCtx, cfg, options, logf)
 	return carrier, nil
 }
 
@@ -823,7 +870,8 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 
 func isFatalCarrierConnectError(err error) bool {
 	return errors.Is(err, carriercommon.ErrManualCaptchaUnavailable) ||
-		errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired)
+		errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) ||
+		errors.Is(err, carriercommon.ErrSignalingSessionEnded)
 }
 
 func isProviderRateLimitError(err error) bool {
@@ -837,7 +885,9 @@ func refreshExistingCarrierAuthCandidate(ctx context.Context, cfg *carrierconfig
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
 	defer cancel()
-	refreshed, err := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+	refreshed, err := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw, func(event, category string) {
+		logCarrierAuthRefreshLifecycle(logf, event, category)
+	})
 	if err != nil {
 		if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) && logf != nil {
 			logf("WLT carrier auth event=reauthorization_required source=%s", source)
@@ -899,7 +949,36 @@ func refreshCarrierAuthSnapshotAfterRejection(ctx context.Context, cfg *carrierc
 
 func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.ClientConfig, options CarrierOptions, initialErr error, rejectedIdentity []byte, allowProviderRecovery bool, logf func(string, ...any)) (*carrierengine.Client, error) {
 	combinedErr := initialErr
+	// A generic startup timeout may deliberately enter local-only recovery so a
+	// restricted underlay never causes provider work before the tunnel exists.
+	// An explicit TURN/signaling auth rejection is stronger evidence: it proves
+	// the saved identity cannot establish the relay, so local-only mode must be
+	// promoted before the local ring is exhausted. Without this transition a
+	// stale first signaling session permanently suppressed fresh recovery even
+	// after the reserve returned TURN 401.
+	providerRecoveryEligible := allowProviderRecovery
 	var refreshedIdentities [][]byte
+	type sessionRenewal struct {
+		source string
+		raw    []byte
+	}
+	var endedSessions []sessionRenewal
+	if errors.Is(initialErr, carriercommon.ErrSignalingSessionEnded) {
+		// Capture the active identity before importing any alternate snapshot.
+		if raw, readErr := currentCarrierAuthIdentity(cfg, options); readErr == nil {
+			endedSessions = append(endedSessions, sessionRenewal{"current", raw})
+		} else {
+			combinedErr = errors.Join(combinedErr, readErr)
+		}
+	}
+	promoteProviderRecovery := func(source string, err error) {
+		if errors.Is(err, carriercommon.ErrAuthSnapshotReauthorizationRequired) && !providerRecoveryEligible {
+			providerRecoveryEligible = true
+			if logf != nil {
+				logf("WLT carrier auth event=provider_recovery_promoted source=%s reason=explicit_auth_rejection", source)
+			}
+		}
+	}
 	connectCandidate := func(source string) (*carrierengine.Client, error) {
 		if logf != nil {
 			logf("WLT carrier auth event=fallback_started source=%s", source)
@@ -912,18 +991,16 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 			}
 			return client, nil
 		}
+		promoteProviderRecovery(source, err)
 		combinedErr = errors.Join(combinedErr, fmt.Errorf("connect %s auth snapshot: %w", source, err))
 		if logf != nil {
 			logf("WLT carrier auth event=fallback_failed source=%s error=%v", source, err)
 		}
 		return nil, err
 	}
-	tryLocalCandidate := func(source string, raw []byte) (*carrierengine.Client, bool) {
-		client, connectErr := connectCandidate(source)
-		if connectErr == nil {
-			return client, true
-		}
-		if !allowProviderRecovery || !errors.Is(connectErr, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+	refreshCandidate := func(source string, raw []byte) (*carrierengine.Client, bool) {
+		if ctx.Err() != nil {
+			combinedErr = errors.Join(combinedErr, ctx.Err())
 			return nil, false
 		}
 		if options.startup.providerRateLimited() {
@@ -951,6 +1028,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		refreshedIdentities = append(refreshedIdentities, append([]byte(nil), raw...))
 		if refreshErr := refreshExistingCarrierAuthCandidate(ctx, cfg, raw, source, logf); refreshErr != nil {
 			combinedErr = errors.Join(combinedErr, refreshErr)
+			promoteProviderRecovery(source+"_existing_refresh", refreshErr)
 			if isProviderRateLimitError(refreshErr) {
 				recordProviderRateLimit(options, logf)
 			}
@@ -960,8 +1038,24 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 			return nil, false
 		}
 		refreshedSource := source + "_refreshed"
-		client, connectErr = connectCandidate(refreshedSource)
+		client, connectErr := connectCandidate(refreshedSource)
 		return client, connectErr == nil
+	}
+	tryLocalCandidate := func(source string, raw []byte) (*carrierengine.Client, bool) {
+		client, connectErr := connectCandidate(source)
+		if connectErr == nil {
+			return client, true
+		}
+		if errors.Is(connectErr, carriercommon.ErrSignalingSessionEnded) {
+			// Try every saved lane before contacting the provider to renew a
+			// closed session. A working reserve keeps offline startup possible.
+			endedSessions = append(endedSessions, sessionRenewal{source, raw})
+			return nil, false
+		}
+		if errors.Is(connectErr, carriercommon.ErrAuthSnapshotReauthorizationRequired) {
+			return refreshCandidate(source, raw)
+		}
+		return nil, false
 	}
 
 	// Exhaust every persisted local lane before making another provider auth
@@ -1012,7 +1106,13 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		}
 	}
 
-	if !allowProviderRecovery {
+	for _, candidate := range endedSessions {
+		if client, ok := refreshCandidate(candidate.source, candidate.raw); ok {
+			return client, nil
+		}
+	}
+
+	if !providerRecoveryEligible {
 		if logf != nil {
 			logf("WLT carrier auth event=provider_fallback_skipped reason=local_only")
 		}
@@ -1035,7 +1135,7 @@ func recoverCarrierAuthAfterRejection(ctx context.Context, cfg *carrierconfig.Cl
 		return client, nil
 	}
 
-	// Explicit TURN/signaling rejection invalidates the provider cache in the
+	// Explicit authentication rejection invalidates the provider cache in the
 	// carrier module. Only after all local last-known-good candidates failed do
 	// we permit one full client-local authorization/challenge attempt. PrewarmAuth
 	// has its own bounded provider authorization deadline and does not contact the
@@ -1207,7 +1307,9 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 			logf("WLT carrier auth event=refresh_started source=%s remaining_ttl_seconds=%d", source, int64(remaining/time.Second))
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, defaultAuthSnapshotRefreshTimeout)
-		refreshed, refreshErr := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw)
+		refreshed, refreshErr := refreshExistingCarrierAuthSnapshot(refreshCtx, *cfg, raw, func(event, category string) {
+			logCarrierAuthRefreshLifecycle(logf, event, category)
+		})
 		cancel()
 		if refreshErr != nil {
 			if isProviderRateLimitError(refreshErr) {
@@ -1239,6 +1341,29 @@ func prepareCarrierAuthSnapshot(ctx context.Context, cfg *carrierconfig.ClientCo
 		}
 	}
 	return reportPreparedCarrierAuthSnapshot(raw, source, logf)
+}
+
+func logCarrierAuthRefreshLifecycle(logf func(string, ...any), event, category string) {
+	if logf == nil {
+		return
+	}
+	switch event {
+	case "saved_call_session_accepted", "saved_call_session_rejected",
+		"calls_session_replacement_started", "calls_session_replacement_ready",
+		"calls_session_replacement_rejected", "replacement_call_session_join_succeeded",
+		"replacement_call_session_rejected", "identity_renewal_not_entered",
+		"existing_identity_renewal_started":
+	default:
+		event = "unclassified"
+	}
+	switch category {
+	case "none", "authentication_required", "access_denied", "anonymous_identity_rejected",
+		"challenge_required", "conversation_unavailable", "rate_limited", "request_invalid",
+		"rejected", "temporary_failure":
+	default:
+		category = "unclassified"
+	}
+	logf("WLT carrier auth refresh lifecycle event=%s category=%s", event, category)
 }
 
 func reportPreparedCarrierAuthSnapshot(raw []byte, source string, logf func(string, ...any)) error {
@@ -1536,21 +1661,6 @@ func (c *Carrier) DialStream(ctx context.Context, routeClass string, target stri
 		c.failedStreams.Add(1)
 		return nil, err
 	}
-	activeWaitStartedAt := time.Now()
-	releaseActive, err := c.acquireActiveSlot(ctx, routeClass, target)
-	c.recordDuration(&c.lastActiveWait, &c.maxActiveWait, time.Since(activeWaitStartedAt))
-	if err != nil {
-		return nil, err
-	}
-	openWaitStartedAt := time.Now()
-	releaseOpen, err := c.acquireOpenSlot(ctx, routeClass, target)
-	c.recordDuration(&c.lastOpenWait, &c.maxOpenWait, time.Since(openWaitStartedAt))
-	if err != nil {
-		releaseActive()
-		return nil, err
-	}
-	defer releaseOpen()
-
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if _, ok := dialCtx.Deadline(); !ok && c.connectTimeout > 0 {
@@ -1559,6 +1669,28 @@ func (c *Carrier) DialStream(ctx context.Context, routeClass string, target stri
 		dialCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
+	// Wait for the current carrier generation to prove its bidirectional
+	// control path before consuming admission slots or sending a route OPEN.
+	// The same connect budget covers readiness and the later route open.
+	if c.waitReady != nil {
+		if err := c.waitReady(dialCtx); err != nil {
+			return nil, err
+		}
+	}
+	activeWaitStartedAt := time.Now()
+	releaseActive, err := c.acquireActiveSlot(dialCtx, routeClass, target)
+	c.recordDuration(&c.lastActiveWait, &c.maxActiveWait, time.Since(activeWaitStartedAt))
+	if err != nil {
+		return nil, err
+	}
+	openWaitStartedAt := time.Now()
+	releaseOpen, err := c.acquireOpenSlot(dialCtx, routeClass, target)
+	c.recordDuration(&c.lastOpenWait, &c.maxOpenWait, time.Since(openWaitStartedAt))
+	if err != nil {
+		releaseActive()
+		return nil, err
+	}
+	defer releaseOpen()
 
 	dialStartedAt := time.Now()
 	var (
@@ -1640,9 +1772,12 @@ reconnectLoop:
 		releaseActive: releaseActive,
 		idleTimeout:   c.idleTimeout,
 		routeClass:    normalizeCarrierRouteClass(routeClass),
-		idleStop:      make(chan struct{}),
 	}
-	c.registerStream(stream)
+	if !c.registerStream(stream) {
+		_ = stream.Close()
+		c.failedStreams.Add(1)
+		return nil, net.ErrClosed
+	}
 	return stream, nil
 }
 
@@ -1671,6 +1806,11 @@ func (c *Carrier) close(immediate bool) error {
 		return nil
 	}
 	c.closeOnce.Do(func() {
+		c.streamsMu.Lock()
+		if c.done != nil {
+			close(c.done)
+		}
+		c.streamsMu.Unlock()
 		if c.cancel != nil {
 			c.cancel()
 		}
@@ -1684,6 +1824,11 @@ func (c *Carrier) close(immediate bool) error {
 			if err != nil && !strings.Contains(err.Error(), "not running") {
 				c.closeErr = err
 			}
+		}
+		// Wait for old maintenance to finish restoring auth/cache state before
+		// the next service generation may start.
+		if c.authReserveDone != nil {
+			<-c.authReserveDone
 		}
 		if c.restoreSocketControl != nil {
 			c.restoreSocketControl()
@@ -1732,6 +1877,7 @@ func (c *Carrier) Stats() CarrierStats {
 func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, target string) (func(), error) {
 	acquired := tryAcquire(c.activeSlots)
 	if !acquired {
+		c.logActiveAdmissionDiagnostic("saturated", 0)
 		// Under saturation, reclaim only connections that have been idle for a
 		// separately configured pressure interval. The normal idle timeout is
 		// deliberately left untouched so long-lived media is not shortened.
@@ -1754,6 +1900,7 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 		}()
 
 		waitCtx := ctx
+		queueStartedAt := time.Now()
 		var cancel context.CancelFunc
 		if c.dialQueueTimeout > 0 {
 			waitCtx, cancel = context.WithTimeout(ctx, c.dialQueueTimeout)
@@ -1768,6 +1915,7 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 		case <-waitCtx.Done():
 			c.rejectedActive.Add(1)
 			c.rejectedStreams.Add(1)
+			c.logActiveAdmissionDiagnostic("wait_timeout", time.Since(queueStartedAt))
 			return nil, fmt.Errorf("WLT carrier active stream limit reached route=%s target=%s: %w", routeClass, target, waitCtx.Err())
 		}
 	}
@@ -1928,10 +2076,15 @@ func (c *Carrier) routeIDForClass(routeClass string) (string, error) {
 	return "", fmt.Errorf("unknown WLT carrier route class: %s", routeClass)
 }
 
-func withCarrierDefaults(options CarrierOptions) CarrierOptions {
-	if options.ConnectTimeout <= 0 {
-		options.ConnectTimeout = defaultCarrierConnectTimeout
+func CarrierConnectTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return defaultCarrierConnectTimeout
 	}
+	return configured
+}
+
+func withCarrierDefaults(options CarrierOptions) CarrierOptions {
+	options.ConnectTimeout = CarrierConnectTimeout(options.ConnectTimeout)
 	if options.MaxActiveStreams <= 0 {
 		options.MaxActiveStreams = defaultCarrierMaxActive
 	}
@@ -1966,6 +2119,7 @@ func applyCarrierRuntimeOptions(options CarrierOptions) carrierconfig.TransportO
 		TinyMuxPingTimeoutMillis:     int(defaultCarrierTinyMuxPingTimeout / time.Millisecond),
 		PeerIncomingBuffer:           clampInt(bufferSize/256, 64, 256),
 		PeerWriteBuffer:              clampInt(bufferSize/1024, 16, 64),
+		RedundantControl:             options.RedundantControl,
 		AdaptivePeerData:             options.AdaptivePeerData,
 		AdaptivePeerThresholdBytes:   options.AdaptivePeerThresholdBytes,
 		AdaptivePeerIdleMillis:       int(options.AdaptivePeerIdleTimeout / time.Millisecond),
@@ -2096,13 +2250,14 @@ func release(ch chan struct{}) {
 
 type carrierConn struct {
 	net.Conn
-	carrier       *Carrier
-	releaseActive func()
-	idleTimeout   time.Duration
-	routeClass    string
-	lastActivity  atomic.Int64
-	closeOnce     sync.Once
-	idleStop      chan struct{}
+	carrier          *Carrier
+	releaseActive    func()
+	idleTimeout      time.Duration
+	routeClass       string
+	lastActivity     atomic.Int64
+	idleClosing      atomic.Bool
+	admissionClosing atomic.Bool
+	closeOnce        sync.Once
 }
 
 // FlowID exposes the diagnostics-safe TinyMux flow identifier while retaining
@@ -2148,12 +2303,28 @@ func (c *carrierConn) Write(p []byte) (int, error) {
 }
 
 func (c *carrierConn) Close() error {
+	return c.close(false)
+}
+
+// Abort closes only this carrier stream without waiting for a graceful KCP
+// drain. It does not stop or reset the shared carrier generation.
+func (c *carrierConn) Abort() error {
+	return c.close(true)
+}
+
+func (c *carrierConn) close(immediate bool) error {
 	var err error
 	c.closeOnce.Do(func() {
-		if c.idleStop != nil {
-			close(c.idleStop)
+		c.admissionClosing.Store(true)
+		if immediate {
+			if aborter, isAborter := c.Conn.(interface{ Abort() error }); isAborter {
+				err = aborter.Abort()
+			} else {
+				err = c.Conn.Close()
+			}
+		} else {
+			err = c.Conn.Close()
 		}
-		err = c.Conn.Close()
 		c.carrier.unregisterStream(c)
 		c.releaseActive()
 		c.carrier.closedStreams.Add(1)
@@ -2172,58 +2343,93 @@ func (c *carrierConn) markActivity() {
 	c.lastActivity.Store(time.Now().UnixNano())
 }
 
-func (c *Carrier) registerStream(stream *carrierConn) {
+func (c *Carrier) registerStream(stream *carrierConn) bool {
 	if stream == nil {
-		return
+		return false
 	}
 	stream.markActivity()
 	c.streamsMu.Lock()
+	if c.done != nil {
+		select {
+		case <-c.done:
+			c.streamsMu.Unlock()
+			return false
+		default:
+		}
+	}
 	if c.streams == nil {
 		c.streams = make(map[*carrierConn]struct{})
 	}
 	c.streams[stream] = struct{}{}
+	if c.idleWake == nil {
+		c.idleWake = make(chan struct{}, 1)
+	}
+	wake := c.idleWake
 	c.streamsMu.Unlock()
-	stream.startIdleWatch()
+	if stream.idleTimeout > 0 {
+		c.idleWatchOnce.Do(func() { go c.idleWatchLoop() })
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	return true
 }
 
-// startIdleWatch enforces carrier idle timeouts even when the underlying
-// transport cannot implement net.Conn deadlines. TinyMux flow connections
-// intentionally reject SetDeadline, so relying only on refreshDeadline leaves
-// a blocked idle Read alive forever and eventually exhausts active slots.
-func (c *carrierConn) startIdleWatch() {
-	if c == nil || c.idleTimeout <= 0 || c.idleStop == nil {
-		return
-	}
-	go func() {
-		timer := time.NewTimer(c.idleTimeout)
-		defer timer.Stop()
-		for {
-			lastActivity := c.lastActivity.Load()
+// idleWatchLoop enforces idle timeouts for transports without net.Conn
+// deadlines. One timer per carrier is enough: activity only extends a stream's
+// deadline, so an early wake simply recalculates the next expiry.
+func (c *Carrier) idleWatchLoop() {
+	for {
+		now := time.Now()
+		var expired []*carrierConn
+		var next time.Duration
+		c.streamsMu.Lock()
+		for stream := range c.streams {
+			if stream.idleTimeout <= 0 {
+				continue
+			}
+			lastActivity := stream.lastActivity.Load()
 			if lastActivity == 0 {
-				lastActivity = time.Now().UnixNano()
-				c.lastActivity.CompareAndSwap(0, lastActivity)
+				lastActivity = now.UnixNano()
+				stream.lastActivity.CompareAndSwap(0, lastActivity)
 			}
-			remaining := time.Until(time.Unix(0, lastActivity).Add(c.idleTimeout))
+			remaining := time.Unix(0, lastActivity).Add(stream.idleTimeout).Sub(now)
 			if remaining <= 0 {
-				_ = c.Close()
-				return
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+				if stream.idleClosing.CompareAndSwap(false, true) {
+					expired = append(expired, stream)
 				}
-			}
-			timer.Reset(remaining)
-			select {
-			case <-timer.C:
-				// Activity may have advanced while the timer was sleeping. The
-				// next iteration recalculates the remaining idle interval.
-			case <-c.idleStop:
-				return
+			} else if next == 0 || remaining < next {
+				next = remaining
 			}
 		}
-	}()
+		c.streamsMu.Unlock()
+		for _, stream := range expired {
+			// TinyMux Close may wait for pending writes. Keep one slow flow
+			// from delaying expiry of every other flow on this carrier.
+			go func(stream *carrierConn) { _ = stream.Close() }(stream)
+		}
+		if len(expired) > 0 {
+			continue
+		}
+		if next == 0 {
+			select {
+			case <-c.idleWake:
+			case <-c.done:
+				return
+			}
+			continue
+		}
+		timer := time.NewTimer(next)
+		select {
+		case <-timer.C:
+		case <-c.idleWake:
+		case <-c.done:
+			timer.Stop()
+			return
+		}
+		timer.Stop()
+	}
 }
 
 func (c *Carrier) unregisterStream(stream *carrierConn) {
@@ -2273,6 +2479,10 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	if c.logf != nil {
 		c.logf("WLT carrier pressure idle reclaim stream route=%s requested_route=%s idle_ms=%d", candidate.routeClass, routeClass, time.Since(time.Unix(0, candidate.lastActivity.Load())).Milliseconds())
 	}
-	_ = candidate.Close()
+	// A pressure reclaim must free the active slot before the waiting dial's
+	// short queue deadline.  The reliable transport's graceful Close can wait
+	// for unacknowledged payload even though this flow has been idle long enough
+	// to discard it.  Abort only this stale flow; normal closes still drain.
+	_ = candidate.Abort()
 	return true
 }

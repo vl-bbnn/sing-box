@@ -38,15 +38,17 @@ func (g *Group) NewPacketConn(conn net.PacketConn, isExternal bool) net.PacketCo
 
 func (g *Group) Interrupt(interruptExternalConnections bool) {
 	g.access.Lock()
-	defer g.access.Unlock()
-	var toDelete []*list.Element[*groupConnItem]
-	for element := g.connections.Front(); element != nil; element = element.Next() {
+	var toClose []io.Closer
+	for element := g.connections.Front(); element != nil; {
+		next := element.Next()
 		if !element.Value.isExternal || interruptExternalConnections {
-			element.Value.conn.Close()
-			toDelete = append(toDelete, element)
+			toClose = append(toClose, element.Value.conn)
+			g.connections.Remove(element)
 		}
+		element = next
 	}
-	for _, element := range toDelete {
-		g.connections.Remove(element)
+	g.access.Unlock()
+	for _, conn := range toClose {
+		_ = conn.Close()
 	}
 }

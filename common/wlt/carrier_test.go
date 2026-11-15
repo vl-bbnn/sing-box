@@ -97,6 +97,65 @@ func TestCarrierStartupTelemetryUsesSanitizedOneShotMilestones(t *testing.T) {
 	}
 }
 
+func TestCarrierWaitTrafficReadyWaitsForEndToEndSignal(t *testing.T) {
+	startup := newCarrierStartupTelemetry(time.Now(), nil)
+	carrier := &Carrier{startup: startup, done: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		result <- carrier.WaitTrafficReady(context.Background())
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("WaitTrafficReady returned before traffic signal: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	startup.markTrafficReady()
+	if err := <-result; err != nil {
+		t.Fatalf("WaitTrafficReady returned error: %v", err)
+	}
+}
+
+func TestCarrierWaitTrafficReadyHonorsTimeoutAndCancellation(t *testing.T) {
+	newCarrier := func() *Carrier {
+		return &Carrier{startup: newCarrierStartupTelemetry(time.Now(), nil), done: make(chan struct{})}
+	}
+	t.Run("timeout", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := newCarrier().WaitTrafficReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("WaitTrafficReady error = %v, want deadline exceeded", err)
+		}
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := newCarrier().WaitTrafficReady(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitTrafficReady error = %v, want context cancellation", err)
+		}
+	})
+}
+
+func TestCarrierWaitTrafficReadyWakesWhenCarrierCloses(t *testing.T) {
+	carrier := &Carrier{startup: newCarrierStartupTelemetry(time.Now(), nil), done: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		result <- carrier.WaitTrafficReady(context.Background())
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if err := carrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("WaitTrafficReady error = %v, want closed carrier", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitTrafficReady did not wake when carrier closed")
+	}
+}
+
 func TestCarrierConnMarksFirstPacketAfterSuccessfulIO(t *testing.T) {
 	var logs []string
 	startup := newCarrierStartupTelemetry(time.Now(), func(format string, arguments ...any) {
@@ -165,6 +224,21 @@ func TestFatalCarrierConnectErrorIncludesRejectedAuthSnapshot(t *testing.T) {
 	err := errors.Join(errors.New("connect failed"), carriercommon.ErrAuthSnapshotReauthorizationRequired)
 	if !isFatalCarrierConnectError(err) {
 		t.Fatal("rejected TURN auth snapshot should stop blind connect retries")
+	}
+}
+
+func TestEndedSignalingSessionStopsRetriesWithoutAuthorizingProviderRecovery(t *testing.T) {
+	err := fmt.Errorf("connect: %w", carriercommon.ErrSignalingSessionEnded)
+	if !isFatalCarrierConnectError(err) {
+		t.Fatal("ended session would be retried until the connect deadline")
+	}
+	if carrierAuthRecoveryRequired(err) {
+		t.Fatal("ended session alone must not permit fresh provider authorization")
+	}
+	for _, transient := range []error{context.DeadlineExceeded, io.EOF, errors.New("connection reset by peer"), errors.New("provider signaling error: HUNGUP")} {
+		if isFatalCarrierConnectError(transient) {
+			t.Fatalf("untyped transport error became terminal: %v", transient)
+		}
 	}
 }
 
@@ -420,7 +494,12 @@ func TestLoadCarrierAuthSnapshotDefersRefreshedIdentityPersistence(t *testing.T)
 		t.Fatal(err)
 	}
 	previousRefresh := refreshExistingCarrierAuthSnapshot
-	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte, observe func(string, string)) ([]byte, error) {
+		observe("saved_call_session_rejected", "request_invalid")
+		observe("calls_session_replacement_started", "none")
+		observe("calls_session_replacement_ready", "none")
+		observe("replacement_call_session_join_succeeded", "none")
+		observe("identity_renewal_not_entered", "none")
 		return []byte(testCarrierAuthSnapshotAt("refreshed-token", time.Now().Add(30*time.Minute))), nil
 	}
 	t.Cleanup(func() { refreshExistingCarrierAuthSnapshot = previousRefresh })
@@ -446,6 +525,27 @@ func TestLoadCarrierAuthSnapshotDefersRefreshedIdentityPersistence(t *testing.T)
 	if !strings.Contains(joinedLogs, "event=refresh_succeeded") || !strings.Contains(joinedLogs, "persistence=deferred") {
 		t.Fatalf("deferred refreshed snapshot was not reported; logs=%v", logs)
 	}
+	for _, expected := range []string{
+		"lifecycle event=saved_call_session_rejected category=request_invalid",
+		"lifecycle event=calls_session_replacement_started category=none",
+		"lifecycle event=calls_session_replacement_ready category=none",
+		"lifecycle event=replacement_call_session_join_succeeded category=none",
+		"lifecycle event=identity_renewal_not_entered category=none",
+	} {
+		if !strings.Contains(joinedLogs, expected) {
+			t.Fatalf("sanitized refresh lifecycle event missing: %s", expected)
+		}
+	}
+}
+
+func TestCarrierAuthRefreshLifecycleSanitizesUnknownValues(t *testing.T) {
+	var logs []string
+	logCarrierAuthRefreshLifecycle(func(format string, arguments ...any) {
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}, "private-event", "private-category")
+	if got := strings.Join(logs, "\n"); got != "WLT carrier auth refresh lifecycle event=unclassified category=unclassified" {
+		t.Fatalf("unexpected sanitized lifecycle log=%q", got)
+	}
 }
 
 func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T) {
@@ -454,7 +554,7 @@ func TestLoadCarrierAuthSnapshotReusesSavedIdentityWhenRefreshFails(t *testing.T
 		t.Fatal(err)
 	}
 	previousRefresh := refreshExistingCarrierAuthSnapshot
-	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte, _ func(string, string)) ([]byte, error) {
 		return nil, errors.New("provider unavailable")
 	}
 	t.Cleanup(func() { refreshExistingCarrierAuthSnapshot = previousRefresh })
@@ -753,7 +853,7 @@ func TestProviderRateLimitExpiresWithoutProcessRestart(t *testing.T) {
 func TestLoadCarrierAuthSnapshotRefreshesWithoutConfigTimestamp(t *testing.T) {
 	refreshCalls := 0
 	previousRefresh := refreshExistingCarrierAuthSnapshot
-	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte) ([]byte, error) {
+	refreshExistingCarrierAuthSnapshot = func(_ context.Context, _ carrierconfig.ClientConfig, _ []byte, _ func(string, string)) ([]byte, error) {
 		refreshCalls++
 		return []byte(testCarrierAuthSnapshot("refreshed-token")), nil
 	}
@@ -855,11 +955,13 @@ func TestCarrierRuntimeOptionsAreBounded(t *testing.T) {
 
 	transportOptions = applyCarrierRuntimeOptions(CarrierOptions{
 		BufferSize:                   64 * 1024,
+		RedundantControl:             true,
 		TinyMuxRateBurstBytes:        512 * 1024,
 		TinyMuxPingTimeout:           25 * time.Second,
 		RelayBandwidthBytesPerSecond: 5 * 1024 * 1024,
 	})
-	if transportOptions.TinyMuxFlowBuffer != 256 ||
+	if !transportOptions.RedundantControl ||
+		transportOptions.TinyMuxFlowBuffer != 256 ||
 		transportOptions.TinyMuxFlowSendBuffer != 64 ||
 		transportOptions.TinyMuxRateBurstBytes != 512*1024 ||
 		transportOptions.TinyMuxPingTimeoutMillis != 25000 ||
@@ -997,6 +1099,54 @@ func TestCarrierReclaimsPressureIdleStream(t *testing.T) {
 	stats := carrier.Stats()
 	if stats.PressureIdleReclaims != 1 || stats.RejectedStreams != 0 || stats.ActiveStreams != 1 {
 		t.Fatalf("stats=%+v, want one pressure reclaim and no rejection", stats)
+	}
+}
+
+type slowGracefulPressureConn struct {
+	net.Conn
+	gracefulRelease <-chan struct{}
+	aborted         atomic.Bool
+}
+
+func (c *slowGracefulPressureConn) Close() error {
+	<-c.gracefulRelease
+	return c.Conn.Close()
+}
+
+func (c *slowGracefulPressureConn) Abort() error {
+	c.aborted.Store(true)
+	return c.Conn.Close()
+}
+
+func TestCarrierPressureReclaimDoesNotWaitForGracefulDrain(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	gracefulRelease := make(chan struct{})
+	defer close(gracefulRelease)
+	underlay := &slowGracefulPressureConn{Conn: left, gracefulRelease: gracefulRelease}
+	carrier := newTestCarrier(1, 1, 1, 50*time.Millisecond, time.Second)
+	carrier.pressureIdleTimeout = 10 * time.Millisecond
+	carrier.activeSlots <- struct{}{}
+	carrier.activeStreams.Add(1)
+	stream := &carrierConn{
+		Conn:          underlay,
+		carrier:       carrier,
+		releaseActive: func() { release(carrier.activeSlots); carrier.activeStreams.Add(-1) },
+		routeClass:    "direct",
+	}
+	if !carrier.registerStream(stream) {
+		t.Fatal("failed to register pressure candidate")
+	}
+	stream.lastActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	done := make(chan bool, 1)
+	go func() { done <- carrier.reclaimPressureIdleStream("eu") }()
+	select {
+	case reclaimed := <-done:
+		if !reclaimed || !underlay.aborted.Load() || carrier.activeStreams.Load() != 0 {
+			t.Fatalf("reclaimed=%t aborted=%t active=%d", reclaimed, underlay.aborted.Load(), carrier.activeStreams.Load())
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pressure reclaim blocked on graceful drain")
 	}
 }
 
@@ -1315,6 +1465,127 @@ func TestCarrierDialStreamCancelsOpen(t *testing.T) {
 	}
 }
 
+func TestCarrierDialStreamWaitsForReadinessBeforeAdmission(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	ready := make(chan struct{})
+	var dialCalls atomic.Int64
+	carrier.waitReady = func(ctx context.Context) error {
+		select {
+		case <-ready:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		left, right := net.Pipe()
+		_ = right.Close()
+		return left, nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, err := carrier.DialStream(context.Background(), "eu", "ready.example:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.ActiveStreams != 0 || stats.PendingDials != 0 {
+		t.Fatalf("dial admitted before readiness: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+	close(ready)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if dialCalls.Load() != 1 || carrier.Stats().OpenAttempts != 1 {
+		t.Fatal("ready dial was not attempted exactly once")
+	}
+}
+
+func TestCarrierDialStreamReadinessCancellationSendsNoOpen(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.waitReady = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var dialCalls atomic.Int64
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		return nil, errors.New("unexpected dial")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := carrier.DialStream(ctx, "eu", "ready.example:443"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DialStream readiness error=%v", err)
+	}
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.FailedStreams != 0 {
+		t.Fatalf("readiness cancellation counted as route open: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+}
+
+func TestCarrierDialStreamReadinessUsesConnectTimeoutWithoutCallerDeadline(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 25*time.Millisecond, time.Second)
+	carrier.waitReady = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var dialCalls atomic.Int64
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		return nil, errors.New("unexpected dial")
+	}
+	started := time.Now()
+	if _, err := carrier.DialStream(context.Background(), "eu", "ready.example:443"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DialStream readiness error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("readiness exceeded connect timeout: %v", elapsed)
+	}
+	stats := carrier.Stats()
+	if dialCalls.Load() != 0 || stats.OpenAttempts != 0 || stats.FailedStreams != 0 {
+		t.Fatalf("bounded readiness counted as route open: calls=%d stats=%+v", dialCalls.Load(), stats)
+	}
+}
+
+func TestCarrierDialStreamSharesConnectBudgetBetweenReadinessAndOpen(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 50*time.Millisecond, time.Second)
+	var readyDeadline time.Time
+	carrier.waitReady = func(ctx context.Context) error {
+		var ok bool
+		readyDeadline, ok = ctx.Deadline()
+		if !ok {
+			t.Fatal("readiness has no connect deadline")
+		}
+		timer := time.NewTimer(30 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	carrier.dialRoute = func(ctx context.Context, _ string) (net.Conn, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || !deadline.Equal(readyDeadline) {
+			t.Fatal("route open did not preserve readiness deadline")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if _, err := carrier.DialStream(context.Background(), "eu", "ready.example:443"); err == nil {
+		t.Fatal("expected shared connect budget to expire")
+	}
+	stats := carrier.Stats()
+	if stats.OpenAttempts != 1 || stats.FailedStreams != 1 {
+		t.Fatalf("post-readiness open failure not counted: %+v", stats)
+	}
+}
+
 func TestCarrierDialStreamWaitsForReconnect(t *testing.T) {
 	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
 	var calls int
@@ -1426,7 +1697,6 @@ func TestCarrierIdleWatchClosesTransportWithoutDeadlineSupport(t *testing.T) {
 		},
 		idleTimeout: 30 * time.Millisecond,
 		routeClass:  "eu",
-		idleStop:    make(chan struct{}),
 	}
 	carrier.activeStreams.Store(1)
 	carrier.registerStream(conn)
@@ -1458,6 +1728,115 @@ func TestCarrierIdleWatchClosesTransportWithoutDeadlineSupport(t *testing.T) {
 	}
 }
 
+func TestCarrierIdleWatchDoesNotWaitForAnotherFlowClose(t *testing.T) {
+	first, firstPeer := net.Pipe()
+	second, secondPeer := net.Pipe()
+	defer firstPeer.Close()
+	defer secondPeer.Close()
+
+	carrier := newTestCarrier(2, 2, 2, time.Second, time.Second)
+	carrier.done = make(chan struct{})
+	defer carrier.Close()
+	releaseFirst := make(chan struct{})
+	defer close(releaseFirst)
+	firstCloseStarted := make(chan struct{})
+	firstStream := &carrierConn{
+		Conn: &blockingCloseConn{Conn: &deadlineUnsupportedConn{Conn: first},
+			started: firstCloseStarted, release: releaseFirst},
+		carrier: carrier, releaseActive: func() {}, idleTimeout: 20 * time.Millisecond,
+	}
+	secondStream := &carrierConn{
+		Conn: &deadlineUnsupportedConn{Conn: second}, carrier: carrier,
+		releaseActive: func() {}, idleTimeout: 50 * time.Millisecond,
+	}
+	carrier.registerStream(firstStream)
+	carrier.registerStream(secondStream)
+	select {
+	case <-firstCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first flow did not reach blocked Close")
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := secondStream.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("second idle flow Read succeeded unexpectedly")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second idle flow waited for the first flow's blocked Close")
+	}
+}
+
+type blockingCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (c *blockingCloseConn) Close() error {
+	close(c.started)
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestCarrierRegisterStreamAfterCloseFails(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.done = make(chan struct{})
+	if err := carrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stream := &carrierConn{carrier: carrier}
+	if carrier.registerStream(stream) {
+		t.Fatal("registered stream after carrier close")
+	}
+	if len(carrier.streams) != 0 {
+		t.Fatal("closed carrier retained late stream")
+	}
+}
+
+func TestCarrierCloseDuringDialDoesNotPublishLateStream(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.done = make(chan struct{})
+	dialEntered := make(chan struct{})
+	releaseDial := make(chan struct{})
+	carrier.dialRoute = func(context.Context, string) (net.Conn, error) {
+		close(dialEntered)
+		<-releaseDial
+		left, right := net.Pipe()
+		_ = right.Close()
+		return left, nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		conn, err := carrier.DialStream(context.Background(), "eu", "example.com:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		result <- err
+	}()
+	<-dialEntered
+	if err := carrier.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseDial)
+	select {
+	case err := <-result:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("late dial error=%v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late dial did not finish after carrier close")
+	}
+	if len(carrier.streams) != 0 || carrier.activeStreams.Load() != 0 {
+		t.Fatalf("late dial retained stream or active slot: streams=%d active=%d",
+			len(carrier.streams), carrier.activeStreams.Load())
+	}
+}
+
 func TestCarrierIdleWatchExtendsDeadlineOnActivity(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
@@ -1469,7 +1848,6 @@ func TestCarrierIdleWatchExtendsDeadlineOnActivity(t *testing.T) {
 		releaseActive: func() { carrier.activeStreams.Add(-1) },
 		idleTimeout:   120 * time.Millisecond,
 		routeClass:    "eu",
-		idleStop:      make(chan struct{}),
 	}
 	carrier.activeStreams.Store(1)
 	carrier.registerStream(conn)
