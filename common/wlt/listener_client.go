@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package wlt
 
 import (
@@ -7,53 +9,53 @@ import (
 	"strings"
 	"sync"
 
-	turnableconfig "github.com/theairblow/turnable/pkg/config"
-	turnableengine "github.com/theairblow/turnable/pkg/engine"
+	carrierconfig "github.com/2b2n/wlt-carrier/pkg/config"
+	carrierengine "github.com/2b2n/wlt-carrier/pkg/engine"
 )
 
-type TurnableListenerClientOptions struct {
+type ListenerClientOptions struct {
 	Config     string
 	ConfigFile string
 	Listeners  string
 	Logger     func(string, ...any)
 }
 
-type TurnableListenerClient struct {
+type ListenerClient struct {
 	cancel context.CancelFunc
-	client *turnableengine.TurnableClient
+	client *carrierengine.Client
 	done   <-chan error
 
 	closeOnce sync.Once
 	closeErr  error
 }
 
-func StartTurnableListenerClient(ctx context.Context, options TurnableListenerClientOptions) (*TurnableListenerClient, error) {
-	cfg, err := loadTurnableClientConfig(TurnableOptions{
+func StartListenerClient(ctx context.Context, options ListenerClientOptions) (*ListenerClient, error) {
+	cfg, err := loadCarrierClientConfig(CarrierConfigOptions{
 		Config:     options.Config,
 		ConfigFile: options.ConfigFile,
 	})
 	if err != nil {
 		return nil, err
 	}
-	listenAddrs, listenKeys, err := turnableListenAddrs(cfg, options.Listeners)
+	listenAddrs, listenKeys, err := carrierListenAddrs(cfg, options.Listeners)
 	if err != nil {
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	turnableconfig.Options.Interactive = false
-	turnableClient := turnableengine.NewTurnableClient(*cfg)
-	turnableClient.SetLogger(newLogfSlogLogger(options.Logger))
-	if err := turnableClient.Start(listenAddrs); err != nil {
+	carrierconfig.Options.Interactive = false
+	runtimeClient := carrierengine.NewClient(*cfg)
+	runtimeClient.SetLogger(newLogfSlogLogger(options.Logger))
+	if err := runtimeClient.Start(listenAddrs); err != nil {
 		cancel()
 		return nil, err
 	}
 	if options.Logger != nil {
-		options.Logger("Turnable listener client started routes=%d listen=%s", len(cfg.Routes), strings.Join(listenKeys, ","))
+		options.Logger("WLT listener client started routes=%d listen=%s", len(cfg.Routes), strings.Join(listenKeys, ","))
 	}
 
-	client := &TurnableListenerClient{
+	client := &ListenerClient{
 		cancel: cancel,
-		client: turnableClient,
+		client: runtimeClient,
 	}
 	done := make(chan error, 1)
 	client.done = done
@@ -64,7 +66,7 @@ func StartTurnableListenerClient(ctx context.Context, options TurnableListenerCl
 	return client, nil
 }
 
-func (c *TurnableListenerClient) Close() error {
+func (c *ListenerClient) Close() error {
 	if c == nil {
 		return nil
 	}
@@ -81,25 +83,25 @@ func (c *TurnableListenerClient) Close() error {
 	return c.closeErr
 }
 
-func (c *TurnableListenerClient) Wait() error {
+func (c *ListenerClient) Wait() error {
 	if c == nil || c.done == nil {
 		return nil
 	}
 	return <-c.done
 }
 
-func turnableListenAddrs(cfg *turnableconfig.ClientConfig, spec string) ([]string, []string, error) {
+func carrierListenAddrs(cfg *carrierconfig.ClientConfig, spec string) ([]string, []string, error) {
 	listeners, err := parseMap(defaultString(spec, "direct=127.0.0.1:12100,eu=127.0.0.1:12101,ru=127.0.0.1:12102"))
 	if err != nil {
 		return nil, nil, err
 	}
 	if cfg == nil {
-		return nil, nil, errors.New("nil turnable config")
+		return nil, nil, errors.New("nil carrier config")
 	}
 	listenAddrs := make([]string, 0, len(cfg.Routes))
 	listenKeys := make([]string, 0, len(cfg.Routes))
 	for _, route := range cfg.Routes {
-		key := turnableListenerKey(route.RouteID)
+		key := carrierListenerKey(route.RouteID)
 		addr := ""
 		if route.RouteID != "" {
 			addr = listeners[route.RouteID]
@@ -108,7 +110,7 @@ func turnableListenAddrs(cfg *turnableconfig.ClientConfig, spec string) ([]strin
 			addr = listeners[key]
 		}
 		if addr == "" {
-			return nil, nil, fmt.Errorf("no Turnable listener for route %q", route.RouteID)
+			return nil, nil, fmt.Errorf("no WLT listener for route %q", route.RouteID)
 		}
 		listenAddrs = append(listenAddrs, addr)
 		if key == "" {
@@ -119,7 +121,7 @@ func turnableListenAddrs(cfg *turnableconfig.ClientConfig, spec string) ([]strin
 	return listenAddrs, listenKeys, nil
 }
 
-func turnableListenerKey(routeID string) string {
+func carrierListenerKey(routeID string) string {
 	route := strings.ToLower(routeID)
 	switch {
 	case strings.Contains(route, "eu"):

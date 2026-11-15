@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package wlt
 
 import (
@@ -10,17 +12,17 @@ import (
 	"testing"
 	"time"
 
-	turnableconfig "github.com/theairblow/turnable/pkg/config"
+	carrierconfig "github.com/2b2n/wlt-carrier/pkg/config"
 )
 
-func TestTurnableCarrierRouteMapUsesRouteClasses(t *testing.T) {
-	cfg := &turnableconfig.ClientConfig{Routes: []turnableconfig.ClientRoute{
+func TestCarrierRouteMapUsesRouteClasses(t *testing.T) {
+	cfg := &carrierconfig.ClientConfig{Routes: []carrierconfig.ClientRoute{
 		{RouteID: "vless-reality-main", Socket: "tcp", Transport: "srtp"},
 		{RouteID: "vless-reality-eu", Socket: "tcp", Transport: "srtp"},
 		{RouteID: "vless-reality-ru", Socket: "tcp", Transport: "srtp"},
 	}}
 
-	routeByClass := turnableCarrierRouteMap(cfg)
+	routeByClass := carrierRouteMap(cfg)
 	want := map[string]string{
 		"vless-reality-main": "vless-reality-main",
 		"vless-reality-eu":   "vless-reality-eu",
@@ -34,53 +36,53 @@ func TestTurnableCarrierRouteMapUsesRouteClasses(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierDefaultsAreIPhoneBounded(t *testing.T) {
-	options := withTurnableCarrierDefaults(TurnableCarrierOptions{})
-	if options.MaxActiveStreams != defaultTurnableCarrierMaxActive {
-		t.Fatalf("max active=%d, want %d", options.MaxActiveStreams, defaultTurnableCarrierMaxActive)
+func TestCarrierDefaultsAreIPhoneBounded(t *testing.T) {
+	options := withCarrierDefaults(CarrierOptions{})
+	if options.MaxActiveStreams != defaultCarrierMaxActive {
+		t.Fatalf("max active=%d, want %d", options.MaxActiveStreams, defaultCarrierMaxActive)
 	}
-	if options.MaxOpenAttempts != defaultTurnableCarrierMaxOpen {
-		t.Fatalf("max open=%d, want %d", options.MaxOpenAttempts, defaultTurnableCarrierMaxOpen)
+	if options.MaxOpenAttempts != defaultCarrierMaxOpen {
+		t.Fatalf("max open=%d, want %d", options.MaxOpenAttempts, defaultCarrierMaxOpen)
 	}
-	if options.MaxPendingDials != defaultTurnableCarrierMaxPending {
-		t.Fatalf("max pending=%d, want %d", options.MaxPendingDials, defaultTurnableCarrierMaxPending)
+	if options.MaxPendingDials != defaultCarrierMaxPending {
+		t.Fatalf("max pending=%d, want %d", options.MaxPendingDials, defaultCarrierMaxPending)
 	}
-	if options.DialQueueTimeout != defaultTurnableCarrierQueueTimeout {
-		t.Fatalf("queue timeout=%s, want %s", options.DialQueueTimeout, defaultTurnableCarrierQueueTimeout)
+	if options.DialQueueTimeout != defaultCarrierQueueTimeout {
+		t.Fatalf("queue timeout=%s, want %s", options.DialQueueTimeout, defaultCarrierQueueTimeout)
 	}
-	if options.IdleTimeout != defaultTurnableCarrierIdleTimeout {
-		t.Fatalf("idle timeout=%s, want %s", options.IdleTimeout, defaultTurnableCarrierIdleTimeout)
+	if options.IdleTimeout != defaultCarrierIdleTimeout {
+		t.Fatalf("idle timeout=%s, want %s", options.IdleTimeout, defaultCarrierIdleTimeout)
 	}
 	if options.BufferSize != 32*1024 {
 		t.Fatalf("buffer size=%d, want 32768", options.BufferSize)
 	}
 }
 
-func TestTurnableCarrierRuntimeOptionsAreBounded(t *testing.T) {
-	previousOptions := turnableconfig.Options
+func TestCarrierRuntimeOptionsAreBounded(t *testing.T) {
+	previousOptions := carrierconfig.Options
 	defer func() {
-		turnableconfig.Options = previousOptions
+		carrierconfig.Options = previousOptions
 	}()
 
-	turnableconfig.Options.Transport.RelayBandwidthBytesPerSecond = 1234
-	options := withTurnableCarrierDefaults(TurnableCarrierOptions{})
-	transportOptions := applyTurnableCarrierRuntimeOptions(options)
-	if !reflect.DeepEqual(transportOptions, turnableconfig.TransportOptions{
-		TinyMuxFlowBuffer:            defaultTurnableTinyMuxFlowBuffer,
-		TinyMuxFlowSendBuffer:        defaultTurnableTinyMuxFlowSendBuffer,
-		TinyMuxControlBuffer:         defaultTurnableTinyMuxControlBuffer,
-		TinyMuxPingTimeoutMillis:     int(defaultTurnableTinyMuxPingTimeout / time.Millisecond),
-		PeerIncomingBuffer:           defaultTurnablePeerIncomingBuffer,
-		PeerWriteBuffer:              defaultTurnablePeerWriteBuffer,
-		SRTPPacketBuffer:             defaultTurnableSRTPPacketBuffer,
-		KCPWindowSize:                defaultTurnableKCPWindowSize,
-		KCPReadWriteBuffer:           defaultTurnableKCPReadWriteBuffer,
+	carrierconfig.Options.Transport.RelayBandwidthBytesPerSecond = 1234
+	options := withCarrierDefaults(CarrierOptions{})
+	transportOptions := applyCarrierRuntimeOptions(options)
+	if !reflect.DeepEqual(transportOptions, carrierconfig.TransportOptions{
+		TinyMuxFlowBuffer:            defaultCarrierTinyMuxFlowBuffer,
+		TinyMuxFlowSendBuffer:        defaultCarrierTinyMuxFlowSendBuffer,
+		TinyMuxControlBuffer:         defaultCarrierTinyMuxControlBuffer,
+		TinyMuxPingTimeoutMillis:     int(defaultCarrierTinyMuxPingTimeout / time.Millisecond),
+		PeerIncomingBuffer:           defaultCarrierPeerIncomingBuffer,
+		PeerWriteBuffer:              defaultCarrierPeerWriteBuffer,
+		SRTPPacketBuffer:             defaultCarrierSRTPPacketBuffer,
+		KCPWindowSize:                defaultCarrierKCPWindowSize,
+		KCPReadWriteBuffer:           defaultCarrierKCPReadWriteBuffer,
 		RelayBandwidthBytesPerSecond: 1234,
 	}) {
 		t.Fatalf("transport options=%+v", transportOptions)
 	}
 
-	transportOptions = applyTurnableCarrierRuntimeOptions(TurnableCarrierOptions{
+	transportOptions = applyCarrierRuntimeOptions(CarrierOptions{
 		BufferSize:                   64 * 1024,
 		TinyMuxRateBurstBytes:        512 * 1024,
 		TinyMuxPingTimeout:           25 * time.Second,
@@ -99,8 +101,8 @@ func TestTurnableCarrierRuntimeOptionsAreBounded(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierDialStreamUsesRouteClassAndStats(t *testing.T) {
-	carrier := newTestTurnableCarrier(2, 2, 1, time.Second, time.Second)
+func TestCarrierDialStreamUsesRouteClassAndStats(t *testing.T) {
+	carrier := newTestCarrier(2, 2, 1, time.Second, time.Second)
 	var (
 		mu     sync.Mutex
 		dialed []string
@@ -135,8 +137,8 @@ func TestTurnableCarrierDialStreamUsesRouteClassAndStats(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierQueuesOverActiveLimit(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
+func TestCarrierQueuesOverActiveLimit(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
 		_ = ctx
 		left, right := net.Pipe()
@@ -170,8 +172,8 @@ func TestTurnableCarrierQueuesOverActiveLimit(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierRejectsActiveQueueTimeout(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, 20*time.Millisecond)
+func TestCarrierRejectsActiveQueueTimeout(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, 20*time.Millisecond)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
 		_ = ctx
 		left, right := net.Pipe()
@@ -193,8 +195,8 @@ func TestTurnableCarrierRejectsActiveQueueTimeout(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierRejectsOverPendingLimit(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
+func TestCarrierRejectsOverPendingLimit(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
 		_ = ctx
 		left, right := net.Pipe()
@@ -232,8 +234,8 @@ func TestTurnableCarrierRejectsOverPendingLimit(t *testing.T) {
 	_ = second.conn.Close()
 }
 
-func TestTurnableCarrierQueuesOverOpenAttemptLimit(t *testing.T) {
-	carrier := newTestTurnableCarrier(2, 1, 1, time.Second, time.Second)
+func TestCarrierQueuesOverOpenAttemptLimit(t *testing.T) {
+	carrier := newTestCarrier(2, 1, 1, time.Second, time.Second)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
 	var (
@@ -286,8 +288,8 @@ func TestTurnableCarrierQueuesOverOpenAttemptLimit(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierRejectsOverOpenAttemptLimit(t *testing.T) {
-	carrier := newTestTurnableCarrier(2, 1, 1, time.Second, 20*time.Millisecond)
+func TestCarrierRejectsOverOpenAttemptLimit(t *testing.T) {
+	carrier := newTestCarrier(2, 1, 1, time.Second, 20*time.Millisecond)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
@@ -324,8 +326,8 @@ func TestTurnableCarrierRejectsOverOpenAttemptLimit(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
-	carrier := newTestTurnableCarrier(3, 1, 1, time.Second, time.Second)
+func TestCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
+	carrier := newTestCarrier(3, 1, 1, time.Second, time.Second)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
@@ -375,8 +377,8 @@ func TestTurnableCarrierRejectsOverPendingLimitWhileOpenFull(t *testing.T) {
 	_ = second.conn.Close()
 }
 
-func TestTurnableCarrierDialStreamCancelsOpen(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, 30*time.Millisecond, time.Second)
+func TestCarrierDialStreamCancelsOpen(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 30*time.Millisecond, time.Second)
 	carrier.dialRoute = func(ctx context.Context, routeID string) (net.Conn, error) {
 		_ = routeID
 		<-ctx.Done()
@@ -392,8 +394,8 @@ func TestTurnableCarrierDialStreamCancelsOpen(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
+func TestCarrierDialStreamWaitsForReconnect(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
 	var calls int
 	ready := make(chan struct{})
 	carrier.waitReady = func(ctx context.Context) error {
@@ -431,8 +433,8 @@ func TestTurnableCarrierDialStreamWaitsForReconnect(t *testing.T) {
 	}
 }
 
-func TestTurnableCarrierDialStreamBacksOffWhenReconnectWaitReturnsEarly(t *testing.T) {
-	carrier := newTestTurnableCarrier(1, 1, 1, 120*time.Millisecond, time.Second)
+func TestCarrierDialStreamBacksOffWhenReconnectWaitReturnsEarly(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 120*time.Millisecond, time.Second)
 	var calls int
 	carrier.waitReady = func(ctx context.Context) error {
 		select {
@@ -466,11 +468,11 @@ func TestTurnableCarrierDialStreamBacksOffWhenReconnectWaitReturnsEarly(t *testi
 	}
 }
 
-func TestTurnableCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
+func TestCarrierIdleTimeoutClosesStaleTail(t *testing.T) {
 	left, right := net.Pipe()
 	defer right.Close()
-	carrier := newTestTurnableCarrier(1, 1, 1, time.Second, time.Second)
-	conn := &turnableCarrierConn{
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	conn := &carrierConn{
 		Conn:          left,
 		carrier:       carrier,
 		releaseActive: func() {},
@@ -493,12 +495,12 @@ type ioResult struct {
 	err  error
 }
 
-func newTestTurnableCarrier(maxActive int, maxOpen int, maxPending int, connectTimeout time.Duration, queueTimeout time.Duration) *TurnableCarrier {
-	return &TurnableCarrier{
+func newTestCarrier(maxActive int, maxOpen int, maxPending int, connectTimeout time.Duration, queueTimeout time.Duration) *Carrier {
+	return &Carrier{
 		connectTimeout:   connectTimeout,
 		dialQueueTimeout: queueTimeout,
-		idleTimeout:      defaultTurnableCarrierIdleTimeout,
-		bufferSize:       defaultTurnableCarrierBufferSize,
+		idleTimeout:      defaultCarrierIdleTimeout,
+		bufferSize:       defaultCarrierBufferSize,
 		activeSlots:      make(chan struct{}, maxActive),
 		openSlots:        make(chan struct{}, maxOpen),
 		pendingSlots:     make(chan struct{}, maxPending),
@@ -509,7 +511,7 @@ func newTestTurnableCarrier(maxActive int, maxOpen int, maxPending int, connectT
 	}
 }
 
-func waitForCarrierStat(t *testing.T, carrier *TurnableCarrier, predicate func(CarrierStats) bool) {
+func waitForCarrierStat(t *testing.T, carrier *Carrier, predicate func(CarrierStats) bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
