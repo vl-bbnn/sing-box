@@ -1203,8 +1203,9 @@ func TestCarrierPressureReclaimSkipsStreamAlreadyClosing(t *testing.T) {
 	}()
 	select {
 	case reclaimed := <-reclaimDone:
-		if !reclaimed || carrier.activeStreams.Load() != 1 || underlay.aborted.Load() {
-			t.Fatalf("reclaimed=%t active=%d closing_aborted=%t", reclaimed, carrier.activeStreams.Load(), underlay.aborted.Load())
+		if !reclaimed || carrier.activeStreams.Load() != 0 || carrier.drainingStreams.Load() != 1 || underlay.aborted.Load() {
+			t.Fatalf("reclaimed=%t active=%d draining=%d closing_aborted=%t", reclaimed,
+				carrier.activeStreams.Load(), carrier.drainingStreams.Load(), underlay.aborted.Load())
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("pressure reclaim waited behind an already-started graceful close")
@@ -1883,6 +1884,10 @@ func TestCarrierCloseDuringDialDoesNotPublishLateStream(t *testing.T) {
 	if err := carrier.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// A post-close sample is an observation, not a settled admission barrier.
+	if post := carrier.Stats(); post.ActiveStreams != 1 || post.OpenAttempts != 1 {
+		t.Fatalf("late dial was hidden from post-close stats: active=%d attempts=%d", post.ActiveStreams, post.OpenAttempts)
+	}
 	close(releaseDial)
 	select {
 	case err := <-result:
@@ -2034,6 +2039,7 @@ func newTestCarrier(maxActive int, maxOpen int, maxPending int, connectTimeout t
 		streams:          make(map[*carrierConn]struct{}),
 		bufferSize:       defaultCarrierBufferSize,
 		activeSlots:      make(chan struct{}, maxActive),
+		drainSlots:       make(chan struct{}, min(maxActive, 8)),
 		openSlots:        make(chan struct{}, maxOpen),
 		pendingSlots:     make(chan struct{}, maxPending),
 		routeByClass: map[string]string{
@@ -2053,4 +2059,219 @@ func waitForCarrierStat(t *testing.T, carrier *Carrier, predicate func(CarrierSt
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for carrier stats, last=%+v", carrier.Stats())
+}
+
+// Regression contract for a future bounded drain owner. This deliberately fails
+// against frozen 0311: a graceful Close retains its active permit until the
+// transport drain returns, even when the stream is already logically closing.
+func TestCarrierClosingDrainReleasesLogicalPermitWithFiniteOverhang(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, 100*time.Millisecond, 60*time.Millisecond)
+	carrier.pressureIdleTimeout = 0 // Reclaim is a different mechanism.
+	firstLeft, firstRight := net.Pipe()
+	defer firstRight.Close()
+	firstRelease := make(chan struct{})
+	firstStarted := make(chan struct{}, 1)
+	firstUnderlay := &slowGracefulPressureConn{Conn: firstLeft, gracefulRelease: firstRelease, gracefulStarted: firstStarted}
+	carrier.activeSlots <- struct{}{}
+	carrier.activeStreams.Add(1)
+	first := &carrierConn{Conn: firstUnderlay, carrier: carrier, routeClass: "direct",
+		releaseActive: func() { release(carrier.activeSlots); carrier.activeStreams.Add(-1) }}
+	if !carrier.registerStream(first) { t.Fatal("register first") }
+	firstDone := make(chan struct{})
+	go func() { defer close(firstDone); _ = first.Close() }()
+	var firstReleaseOnce sync.Once
+	releaseFirst := func() { firstReleaseOnce.Do(func() { close(firstRelease) }); <-firstDone }
+	defer releaseFirst()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second): t.Fatal("first graceful close never started")
+	}
+	// This is the functional regression: a logically closed stream's slow
+	// transport drain must not consume the sole live admission permit.
+	secondPermit, err := carrier.acquireActiveSlot(context.Background(), "direct", "second.example:443")
+	if err != nil { t.Fatalf("closing stream held live permit past queue deadline: %v", err) }
+	secondLeft, secondRight := net.Pipe()
+	defer secondRight.Close()
+	secondRelease := make(chan struct{})
+	secondStarted := make(chan struct{}, 1)
+	secondUnderlay := &slowGracefulPressureConn{Conn: secondLeft, gracefulRelease: secondRelease, gracefulStarted: secondStarted}
+	second := &carrierConn{Conn: secondUnderlay, carrier: carrier, routeClass: "direct", releaseActive: secondPermit}
+	if !carrier.registerStream(second) { secondPermit(); t.Fatal("register second") }
+	secondDone := make(chan struct{})
+	go func() { defer close(secondDone); _ = second.Close() }()
+	var secondReleaseOnce sync.Once
+	releaseSecond := func() { secondReleaseOnce.Do(func() { close(secondRelease) }); <-secondDone }
+	defer releaseSecond()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second): t.Fatal("second graceful close never started")
+	}
+	// With a one-stream live cap and a one-drain overhang budget, the third
+	// logical dial must wait: two blocked drains cannot silently become three.
+	thirdPermit, err := carrier.acquireActiveSlot(context.Background(), "direct", "third.example:443")
+	if err == nil {
+		thirdPermit()
+		t.Fatal("unbounded draining overhang admitted a third stream")
+	}
+	if carrier.activeStreams.Load() > 1 { t.Fatal("live active stream cap exceeded") }
+	releaseSecond()
+	releaseFirst()
+	if carrier.activeStreams.Load() != 0 || carrier.drainingStreams.Load() != 0 ||
+		len(carrier.activeSlots) != 0 || len(carrier.drainSlots) != 0 || carrier.closedStreams.Load() != 2 {
+		t.Fatalf("close ownership leaked after both drains: %+v", carrier.Stats())
+	}
+}
+
+type abortableClosingConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	startOnce sync.Once
+	abortCalls atomic.Int64
+}
+
+func (c *abortableClosingConn) Close() error {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+func (c *abortableClosingConn) Abort() error {
+	c.abortCalls.Add(1)
+	return c.Conn.Close()
+}
+
+// Once graceful Close owns this stream, concurrent Abort joins that owner.
+// It must not enter the frozen underlay's Abort while its Close is active.
+func TestCarrierAbortJoinsAlreadyClosingDrain(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	underlay := &abortableClosingConn{Conn: left, started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(underlay.release) }) }
+	defer releaseClose()
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.activeSlots <- struct{}{}
+	carrier.activeStreams.Add(1)
+	var releases atomic.Int64
+	stream := &carrierConn{Conn: underlay, carrier: carrier,
+		releaseActive: func() { releases.Add(1); release(carrier.activeSlots); carrier.activeStreams.Add(-1) }}
+	if !carrier.registerStream(stream) { t.Fatal("register stream") }
+	closeDone := make(chan struct{})
+	go func() { defer close(closeDone); _ = stream.Close() }()
+	select { case <-underlay.started: case <-time.After(time.Second): t.Fatal("graceful close never started") }
+	abortDone := make(chan struct{})
+	abortStarted := make(chan struct{})
+	go func() { close(abortStarted); defer close(abortDone); _ = stream.Abort() }()
+	<-abortStarted
+	select {
+	case <-abortDone: t.Fatal("Abort returned before the sole close owner finished")
+	case <-time.After(200*time.Millisecond):
+	}
+	if underlay.abortCalls.Load() != 0 { t.Fatal("concurrent Abort entered underlay") }
+	releaseClose()
+	select { case <-closeDone: case <-time.After(time.Second): t.Fatal("graceful close did not finish") }
+	select { case <-abortDone: case <-time.After(time.Second): t.Fatal("Abort did not join close owner") }
+	if releases.Load() != 1 || carrier.activeStreams.Load() != 0 { t.Fatal("permit release was not exactly once") }
+}
+
+// Cancellation must remain bounded when one drain token is owned and a second
+// graceful close retains the live token because D is full.
+func TestCarrierDrainBudgetFullCanceledAdmissionReturns(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, time.Second)
+	carrier.pressureIdleTimeout = 0
+	makeStream := func(releaseActive func()) (*carrierConn, *slowGracefulPressureConn, chan struct{}, chan struct{}, net.Conn) {
+		left, right := net.Pipe()
+		started := make(chan struct{}, 1)
+		releaseClose := make(chan struct{})
+		underlay := &slowGracefulPressureConn{Conn: left, gracefulRelease: releaseClose, gracefulStarted: started}
+		stream := &carrierConn{Conn: underlay, carrier: carrier, releaseActive: releaseActive}
+		if !carrier.registerStream(stream) { t.Fatal("register stream") }
+		return stream, underlay, started, releaseClose, right
+	}
+	carrier.activeSlots <- struct{}{}
+	carrier.activeStreams.Add(1)
+	first, _, firstStarted, firstRelease, firstPeer := makeStream(func() {
+		release(carrier.activeSlots); carrier.activeStreams.Add(-1)
+	})
+	defer firstPeer.Close()
+	firstDone := make(chan struct{})
+	go func() { defer close(firstDone); _ = first.Close() }()
+	var firstOnce sync.Once
+	defer func() { firstOnce.Do(func() { close(firstRelease) }); <-firstDone }()
+	select { case <-firstStarted: case <-time.After(time.Second): t.Fatal("first close not started") }
+	secondPermit, err := carrier.acquireActiveSlot(context.Background(), "direct", "second.example:443")
+	if err != nil { t.Fatalf("first drain did not release live permit: %v", err) }
+	second, _, secondStarted, secondRelease, secondPeer := makeStream(secondPermit)
+	defer secondPeer.Close()
+	secondDone := make(chan struct{})
+	go func() { defer close(secondDone); _ = second.Close() }()
+	var secondOnce sync.Once
+	defer func() { secondOnce.Do(func() { close(secondRelease) }); <-secondDone }()
+	select { case <-secondStarted: case <-time.After(time.Second): t.Fatal("second close not started") }
+	if carrier.drainingStreams.Load() != 1 || carrier.activeStreams.Load() != 1 {
+		t.Fatalf("A=1,D=1 ownership not bounded: %+v", carrier.Stats())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		permit, err := carrier.acquireActiveSlot(ctx, "direct", "third.example:443")
+		if permit != nil { permit() }
+		result <- err
+	}()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) { t.Fatalf("canceled admission error=%v", err) }
+	case <-time.After(200*time.Millisecond): t.Fatal("canceled admission blocked behind full drain budget")
+	}
+	secondOnce.Do(func() { close(secondRelease) }); <-secondDone
+	firstOnce.Do(func() { close(firstRelease) }); <-firstDone
+	if carrier.activeStreams.Load() != 0 || carrier.drainingStreams.Load() != 0 ||
+		len(carrier.activeSlots) != 0 || len(carrier.drainSlots) != 0 || carrier.closedStreams.Load() != 2 {
+		t.Fatalf("canceled shutdown left ownership: %+v", carrier.Stats())
+	}
+}
+
+func TestCarrierBoundedDrainChurnReturnsAllTokens(t *testing.T) {
+	carrier := newTestCarrier(1, 1, 1, time.Second, 200*time.Millisecond)
+	carrier.pressureIdleTimeout = 0
+	for i := 0; i < 64; i++ {
+		left, right := net.Pipe()
+		started := make(chan struct{}, 1)
+		unblock := make(chan struct{})
+		carrier.activeSlots <- struct{}{}
+		carrier.activeStreams.Add(1)
+		stream := &carrierConn{Conn: &slowGracefulPressureConn{Conn: left, gracefulRelease: unblock, gracefulStarted: started},
+			carrier: carrier, releaseActive: func() { release(carrier.activeSlots); carrier.activeStreams.Add(-1) }}
+		if !carrier.registerStream(stream) { t.Fatal("register stream") }
+		done := make(chan struct{})
+		go func() { defer close(done); _ = stream.Close() }()
+		select { case <-started: case <-time.After(time.Second): close(unblock); t.Fatal("close not started") }
+		permit, err := carrier.acquireActiveSlot(context.Background(), "direct", "next.example:443")
+		if err != nil { close(unblock); <-done; t.Fatalf("cycle %d admission: %v", i, err) }
+		if carrier.activeStreams.Load()+carrier.drainingStreams.Load() > 2 ||
+			len(carrier.activeSlots)+len(carrier.drainSlots) > 2 {
+			t.Fatalf("cycle %d exceeded A+D", i)
+		}
+		if peak := carrier.peakDrainingStreams.Load(); peak > int64(cap(carrier.drainSlots)) {
+			t.Fatalf("cycle %d peak draining %d exceeded D=%d", i, peak, cap(carrier.drainSlots))
+		}
+		if peak := carrier.peakActiveStreams.Load(); peak > int64(cap(carrier.activeSlots)) {
+			t.Fatalf("cycle %d peak active %d exceeded A=%d", i, peak, cap(carrier.activeSlots))
+		}
+		permit()
+		close(unblock)
+		<-done
+		_ = right.Close()
+		if carrier.activeStreams.Load() != 0 || carrier.drainingStreams.Load() != 0 ||
+			len(carrier.activeSlots) != 0 || len(carrier.drainSlots) != 0 {
+			t.Fatalf("cycle %d leaked ownership: %+v", i, carrier.Stats())
+		}
+	}
+	if carrier.closedStreams.Load() != 64 || carrier.peakDrainingStreams.Load() != 1 ||
+		carrier.peakDrainingStreams.Load() > int64(cap(carrier.drainSlots)) ||
+		carrier.peakActiveStreams.Load() > int64(cap(carrier.activeSlots)) {
+		t.Fatalf("churn counters: %+v", carrier.Stats())
+	}
 }

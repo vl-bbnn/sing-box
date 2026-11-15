@@ -1,6 +1,7 @@
 package interrupt
 
 import (
+	N "github.com/sagernet/sing/common/network"
 	"net"
 
 	"github.com/sagernet/sing/common/x/list"
@@ -46,7 +47,7 @@ func (c *Conn) Upstream() any {
 }
 
 type PacketConn struct {
-	net.PacketConn
+	N.NetPacketConn
 	group   *Group
 	element *list.Element[*groupConnItem]
 }
@@ -59,7 +60,7 @@ func (c *PacketConn) Close() error {
 	c.group.access.Lock()
 	c.group.connections.Remove(c.element)
 	c.group.access.Unlock()
-	return c.PacketConn.Close()
+	return c.NetPacketConn.Close()
 }
 
 func (c *PacketConn) ReaderReplaceable() bool {
@@ -71,5 +72,5 @@ func (c *PacketConn) WriterReplaceable() bool {
 }
 
 func (c *PacketConn) Upstream() any {
-	return c.PacketConn
+	return c.NetPacketConn
 }

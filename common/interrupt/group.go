@@ -1,6 +1,7 @@
 package interrupt
 
 import (
+	"github.com/sagernet/sing/common/bufio"
 	"io"
 	"net"
 	"sync"
@@ -33,7 +34,7 @@ func (g *Group) NewPacketConn(conn net.PacketConn, isExternal bool) net.PacketCo
 	g.access.Lock()
 	defer g.access.Unlock()
 	item := g.connections.PushBack(&groupConnItem{conn, isExternal})
-	return &PacketConn{PacketConn: conn, group: g, element: item}
+	return &PacketConn{NetPacketConn: bufio.NewPacketConn(conn), group: g, element: item}
 }
 
 func (g *Group) Interrupt(interruptExternalConnections bool) {

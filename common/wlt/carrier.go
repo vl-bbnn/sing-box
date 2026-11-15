@@ -196,6 +196,7 @@ type CarrierOptions struct {
 	TinyMuxPingTimeout           time.Duration
 	PeerIncomingBuffer           int
 	PeerWriteBuffer              int
+	DataHalfClose                bool
 	RedundantControl             bool
 	AdaptivePeerData             bool
 	AdaptivePeerThresholdBytes   int
@@ -207,6 +208,8 @@ type CarrierOptions struct {
 	SocketControl                carriercommon.SocketControlFunc
 
 	Logger func(string, ...any)
+	// CloseLifecycleDiagnostics enables capped, endpoint-free close timing logs.
+	CloseLifecycleDiagnostics bool
 
 	startup *carrierStartupTelemetry
 }
@@ -417,6 +420,9 @@ type CarrierStats struct {
 	RejectedActive       int64
 	RejectedOpen         int64
 	PressureIdleReclaims int64
+	DrainingStreams      int64
+	PeakDrainingStreams  int64
+	DrainCapacity        int
 	FailedStreams        int64
 	LastActiveWaitMillis int64
 	MaxActiveWaitMillis  int64
@@ -436,10 +442,11 @@ type Carrier struct {
 	authReserveDone      <-chan struct{}
 	restoreSocketControl func()
 
-	dialRoute func(context.Context, string) (net.Conn, error)
-	waitReady func(context.Context) error
-	logf      func(string, ...any)
-	startup   *carrierStartupTelemetry
+	dialRoute                 func(context.Context, string) (net.Conn, error)
+	waitReady                 func(context.Context) error
+	logf                      func(string, ...any)
+	closeLifecycleDiagnostics bool
+	startup                   *carrierStartupTelemetry
 
 	connectTimeout      time.Duration
 	dialQueueTimeout    time.Duration
@@ -447,42 +454,60 @@ type Carrier struct {
 	pressureIdleTimeout time.Duration
 	bufferSize          int
 	activeSlots         chan struct{}
+	drainSlots          chan struct{}
 	openSlots           chan struct{}
 	openGate            *prioritySlotGate
 	pendingSlots        chan struct{}
 	routeByClass        map[string]string
 
-	activeStreams        atomic.Int64
-	peakActiveStreams    atomic.Int64
-	pendingDials         atomic.Int64
-	peakPendingDials     atomic.Int64
-	openAttempts         atomic.Int64
-	dnsOpenRequests      atomic.Int64
-	dnsOpenQueued        atomic.Int64
-	dnsOpenRejected      atomic.Int64
-	openedStreams        atomic.Int64
-	closedStreams        atomic.Int64
-	queuedDials          atomic.Int64
-	rejectedStreams      atomic.Int64
-	rejectedQueue        atomic.Int64
-	rejectedActive       atomic.Int64
-	rejectedOpen         atomic.Int64
-	failedStreams        atomic.Int64
-	lastActiveWait       atomic.Int64
-	maxActiveWait        atomic.Int64
-	lastOpenWait         atomic.Int64
-	maxOpenWait          atomic.Int64
-	lastDialDuration     atomic.Int64
-	maxDialDuration      atomic.Int64
-	reconnectRetries     atomic.Int64
-	reconnectWait        atomic.Int64
-	closeOnce            sync.Once
-	closeErr             error
-	streamsMu            sync.Mutex
-	streams              map[*carrierConn]struct{}
-	idleWatchOnce        sync.Once
-	idleWake             chan struct{}
-	pressureIdleReclaims atomic.Int64
+	activeStreams                    atomic.Int64
+	peakActiveStreams                atomic.Int64
+	drainingStreams                  atomic.Int64
+	peakDrainingStreams              atomic.Int64
+	pendingDials                     atomic.Int64
+	peakPendingDials                 atomic.Int64
+	openAttempts                     atomic.Int64
+	dnsOpenRequests                  atomic.Int64
+	dnsOpenQueued                    atomic.Int64
+	dnsOpenRejected                  atomic.Int64
+	openedStreams                    atomic.Int64
+	closedStreams                    atomic.Int64
+	queuedDials                      atomic.Int64
+	rejectedStreams                  atomic.Int64
+	rejectedQueue                    atomic.Int64
+	rejectedActive                   atomic.Int64
+	rejectedOpen                     atomic.Int64
+	failedStreams                    atomic.Int64
+	lastActiveWait                   atomic.Int64
+	maxActiveWait                    atomic.Int64
+	lastOpenWait                     atomic.Int64
+	maxOpenWait                      atomic.Int64
+	lastDialDuration                 atomic.Int64
+	maxDialDuration                  atomic.Int64
+	reconnectRetries                 atomic.Int64
+	reconnectWait                    atomic.Int64
+	closeStateMu                     sync.Mutex
+	closeDone                        chan struct{}
+	abortRequested                   chan struct{}
+	abortDone                        chan struct{}
+	abortOnce                        sync.Once
+	abortErr                         error
+	closeErr                         error
+	transportClosed                  bool // guarded by closeStateMu
+	networkLossAbort                 atomic.Bool
+	closingStreams                   []*carrierConn
+	streamAdmissionSealed            bool           // guarded by streamsMu
+	streamOpenOwners                 sync.WaitGroup // Add only under streamsMu before seal
+	streamOpenCloseErrors            error          // guarded by streamsMu
+	shutdownDrainTimeout             time.Duration  // zero uses carrierShutdownDrainTimeout
+	streamsMu                        sync.Mutex
+	streams                          map[*carrierConn]struct{}
+	idleWatchOnce                    sync.Once
+	idleWake                         chan struct{}
+	pressureIdleReclaims             atomic.Int64
+	admissionDiagnosticEvents        atomic.Uint64
+	closeLifecycleEvents             atomic.Uint64
+	closeLifecycleCapExhaustedLogged atomic.Bool
 }
 
 // WaitTrafficReady blocks until this carrier generation has received an
@@ -537,6 +562,9 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 		if logf != nil {
 			logf("WLT carrier start failed phase=load_config elapsed=%s error=%v", time.Since(startedAt), err)
 		}
+		return nil, err
+	}
+	if err := applyDataHalfCloseOption(cfg, options.DataHalfClose); err != nil {
 		return nil, err
 	}
 	if logf != nil {
@@ -701,24 +729,26 @@ func StartCarrier(ctx context.Context, options CarrierOptions) (*Carrier, error)
 	}
 
 	carrier := &Carrier{
-		client:               runtimeClient,
-		cancel:               cancel,
-		done:                 make(chan struct{}),
-		restoreSocketControl: restoreSocketControl,
-		dialRoute:            runtimeClient.DialRouteContext,
-		waitReady:            runtimeClient.WaitReady,
-		logf:                 logf,
-		startup:              startup,
-		connectTimeout:       options.ConnectTimeout,
-		dialQueueTimeout:     options.DialQueueTimeout,
-		idleTimeout:          options.IdleTimeout,
-		pressureIdleTimeout:  options.PressureIdleTimeout,
-		bufferSize:           options.BufferSize,
-		activeSlots:          make(chan struct{}, options.MaxActiveStreams),
-		openSlots:            make(chan struct{}, options.MaxOpenAttempts),
-		pendingSlots:         make(chan struct{}, options.MaxPendingDials),
-		streams:              make(map[*carrierConn]struct{}),
-		routeByClass:         carrierRouteMap(cfg),
+		client:                    runtimeClient,
+		cancel:                    cancel,
+		done:                      make(chan struct{}),
+		restoreSocketControl:      restoreSocketControl,
+		dialRoute:                 runtimeClient.DialRouteContext,
+		waitReady:                 runtimeClient.WaitReady,
+		logf:                      logf,
+		closeLifecycleDiagnostics: options.CloseLifecycleDiagnostics,
+		startup:                   startup,
+		connectTimeout:            options.ConnectTimeout,
+		dialQueueTimeout:          options.DialQueueTimeout,
+		idleTimeout:               options.IdleTimeout,
+		pressureIdleTimeout:       options.PressureIdleTimeout,
+		bufferSize:                options.BufferSize,
+		activeSlots:               make(chan struct{}, options.MaxActiveStreams),
+		drainSlots:                make(chan struct{}, min(options.MaxActiveStreams, 8)),
+		openSlots:                 make(chan struct{}, options.MaxOpenAttempts),
+		pendingSlots:              make(chan struct{}, options.MaxPendingDials),
+		streams:                   make(map[*carrierConn]struct{}),
+		routeByClass:              carrierRouteMap(cfg),
 	}
 	if options.DNSOpenReserve > 0 {
 		carrier.openGate = newPrioritySlotGate(options.MaxOpenAttempts, options.DNSOpenReserve)
@@ -764,6 +794,15 @@ func carrierAuthRecoveryRequired(err error) bool {
 		errors.Is(err, carriercommon.ErrManualCaptchaUnavailable)
 }
 
+// carrierClientConfigForBuild changes only the per-attempt copy used by NewClient.
+// A tagged diagnostic build forces bounded OPEN tracing without changing cfg.
+func carrierClientConfigForBuild(cfg carrierconfig.ClientConfig) carrierconfig.ClientConfig {
+	if forceCarrierOpenTrace {
+		cfg.DiagnosticOpenTrace = true
+	}
+	return cfg
+}
+
 func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, timeout time.Duration, logf func(string, ...any)) (*carrierengine.Client, error) {
 	startedAt := time.Now()
 	connectCtx, connectCancel := context.WithTimeout(ctx, timeout)
@@ -773,7 +812,7 @@ func connectCarrierClient(ctx context.Context, cfg *carrierconfig.ClientConfig, 
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		attemptStartedAt := time.Now()
-		runtimeClient := carrierengine.NewClient(*cfg)
+		runtimeClient := carrierengine.NewClient(carrierClientConfigForBuild(*cfg))
 		runtimeClient.SetLogger(newLogfSlogLoggerWithObserver(logf, func(record slog.Record) {
 			if startup := carrierStartupFromContext(ctx); startup != nil {
 				startup.observe(record)
@@ -1660,6 +1699,10 @@ func (c *Carrier) DialStream(ctx context.Context, routeClass string, target stri
 		c.failedStreams.Add(1)
 		return nil, err
 	}
+	if !c.beginStreamOpen() {
+		return nil, net.ErrClosed
+	}
+	defer c.streamOpenOwners.Done()
 	dialCtx := ctx
 	var cancel context.CancelFunc
 	if _, ok := dialCtx.Deadline(); !ok && c.connectTimeout > 0 {
@@ -1773,9 +1816,13 @@ reconnectLoop:
 		routeClass:    normalizeCarrierRouteClass(routeClass),
 	}
 	if !c.registerStream(stream) {
-		_ = stream.Close()
+		// This admitted owner returned after close sealed publication.
+		closeErr := stream.Abort()
+		c.streamsMu.Lock()
+		c.streamOpenCloseErrors = errors.Join(c.streamOpenCloseErrors, closeErr)
+		c.streamsMu.Unlock()
 		c.failedStreams.Add(1)
-		return nil, net.ErrClosed
+		return nil, errors.Join(net.ErrClosed, closeErr)
 	}
 	return stream, nil
 }
@@ -1800,40 +1847,229 @@ func (c *Carrier) Abort() error {
 	return c.close(true)
 }
 
+// AbortAfterNetworkLoss retires a carrier whose physical underlay is known to
+// be gone. Its shared mux must close before DATA/late-OPEN owners retire.
+// Generic Abort keeps its bounded live-parent notification contract.
+func (c *Carrier) AbortAfterNetworkLoss() error {
+	if c == nil {
+		return nil
+	}
+	c.networkLossAbort.Store(true)
+	return c.close(true)
+}
+
+const (
+	carrierShutdownDrainTimeout = 12 * time.Second
+)
+
+// requestAbort is safe while another caller owns graceful close. It publishes
+// the abort signal before starting the force path so the owner stops waiting
+// for ACKs even when the interface disappears between two close phases.
+func (c *Carrier) requestAbort() {
+	c.closeStateMu.Lock()
+	if c.transportClosed {
+		c.closeStateMu.Unlock()
+		return
+	}
+	select {
+	case <-c.abortRequested:
+	default:
+		close(c.abortRequested)
+	}
+	c.closeStateMu.Unlock()
+	c.abortOnce.Do(func() { go c.forceAbort() })
+}
+
+// Published stream Abort can still submit a close control message. Keep its
+// parent and shared control transport alive for a bounded retirement phase.
+// A blocked stream must never prevent hard abort; its actual error is joined.
+const carrierAbortStreamRetirementGrace = 100 * time.Millisecond
+
+func (c *Carrier) forceAbort() {
+	var err error
+	lostUnderlay := c.networkLossAbort.Load()
+	if lostUnderlay {
+		if c.client != nil {
+			err = errors.Join(err, c.client.Abort())
+		}
+		if c.cancel != nil {
+			c.cancel()
+		}
+	}
+	c.closeStateMu.Lock()
+	streams := append([]*carrierConn(nil), c.closingStreams...)
+	c.closeStateMu.Unlock()
+	results := make(chan error, len(streams)+2)
+	remaining := len(streams) + 1
+	go func() {
+		c.streamOpenOwners.Wait()
+		c.streamsMu.Lock()
+		err := c.streamOpenCloseErrors
+		c.streamsMu.Unlock()
+		results <- err
+	}()
+	for _, stream := range streams {
+		go func(stream *carrierConn) { results <- stream.Abort() }(stream)
+	}
+	if remaining > 0 {
+		timer := time.NewTimer(carrierAbortStreamRetirementGrace)
+	retirement:
+		for remaining > 0 {
+			select {
+			case streamErr := <-results:
+				err = errors.Join(err, streamErr)
+				remaining--
+			case <-timer.C:
+				break retirement
+			}
+		}
+		timer.Stop()
+	}
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.client != nil && !lostUnderlay {
+		remaining++
+		go func() { results <- c.client.Abort() }()
+	}
+	for ; remaining > 0; remaining-- {
+		err = errors.Join(err, <-results)
+	}
+	c.closeStateMu.Lock()
+	c.abortErr = err
+	c.closeStateMu.Unlock()
+	close(c.abortDone)
+}
+
+// closePublishedStreams starts all published stream closes before waiting, so
+// one slow KCP flow cannot consume a fresh timeout for every other flow.
+func (c *Carrier) closePublishedStreams(streams []*carrierConn) error {
+	if len(streams) == 0 {
+		return nil
+	}
+	timeout := c.shutdownDrainTimeout
+	if timeout <= 0 {
+		timeout = carrierShutdownDrainTimeout
+	}
+	results := make(chan error, len(streams))
+	for _, stream := range streams {
+		go func(stream *carrierConn) { results <- stream.Close() }(stream)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var err error
+	remaining := len(streams)
+	for remaining > 0 {
+		select {
+		case streamErr := <-results:
+			err = errors.Join(err, streamErr)
+			remaining--
+		case <-c.abortRequested:
+			return c.joinAbortedStreams(results, remaining, err)
+		case <-timer.C:
+			if c.logf != nil {
+				c.logf("WLT carrier shutdown drain timed out remaining=%d total=%d", remaining, len(streams))
+			}
+			c.requestAbort()
+			err = errors.Join(err, fmt.Errorf("WLT carrier shutdown drain timed out: %d of %d streams remain: %w", remaining, len(streams), context.DeadlineExceeded))
+			return c.joinAbortedStreams(results, remaining, err)
+		}
+	}
+	return err
+}
+
+func (c *Carrier) joinAbortedStreams(results <-chan error, remaining int, err error) error {
+	for remaining > 0 {
+		err = errors.Join(err, <-results)
+		remaining--
+	}
+	return err
+}
+
 func (c *Carrier) close(immediate bool) error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		c.streamsMu.Lock()
-		if c.done != nil {
-			close(c.done)
+	c.closeStateMu.Lock()
+	if c.closeDone != nil {
+		done := c.closeDone
+		c.closeStateMu.Unlock()
+		if immediate {
+			c.requestAbort()
+			return c.waitCloseAfterAbort(done)
 		}
-		c.streamsMu.Unlock()
-		if c.cancel != nil {
-			c.cancel()
-		}
-		if c.client != nil {
-			var err error
-			if immediate {
-				err = c.client.Abort()
-			} else {
-				err = c.client.Stop()
-			}
-			if err != nil && !strings.Contains(err.Error(), "not running") {
-				c.closeErr = err
-			}
-		}
-		// Wait for old maintenance to finish restoring auth/cache state before
-		// the next service generation may start.
-		if c.authReserveDone != nil {
-			<-c.authReserveDone
-		}
-		if c.restoreSocketControl != nil {
-			c.restoreSocketControl()
-		}
-	})
+		<-done
+		return c.closeErr
+	}
+	c.closeDone = make(chan struct{})
+	c.abortRequested = make(chan struct{})
+	c.abortDone = make(chan struct{})
+	done := c.closeDone
+	c.streamsMu.Lock()
+	c.streamAdmissionSealed = true
+	if c.done != nil {
+		close(c.done)
+	}
+	for stream := range c.streams {
+		c.closingStreams = append(c.closingStreams, stream)
+	}
+	c.streamsMu.Unlock()
+	streams := append([]*carrierConn(nil), c.closingStreams...)
+	c.closeStateMu.Unlock()
+
+	var streamErr error
+	if immediate {
+		c.requestAbort()
+	} else {
+		streamErr = c.closePublishedStreams(streams)
+	}
+	c.closeStateMu.Lock()
+	aborting := channelClosed(c.abortRequested)
+	c.closeStateMu.Unlock()
+	if !aborting && c.client != nil {
+		streamErr = errors.Join(streamErr, c.client.Stop())
+	}
+	// Stop can itself be preempted by Abort. Serialize the final decision with
+	// requestAbort so no force worker outlives the carrier close owner.
+	c.closeStateMu.Lock()
+	aborting = channelClosed(c.abortRequested)
+	c.transportClosed = !aborting
+	c.closeStateMu.Unlock()
+	if aborting {
+		<-c.abortDone
+		c.closeStateMu.Lock()
+		streamErr = errors.Join(streamErr, c.abortErr)
+		c.transportClosed = true
+		c.closeStateMu.Unlock()
+	}
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.authReserveDone != nil {
+		<-c.authReserveDone
+	}
+	if c.restoreSocketControl != nil {
+		c.restoreSocketControl()
+	}
+	c.closeStateMu.Lock()
+	c.closeErr = streamErr
+	close(done)
+	c.closeStateMu.Unlock()
+	return streamErr
+}
+
+func (c *Carrier) waitCloseAfterAbort(done <-chan struct{}) error {
+	<-done
 	return c.closeErr
+}
+
+func channelClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Carrier) Stats() CarrierStats {
@@ -1857,6 +2093,9 @@ func (c *Carrier) Stats() CarrierStats {
 		RejectedActive:       c.rejectedActive.Load(),
 		RejectedOpen:         c.rejectedOpen.Load(),
 		PressureIdleReclaims: c.pressureIdleReclaims.Load(),
+		DrainingStreams:      c.drainingStreams.Load(),
+		PeakDrainingStreams:  c.peakDrainingStreams.Load(),
+		DrainCapacity:        cap(c.drainSlots),
 		FailedStreams:        c.failedStreams.Load(),
 		LastActiveWaitMillis: nanosToMillis(c.lastActiveWait.Load()),
 		MaxActiveWaitMillis:  nanosToMillis(c.maxActiveWait.Load()),
@@ -1876,6 +2115,7 @@ func (c *Carrier) Stats() CarrierStats {
 func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, target string) (func(), error) {
 	acquired := c.tryAcquireOrReclaimActiveSlot(routeClass)
 	if !acquired {
+		c.logActiveAdmissionDiagnostic("saturated", 0)
 		if !tryAcquire(c.pendingSlots) {
 			c.rejectedQueue.Add(1)
 			c.rejectedStreams.Add(1)
@@ -1890,6 +2130,7 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 		}()
 
 		waitCtx := ctx
+		queueStartedAt := time.Now()
 		var cancel context.CancelFunc
 		if c.dialQueueTimeout > 0 {
 			waitCtx, cancel = context.WithTimeout(ctx, c.dialQueueTimeout)
@@ -1902,6 +2143,7 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 			if err := waitCtx.Err(); err != nil {
 				c.rejectedActive.Add(1)
 				c.rejectedStreams.Add(1)
+				c.logActiveAdmissionDiagnostic("wait_timeout", time.Since(queueStartedAt))
 				return nil, fmt.Errorf("WLT carrier active stream limit reached route=%s target=%s: %w", routeClass, target, err)
 			}
 			// An occupied stream can cross the pressure-idle threshold while this
@@ -1942,8 +2184,8 @@ func (c *Carrier) acquireActiveSlot(ctx context.Context, routeClass string, targ
 			return
 		}
 		activeReleased = true
-		release(c.activeSlots)
 		c.activeStreams.Add(-1)
+		release(c.activeSlots)
 	}, nil
 }
 
@@ -2277,13 +2519,17 @@ func release(ch chan struct{}) {
 
 type carrierConn struct {
 	net.Conn
-	carrier       *Carrier
-	releaseActive func()
-	idleTimeout   time.Duration
-	routeClass    string
-	lastActivity  atomic.Int64
-	idleClosing   atomic.Bool
-	closeOnce     sync.Once
+	carrier          *Carrier
+	releaseActive    func()
+	idleTimeout      time.Duration
+	routeClass       string
+	lastActivity     atomic.Int64
+	idleClosing      atomic.Bool
+	admissionClosing atomic.Bool
+	closeMu          sync.Mutex
+	closeDone        chan struct{}
+	closeErr         error
+	drainOwned       bool
 }
 
 // FlowID exposes the diagnostics-safe TinyMux flow identifier while retaining
@@ -2339,21 +2585,80 @@ func (c *carrierConn) Abort() error {
 }
 
 func (c *carrierConn) close(immediate bool) error {
-	var err error
-	c.closeOnce.Do(func() {
+	c.closeMu.Lock()
+	if c.closeDone != nil {
+		done := c.closeDone
+		c.closeMu.Unlock()
 		if immediate {
-			if aborter, isAborter := c.Conn.(interface{ Abort() error }); isAborter {
-				err = aborter.Abort()
-			} else {
-				err = c.Conn.Close()
+			// Only an explicit, nonblocking interruption contract may preempt
+			// an existing owner. Generic Abort methods are not concurrency-safe.
+			if interrupter, ok := c.Conn.(interface{ InterruptClose() }); ok {
+				interrupter.InterruptClose()
 			}
+		}
+		// The first caller owns the original synchronous transport close.
+		<-done
+		return c.closeErr
+	}
+	c.beginCloseLocked(immediate)
+	c.closeMu.Unlock()
+	return c.finishClose(immediate)
+}
+
+// beginCloseLocked only changes ownership. It never waits for a transport or
+// a drain token. The caller holds closeMu, and pressure reclaim may also hold
+// streamsMu while it claims a still-idle stream.
+func (c *carrierConn) beginCloseLocked(immediate bool) {
+	c.admissionClosing.Store(true)
+	c.closeDone = make(chan struct{})
+	if immediate || c.carrier == nil || c.releaseActive == nil {
+		return
+	}
+	if !tryAcquire(c.carrier.drainSlots) {
+		return // Full drain budget retains the original active ownership.
+	}
+	c.drainOwned = true
+	count := c.carrier.drainingStreams.Add(1)
+	updateMaxAtomicInt64(&c.carrier.peakDrainingStreams, count)
+	c.releaseActive()
+}
+
+// finishClose does potentially blocking underlay work outside closeMu and
+// streamsMu. Only the goroutine that created closeDone invokes this method.
+func (c *carrierConn) finishClose(immediate bool) error {
+	started := time.Now()
+	lifecycleEvent := c.carrier.reserveCloseLifecycleEvent()
+	if lifecycleEvent != 0 {
+		c.carrier.logCloseLifecycleStart(lifecycleEvent, c, immediate, started)
+	}
+	if c.drainOwned && c.carrier.logf != nil {
+		c.carrier.logf("WLT close drain ownership event=%d live=%d draining=%d drain_capacity=%d total_ceiling=%d",
+			lifecycleEvent, c.carrier.activeStreams.Load(), c.carrier.drainingStreams.Load(),
+			cap(c.carrier.drainSlots), cap(c.carrier.activeSlots)+cap(c.carrier.drainSlots))
+	}
+	var err error
+	if immediate {
+		if aborter, ok := c.Conn.(interface{ Abort() error }); ok {
+			err = aborter.Abort()
 		} else {
 			err = c.Conn.Close()
 		}
-		c.carrier.unregisterStream(c)
+	} else {
+		err = c.Conn.Close()
+	}
+	c.carrier.unregisterStream(c)
+	if c.drainOwned {
+		c.carrier.drainingStreams.Add(-1)
+		release(c.carrier.drainSlots)
+	} else if c.releaseActive != nil {
 		c.releaseActive()
-		c.carrier.closedStreams.Add(1)
-	})
+	}
+	c.carrier.closedStreams.Add(1)
+	if lifecycleEvent != 0 {
+		c.carrier.logCloseLifecycleEnd(lifecycleEvent, c, immediate, started, err)
+	}
+	c.closeErr = err
+	close(c.closeDone)
 	return err
 }
 
@@ -2368,12 +2673,33 @@ func (c *carrierConn) markActivity() {
 	c.lastActivity.Store(time.Now().UnixNano())
 }
 
+func (c *Carrier) beginStreamOpen() bool {
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+	if c.streamAdmissionSealed {
+		return false
+	}
+	if c.done != nil {
+		select {
+		case <-c.done:
+			return false
+		default:
+		}
+	}
+	c.streamOpenOwners.Add(1)
+	return true
+}
+
 func (c *Carrier) registerStream(stream *carrierConn) bool {
 	if stream == nil {
 		return false
 	}
 	stream.markActivity()
 	c.streamsMu.Lock()
+	if c.streamAdmissionSealed {
+		c.streamsMu.Unlock()
+		return false
+	}
 	if c.done != nil {
 		select {
 		case <-c.done:
@@ -2470,15 +2796,37 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	if c == nil || c.pressureIdleTimeout <= 0 {
 		return false
 	}
+	routeClass = normalizeCarrierRouteClass(routeClass)
+	skipped := make(map[*carrierConn]struct{})
+	// At most one registered stream can hold each active slot. Bound this
+	// scan even if other goroutines continuously close and open new streams.
+	maxCandidates := cap(c.activeSlots)
+	if maxCandidates < 1 {
+		maxCandidates = 1
+	}
+	for attempts := 0; attempts < maxCandidates; attempts++ {
+		candidate := c.selectPressureIdleStream(routeClass, skipped)
+		if candidate == nil {
+			return false
+		}
+		if c.tryReclaimPressureIdleStream(candidate, routeClass) {
+			return true
+		}
+		skipped[candidate] = struct{}{}
+	}
+	return false
+}
+
+// Selection does not claim the stream. Its state must be rechecked after
+// acquiring closeMu, because a normal Close may start in between.
+func (c *Carrier) selectPressureIdleStream(routeClass string, skipped map[*carrierConn]struct{}) *carrierConn {
 	cutoff := time.Now().Add(-c.pressureIdleTimeout).UnixNano()
 	routeClass = normalizeCarrierRouteClass(routeClass)
 	var candidate *carrierConn
 	var sameRouteCandidate *carrierConn
 	c.streamsMu.Lock()
 	for stream := range c.streams {
-		// Its graceful Close already owns closeOnce. Abort would wait for that
-		// drain instead of freeing a slot before the pending dial times out.
-		if stream.idleClosing.Load() {
+		if _, excluded := skipped[stream]; excluded || stream.idleClosing.Load() || stream.admissionClosing.Load() {
 			continue
 		}
 		lastActivity := stream.lastActivity.Load()
@@ -2496,15 +2844,35 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	if candidate == nil {
 		candidate = sameRouteCandidate
 	}
-	if candidate != nil {
-		// Remove it before closing so concurrent admission attempts cannot pick
-		// the same stream while Close is releasing its active slot.
-		delete(c.streams, candidate)
-	}
 	c.streamsMu.Unlock()
+	return candidate
+}
+
+func (c *Carrier) tryReclaimPressureIdleStream(candidate *carrierConn, routeClass string) bool {
 	if candidate == nil {
 		return false
 	}
+	// TryLock cannot wait behind an ordinary graceful Close. Keep streamsMu
+	// while claiming so another reclaimer cannot select the same stream.
+	c.streamsMu.Lock()
+	if _, registered := c.streams[candidate]; !registered || candidate.idleClosing.Load() || candidate.admissionClosing.Load() || !candidate.closeMu.TryLock() {
+		c.streamsMu.Unlock()
+		return false
+	}
+	cutoff := time.Now().Add(-c.pressureIdleTimeout).UnixNano()
+	lastActivity := candidate.lastActivity.Load()
+	if lastActivity == 0 || lastActivity > cutoff {
+		candidate.closeMu.Unlock()
+		c.streamsMu.Unlock()
+		return false
+	}
+	// Claim the close while both locks are held, then release them before any
+	// potentially blocking underlay Abort or diagnostic logging.
+	// Keep this close owner visible to generation shutdown until finishClose
+	// unregisters it. admissionClosing excludes it from later reclaim scans.
+	candidate.beginCloseLocked(true)
+	candidate.closeMu.Unlock()
+	c.streamsMu.Unlock()
 	c.pressureIdleReclaims.Add(1)
 	if c.logf != nil {
 		c.logf("WLT carrier pressure idle reclaim stream route=%s requested_route=%s idle_ms=%d", candidate.routeClass, routeClass, time.Since(time.Unix(0, candidate.lastActivity.Load())).Milliseconds())
@@ -2513,7 +2881,7 @@ func (c *Carrier) reclaimPressureIdleStream(routeClass string) bool {
 	// short queue deadline.  The reliable transport's graceful Close can wait
 	// for unacknowledged payload even though this flow has been idle long enough
 	// to discard it.  Abort only this stale flow; normal closes still drain.
-	_ = candidate.Abort()
+	_ = candidate.finishClose(true)
 	return true
 }
 
@@ -2529,7 +2897,7 @@ func (c *Carrier) nextPressureIdleReclaimDelay() (time.Duration, bool) {
 	found := false
 	c.streamsMu.Lock()
 	for stream := range c.streams {
-		if stream.idleClosing.Load() {
+		if stream.idleClosing.Load() || stream.admissionClosing.Load() {
 			continue
 		}
 		lastActivity := stream.lastActivity.Load()
