@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package libbox
 
 import "testing"
@@ -7,16 +9,16 @@ func TestCheckConfigAcceptsWLTServiceAfterOutbound(t *testing.T) {
 		"services": [
 			{
 				"type": "wlt",
-				"tag": "wlt-turnable",
-				"transport": "turnable",
-				"turnable_config": "{}"
+				"tag": "wlt-carrier",
+				"transport": "wlt",
+				"carrier_config": "{}"
 			}
 		],
 		"outbounds": [
 			{
 				"type": "wlt",
 				"tag": "wlt-eu",
-				"service": "wlt-turnable",
+				"service": "wlt-carrier",
 				"route": "eu",
 				"network": "tcp"
 			}
