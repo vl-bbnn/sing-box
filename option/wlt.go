@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package option
 
 import (
@@ -11,8 +13,12 @@ import (
 )
 
 type WLTServiceOptions struct {
-	Transport                    string             `json:"transport,omitempty"`
-	TurnableConfig               string             `json:"turnable_config,omitempty"`
+	Transport         string `json:"transport,omitempty"`
+	CarrierConfig     string `json:"carrier_config,omitempty"`
+	CarrierConfigFile string `json:"carrier_config_file,omitempty"`
+	// Deprecated: use carrier_config.
+	TurnableConfig string `json:"turnable_config,omitempty"`
+	// Deprecated: use carrier_config_file.
 	TurnableConfigFile           string             `json:"turnable_config_file,omitempty"`
 	ConnectTimeout               badoption.Duration `json:"connect_timeout,omitempty"`
 	MaxActiveStreams             int                `json:"max_active_streams,omitempty"`
@@ -45,14 +51,24 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	transport := strings.ToLower(strings.TrimSpace(o.Transport))
 	if transport == "" {
-		transport = "turnable"
+		transport = "wlt"
 		o.Transport = transport
 	}
-	if transport != "turnable" {
+	if transport != "wlt" && transport != "carrier" && transport != "turnable" {
 		return E.New("unsupported wlt service transport: ", o.Transport)
 	}
-	if strings.TrimSpace(o.TurnableConfig) == "" && strings.TrimSpace(o.TurnableConfigFile) == "" {
-		return E.New("wlt service requires turnable_config or turnable_config_file")
+	o.CarrierConfig = strings.TrimSpace(o.CarrierConfig)
+	o.CarrierConfigFile = strings.TrimSpace(o.CarrierConfigFile)
+	o.TurnableConfig = strings.TrimSpace(o.TurnableConfig)
+	o.TurnableConfigFile = strings.TrimSpace(o.TurnableConfigFile)
+	if o.CarrierConfig == "" {
+		o.CarrierConfig = o.TurnableConfig
+	}
+	if o.CarrierConfigFile == "" {
+		o.CarrierConfigFile = o.TurnableConfigFile
+	}
+	if o.CarrierConfig == "" && o.CarrierConfigFile == "" {
+		return E.New("wlt service requires carrier_config or carrier_config_file")
 	}
 	if o.MaxActiveStreams < 0 {
 		return E.New("wlt service max_active_streams must be non-negative")
