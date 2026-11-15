@@ -5,6 +5,7 @@ package option
 import (
 	"context"
 	"strings"
+	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -45,15 +46,19 @@ type WLTServiceOptions struct {
 	// PressureIdleTimeout enables reclaiming long-idle streams only when the
 	// active-stream limit is saturated. It never changes the normal idle
 	// timeout used by media and long-lived connections.
-	PressureIdleTimeout          badoption.Duration `json:"pressure_idle_timeout,omitempty"`
-	BufferSize                   int                `json:"buffer_size,omitempty"`
-	TinyMuxFlowBuffer            int                `json:"tiny_mux_flow_buffer,omitempty"`
-	TinyMuxFlowSendBuffer        int                `json:"tiny_mux_send_buffer,omitempty"`
-	TinyMuxControlBuffer         int                `json:"tiny_mux_control_buffer,omitempty"`
-	TinyMuxRateBurstBytes        int                `json:"mux_rate_burst,omitempty"`
-	TinyMuxPingTimeout           badoption.Duration `json:"tiny_mux_ping_timeout,omitempty"`
-	PeerIncomingBuffer           int                `json:"peer_incoming_buffer,omitempty"`
-	PeerWriteBuffer              int                `json:"peer_write_buffer,omitempty"`
+	PressureIdleTimeout   badoption.Duration `json:"pressure_idle_timeout,omitempty"`
+	BufferSize            int                `json:"buffer_size,omitempty"`
+	TinyMuxFlowBuffer     int                `json:"tiny_mux_flow_buffer,omitempty"`
+	TinyMuxFlowSendBuffer int                `json:"tiny_mux_send_buffer,omitempty"`
+	TinyMuxControlBuffer  int                `json:"tiny_mux_control_buffer,omitempty"`
+	TinyMuxRateBurstBytes int                `json:"mux_rate_burst,omitempty"`
+	TinyMuxPingTimeout    badoption.Duration `json:"tiny_mux_ping_timeout,omitempty"`
+	PeerIncomingBuffer    int                `json:"peer_incoming_buffer,omitempty"`
+	PeerWriteBuffer       int                `json:"peer_write_buffer,omitempty"`
+	DataHalfClose         bool               `json:"data_half_close,omitempty"`
+	// Opt-in only: retain existing LTE reads briefly when Wi-Fi becomes the default.
+	// No new dials enter the retiring carrier; actual network loss still aborts it.
+	PhysicalHandoverDrainGrace   badoption.Duration `json:"physical_handover_drain_grace,omitempty"`
 	RedundantControl             bool               `json:"redundant_control,omitempty"`
 	AdaptivePeerData             bool               `json:"adaptive_peer_data,omitempty"`
 	AdaptivePeerThresholdBytes   int                `json:"adaptive_peer_threshold_bytes_per_second,omitempty"`
@@ -95,6 +100,9 @@ func (o *WLTServiceOptions) UnmarshalJSONContext(_ context.Context, content []by
 	}
 	if o.CarrierConfig == "" && o.CarrierConfigFile == "" {
 		return E.New("wlt service requires carrier_config or carrier_config_file")
+	}
+	if o.PhysicalHandoverDrainGrace < 0 || (o.PhysicalHandoverDrainGrace > 0 && time.Duration(o.PhysicalHandoverDrainGrace) < time.Second) || time.Duration(o.PhysicalHandoverDrainGrace) > 5*time.Second {
+		return E.New("wlt service physical_handover_drain_grace must be zero (disabled) or between one and five seconds")
 	}
 	if o.MaxActiveStreams < 0 {
 		return E.New("wlt service max_active_streams must be non-negative")
