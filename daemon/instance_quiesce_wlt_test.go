@@ -84,3 +84,17 @@ func TestWLTShutdownWithoutServicesRemainsImmediate(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWLTCloseContextPreservationAppliesOnlyToActualWLTService(t *testing.T) {
+	if hasWLTService(context.Background()) {
+		t.Fatal("missing manager changed ordinary context order")
+	}
+	ordinary := &drainTestManager{services: []adapter.Service{&drainTestService{kind: "ordinary"}}}
+	if hasWLTService(service.ContextWith[adapter.ServiceManager](context.Background(), ordinary)) {
+		t.Fatal("ordinary service delays cancellation")
+	}
+	actual := &drainTestManager{services: []adapter.Service{&drainTestService{kind: C.TypeWLT}}}
+	if !hasWLTService(service.ContextWith[adapter.ServiceManager](context.Background(), actual)) {
+		t.Fatal("WLT service loses parent before drain")
+	}
+}

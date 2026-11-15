@@ -16,6 +16,19 @@ import (
 // OPEN or by giving each service its own fresh timeout.
 const wltShutdownDrainTimeout = 5 * time.Second
 
+func hasWLTService(instanceCtx context.Context) bool {
+	manager := service.FromContext[adapter.ServiceManager](instanceCtx)
+	if manager == nil {
+		return false
+	}
+	for _, candidate := range manager.Services() {
+		if candidate.Type() == C.TypeWLT {
+			return true
+		}
+	}
+	return false
+}
+
 func quiesceWLTServices(instanceCtx context.Context) error {
 	manager := service.FromContext[adapter.ServiceManager](instanceCtx)
 	if manager == nil {

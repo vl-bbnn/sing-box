@@ -140,10 +140,19 @@ func (i *Instance) Close() error {
 	// lx:begin wlt - finish admitted OPENs before canceling their parent context.
 	quiesceErr := quiesceWLTServices(i.ctx)
 	// lx:end wlt
-	i.cancel()
+	if !hasWLTService(i.ctx) {
+		// Preserve the ordinary close order, including builds without WLT.
+		i.cancel()
+		i.urlTestHistoryStorage.Close()
+		return E.Errors(quiesceErr, i.instance.Close())
+	}
+	// Keep the parent context alive while published WLT flows drain through
+	// the service close path. Always cancel, even if the close reports errors.
 	i.urlTestHistoryStorage.Close()
+	closeErr := i.instance.Close()
+	i.cancel()
 	// lx:begin wlt - preserve a drain failure while always closing the instance.
-	return E.Errors(quiesceErr, i.instance.Close())
+	return E.Errors(quiesceErr, closeErr)
 	// lx:end wlt
 }
 
