@@ -203,6 +203,14 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 }
 
 func (s *RemoteRuleSet) loopUpdate() {
+	// PostStart normally follows StartContext, which initializes the ticker.
+	// A rapid service reload can nevertheless cancel a partially initialized
+	// rule-set before its updater goroutine observes the context. Capture the
+	// channel once and fail closed instead of dereferencing a nil ticker.
+	ticker := s.updateTicker
+	if ticker == nil {
+		return
+	}
 	if time.Since(s.lastUpdated) > s.updateInterval {
 		err := s.fetch(s.ctx, nil)
 		if err != nil {
@@ -216,7 +224,7 @@ func (s *RemoteRuleSet) loopUpdate() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-s.updateTicker.C:
+		case <-ticker.C:
 			s.updateOnce()
 		}
 	}
