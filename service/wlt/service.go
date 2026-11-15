@@ -1,3 +1,5 @@
+//go:build with_wlt
+
 package wlt
 
 import (
@@ -35,17 +37,17 @@ type Service struct {
 	options     option.WLTServiceOptions
 	access      sync.RWMutex
 	restart     sync.Mutex
-	carrier     *wltpkg.TurnableCarrier
+	carrier     *wltpkg.Carrier
 	statsCancel context.CancelFunc
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
 	transport := strings.ToLower(strings.TrimSpace(options.Transport))
 	if transport == "" {
-		transport = "turnable"
+		transport = "wlt"
 		options.Transport = transport
 	}
-	if transport != "turnable" {
+	if transport != "wlt" && transport != "carrier" && transport != "turnable" {
 		return nil, E.New("unsupported wlt service transport: ", options.Transport)
 	}
 	return &Service{
@@ -82,10 +84,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (s *Service) startCarrier() (*wltpkg.TurnableCarrier, error) {
-	return wltpkg.StartTurnableCarrier(s.ctx, wltpkg.TurnableCarrierOptions{
-		Config:                       s.options.TurnableConfig,
-		ConfigFile:                   s.options.TurnableConfigFile,
+func (s *Service) startCarrier() (*wltpkg.Carrier, error) {
+	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
+		Config:                       s.options.CarrierConfig,
+		ConfigFile:                   s.options.CarrierConfigFile,
 		ConnectTimeout:               time.Duration(s.options.ConnectTimeout),
 		MaxActiveStreams:             s.options.MaxActiveStreams,
 		MaxOpenAttempts:              s.options.MaxOpenAttempts,
@@ -131,13 +133,13 @@ func (s *Service) Close() error {
 	return err
 }
 
-func (s *Service) Carrier() *wltpkg.TurnableCarrier {
+func (s *Service) Carrier() *wltpkg.Carrier {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return s.carrier
 }
 
-func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
+func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 	if s.statsCancel != nil {
 		s.statsCancel()
 	}
@@ -200,7 +202,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.TurnableCarrier) {
 	}()
 }
 
-func (s *Service) restartCarrier(expected *wltpkg.TurnableCarrier, reason string) {
+func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string) {
 	s.restart.Lock()
 	defer s.restart.Unlock()
 
