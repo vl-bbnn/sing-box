@@ -248,6 +248,13 @@ func buildApple() {
 		"-libname=box",
 		"-tags-not-macos=with_low_memory",
 	}
+	bindOutput := os.Getenv("SING_BOX_APPLE_BIND_OUTPUT")
+	if bindOutput != "" {
+		if !filepath.IsAbs(bindOutput) || !strings.HasSuffix(bindOutput, ".xcframework") {
+			log.Fatal("SING_BOX_APPLE_BIND_OUTPUT must be an absolute .xcframework path")
+		}
+		args = append(args, "-o", bindOutput)
+	}
 	//if !withTailscale {
 	//	args = append(args, "-tags-macos="+strings.Join(memcTags, ","))
 	//}
@@ -279,6 +286,10 @@ func buildApple() {
 	err := command.Run()
 	if err != nil {
 		log.Fatal(err)
+	}
+	if bindOutput != "" {
+		log.Info("built at ", bindOutput)
+		return
 	}
 
 	copyPath := filepath.Join("..", "sing-box-for-apple")
