@@ -67,7 +67,7 @@ func awaitDialResult(t *testing.T, ch <-chan dialTestResult) dialTestResult {
 }
 func publishDialReplacement(t *testing.T, s *Service, b *wltpkg.Carrier) {
 	t.Helper()
-	old, _, generation, ignored := s.beginInterfaceUpdate("wifi", "android")
+	old, _, generation, _, ignored := s.beginInterfaceUpdate("wifi", "android")
 	if ignored {
 		t.Fatal("return notification ignored")
 	}

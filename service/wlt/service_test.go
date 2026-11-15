@@ -61,6 +61,22 @@ func TestInterfaceRecoveryUsesClientReloadFallbackDelayOnAndroid(t *testing.T) {
 	}
 }
 
+func TestConfirmedLossShortensOnlyAppleReturnDelay(t *testing.T) {
+	for _, goos := range []string{"ios", "darwin"} {
+		if got := interfaceRecoveryDelayFor(goos, true, wltInterfaceRecoveryGrace); got != wltConfirmedLossRecoveryDelay {
+			t.Fatalf("%s confirmed loss delay=%s", goos, got)
+		}
+		if got := interfaceRecoveryDelayFor(goos, false, wltInterfaceRecoveryGrace); got != wltInterfaceRecoveryGrace {
+			t.Fatalf("%s ordinary handover delay=%s", goos, got)
+		}
+	}
+	for _, goos := range []string{"android", "linux"} {
+		if got := interfaceRecoveryDelayFor(goos, true, interfaceRecoveryGraceFor(goos)); got != interfaceRecoveryGraceFor(goos) {
+			t.Fatalf("%s delay changed after loss: %s", goos, got)
+		}
+	}
+}
+
 func TestDuplicateInterfaceUpdatesAreIgnoredOnAndroidAndApple(t *testing.T) {
 	const identity = "10|cellular0|cellular|[192.0.2.2/32]"
 	for _, goos := range []string{"android", "ios", "darwin"} {
@@ -102,7 +118,7 @@ func TestRepeatedAppleInterfaceUpdatePreservesLiveCarrierAndAdmission(t *testing
 			}
 			ready := service.interfaceReady
 			for range 7 {
-				gotCarrier, previous, generation, ignored := service.beginInterfaceUpdate(identity, goos)
+				gotCarrier, previous, generation, _, ignored := service.beginInterfaceUpdate(identity, goos)
 				if !ignored || gotCarrier != carrier || previous != identity || generation != 4 {
 					t.Fatalf("duplicate changed live state: carrier=%p previous=%q generation=%d ignored=%t", gotCarrier, previous, generation, ignored)
 				}
@@ -117,7 +133,7 @@ func TestRepeatedAppleInterfaceUpdatePreservesLiveCarrierAndAdmission(t *testing
 				t.Fatalf("live carrier admission changed: carrier=%p error=%v", got, err)
 			}
 			changedIdentity := "10|cellular0|cellular|[192.0.2.3/32]"
-			_, _, generation, ignored := service.beginInterfaceUpdate(changedIdentity, goos)
+			_, _, generation, _, ignored := service.beginInterfaceUpdate(changedIdentity, goos)
 			if ignored || generation != 5 || service.interfaceKey != changedIdentity || attemptCtx.Err() == nil {
 				t.Fatal("real address change did not begin a new recovery generation")
 			}
@@ -535,14 +551,14 @@ func TestSameInterfaceReturnAfterLossStartsNewRecoveryGeneration(t *testing.T) {
 				interfaceUnavailable: true,
 				interfaceKey:         "10|cellular0|cellular|[192.0.2.2/32]",
 			}
-			gotCarrier, previous, generation, ignored := service.beginInterfaceUpdate(service.interfaceKey, goos)
+			gotCarrier, previous, generation, wasUnavailable, ignored := service.beginInterfaceUpdate(service.interfaceKey, goos)
 			if ignored {
 				t.Fatal("same-interface return after loss was suppressed as a duplicate")
 			}
 			if gotCarrier != carrier || previous != service.interfaceKey {
 				t.Fatal("recovery did not retain the exact old interface/carrier identity")
 			}
-			if generation != 8 || service.interfaceUnavailable {
+			if generation != 8 || service.interfaceUnavailable || !wasUnavailable {
 				t.Fatalf("recovery generation=%d unavailable=%t, want 8/false", generation, service.interfaceUnavailable)
 			}
 		})
@@ -1028,7 +1044,7 @@ func TestInterfaceChangeCancelsInitialOrRestartAttemptAndRejectsLateSuccess(t *t
 				close(done)
 			}()
 			awaitLifecycleEvent(t, entered, "start attempt")
-			_, _, generation, ignored := s.beginInterfaceUpdate("11|wifi0", "android")
+			_, _, generation, _, ignored := s.beginInterfaceUpdate("11|wifi0", "android")
 			if ignored || generation != 1 {
 				t.Fatal("interface change did not supersede in-flight start")
 			}
@@ -1062,7 +1078,7 @@ func TestDuplicateInterfaceDuringStartDoesNotCancelSameGeneration(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s.restartAttempt = &carrierStartAttempt{cancel: cancel, generation: 0}
-	_, _, generation, ignored := s.beginInterfaceUpdate(s.interfaceKey, "ios")
+	_, _, generation, _, ignored := s.beginInterfaceUpdate(s.interfaceKey, "ios")
 	if !ignored || generation != 0 || ctx.Err() != nil {
 		t.Fatal("duplicate callback canceled same-interface startup")
 	}
@@ -1089,5 +1105,34 @@ func TestHeartbeatIncidentCannotOverrideCurrentCounters(t *testing.T) {
 	}
 	if fields["last_incident"] != "rejected_delta=2%20active=49%09pending=7%0Dfailed=3%0Amux_open_errors=4" {
 		t.Fatal("incident context lost or not encoded")
+	}
+}
+
+func TestApplePositivePhysicalHandoverShortensSettle(t *testing.T) {
+	const lte = "2|pdp_ip0|cellular|[192.0.2.2/32]"
+	const wifi = "20|en0|wifi|[198.51.100.2/24]"
+	const ethernet = "21|en1|ethernet|[203.0.113.2/24]"
+	for _, goos := range []string{"ios", "darwin"} {
+		for _, keys := range [][2]string{{lte, wifi}, {wifi, lte}, {wifi, ethernet}} {
+			if got := physicalHandoverDelayFor(goos, keys[0], keys[1], wltInterfaceRecoveryGrace); got != time.Second {
+				t.Fatalf("%s physical handover delay=%s", goos, got)
+			}
+		}
+		for _, other := range []string{lte, "2|pdp_ip0|cellular|[192.0.2.3/32]", "", "bad|en0|wifi|[]", "0|en0|wifi|[]", "20||wifi|[]", "20|en0||[]", "20|en0|other|[]", "20|en0|unknown|[]", "20|utun5|other|[]"} {
+			if got := physicalHandoverDelayFor(goos, lte, other, wltInterfaceRecoveryGrace); got != wltInterfaceRecoveryGrace {
+				t.Fatalf("%s same/invalid link %q shortened to %s", goos, other, got)
+			}
+		}
+		for _, previous := range []string{"0|pdp_ip0|cellular|[]", "2|pdp_ip0|other|[]", "2|pdp_ip0|unknown|[]", "33|utun5|other|[]"} {
+			if got := physicalHandoverDelayFor(goos, previous, wifi, wltInterfaceRecoveryGrace); got != wltInterfaceRecoveryGrace {
+				t.Fatalf("%s invalid prior link %q shortened to %s", goos, previous, got)
+			}
+		}
+	}
+	for _, goos := range []string{"android", "linux", "windows"} {
+		grace := interfaceRecoveryGraceFor(goos)
+		if got := physicalHandoverDelayFor(goos, lte, wifi, grace); got != grace {
+			t.Fatalf("%s physical handover delay changed to %s", goos, got)
+		}
 	}
 }

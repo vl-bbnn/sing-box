@@ -6,13 +6,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync/atomic"
 	"time"
 
 	wltpkg "github.com/sagernet/sing-box/common/wlt"
+	carriercommon "github.com/vl-bbnn/wlt-carrier/pkg/common"
 )
 
-var errDialServiceStopped = errors.Join(errors.New("wlt service is stopped"), context.Canceled)
+var errDialServiceStopped = errors.Join(carriercommon.ErrOpenServiceStopped, context.Canceled)
 var errDialCarrierReplaced = errors.Join(errors.New("wlt carrier replaced without a local generation recovery"), context.Canceled)
 
 var nextDialAttemptID atomic.Uint64
@@ -117,6 +119,72 @@ func (s *Service) acquireDialLease(ctx context.Context, previous *dialLease) (*d
 	}
 }
 
+// waitForEarlyLocalRetirement bridges only a failed, unpublished transport
+// OPEN with an exact typed local peer-loss witness and a subsequent real
+// local generation notification. An unrelated or mixed EOF cannot acquire
+// retry authority merely because a later network callback happens. The original
+// transport error remains an error observation; it is never called a local
+// cancellation. No returned stream or application payload is retried.
+func (s *Service) waitForEarlyLocalRetirement(ctx context.Context, lease *dialLease, logicalDialID uint64, original error) bool {
+	if !(errors.Is(original, io.EOF) || errors.Is(original, io.ErrUnexpectedEOF) ||
+		errors.Is(original, io.ErrClosedPipe) || errors.Is(original, net.ErrClosed)) {
+		return false
+	}
+	proof := carriercommon.PendingOpenPathLossFromError(original)
+	if proof == nil || (carriercommon.PeerPathLossFromError(proof.Err) == nil || proof.Diagnostic.LogicalDialID != logicalDialID || proof.Diagnostic.DialAttemptID != lease.attemptID || proof.Diagnostic.CarrierGeneration != lease.generation || proof.Diagnostic.InterfaceGeneration != lease.interfaceGeneration) {
+		return false
+	}
+	s.access.Lock()
+	retired := lease.retired
+	provedRetirement := proof != nil && ctx.Err() == nil && !s.stopped && !s.quiescing && s.ctx.Err() == nil && retired != nil && retired.carrier == lease.carrier && retired.generation == lease.generation && context.Cause(lease.ctx) == retired
+	if provedRetirement {
+		s.access.Unlock()
+		return true
+	}
+	eligible := ctx.Err() == nil && lease.ctx.Err() == nil && !s.stopped && !s.quiescing &&
+		s.ctx.Err() == nil && s.carrier == lease.carrier && s.carrierGeneration == lease.generation &&
+		s.interfaceGeneration == lease.interfaceGeneration && !s.interfaceUnavailable
+	s.access.Unlock()
+	if !eligible {
+		return false
+	}
+	s.logger.Info("wlt dial causal event=early_failure logical_dial_id=", logicalDialID, " dial_attempt_id=", lease.attemptID,
+		" carrier_generation=", lease.generation, " interface_generation=", lease.interfaceGeneration,
+		" original_transport_error=true observation_budget_ms=500")
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		s.access.Lock()
+		retired := lease.retired
+		confirmed := ctx.Err() == nil && !s.stopped && !s.quiescing && s.ctx.Err() == nil &&
+			retired != nil && retired.carrier == lease.carrier && retired.generation == lease.generation &&
+			context.Cause(lease.ctx) == retired
+		terminal := ctx.Err() != nil || s.stopped || s.quiescing || s.ctx.Err() != nil ||
+			(lease.ctx.Err() != nil && !confirmed)
+		if s.dialStateChanged == nil {
+			s.dialStateChanged = make(chan struct{})
+		}
+		changed := s.dialStateChanged
+		s.access.Unlock()
+		if confirmed {
+			return true
+		}
+		if terminal {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.ctx.Done():
+			return false
+		case <-lease.ctx.Done():
+		case <-changed:
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
 // DialStream uses one absolute caller/connect deadline across readiness, OPEN
 // admission and trusted generation recovery. Only unpublished attempts can move
 // to a new carrier; application bytes and returned streams are never replayed.
@@ -132,7 +200,16 @@ func (s *Service) DialStream(ctx context.Context, routeClass string, target stri
 	var previous *dialLease
 	attempts := 0
 	var finalGeneration uint64
+	var logicalDialID, finalAttemptID uint64
+	observedRetirement := false
 	defer func() {
+		if observedRetirement {
+			outcome := "published"
+			if err != nil {
+				outcome = "failed"
+			}
+			s.logger.Info("wlt dial correlation event=final logical_dial_id=", logicalDialID, " final_attempt_id=", finalAttemptID, " final_generation=", finalGeneration, " attempts=", attempts, " outcome=", outcome)
+		}
 		if previous != nil {
 			outcome := "published"
 			if err != nil {
@@ -149,12 +226,36 @@ func (s *Service) DialStream(ctx context.Context, routeClass string, target stri
 			return nil, err
 		}
 		attempts++
-		finalGeneration = lease.generation
-		if s.dialStreamHook != nil {
-			stream, err = s.dialStreamHook(lease.ctx, lease.carrier, routeClass, target)
-		} else {
-			stream, err = lease.carrier.DialStream(lease.ctx, routeClass, target)
+		if logicalDialID == 0 {
+			logicalDialID = lease.attemptID
 		}
+		finalAttemptID = lease.attemptID
+		finalGeneration = lease.generation
+		deadlineRemainingMS := int64(-1)
+		if deadline, ok := lease.ctx.Deadline(); ok {
+			deadlineRemainingMS = time.Until(deadline).Milliseconds()
+		}
+		s.logger.Info("wlt dial causal event=admitted logical_dial_id=", logicalDialID,
+			" dial_attempt_id=", lease.attemptID, " carrier_generation=", lease.generation,
+			" interface_generation=", lease.interfaceGeneration,
+			" deadline_remaining_ms=", deadlineRemainingMS)
+		diagnosticCtx := carriercommon.WithOpenDiagnostic(lease.ctx, carriercommon.OpenDiagnostic{
+			LogicalDialID: logicalDialID, DialAttemptID: lease.attemptID,
+			CarrierGeneration: lease.generation, InterfaceGeneration: lease.interfaceGeneration,
+		})
+		if s.dialStreamHook != nil {
+			stream, err = s.dialStreamHook(diagnosticCtx, lease.carrier, routeClass, target)
+		} else {
+			stream, err = lease.carrier.DialStream(diagnosticCtx, routeClass, target)
+		}
+		if err != nil {
+			tree, nodes, truncated := boundedDialErrorTree(err)
+			s.logger.Info("wlt dial causal event=carrier_error logical_dial_id=", logicalDialID,
+				" dial_attempt_id=", lease.attemptID, " carrier_generation=", lease.generation,
+				" interface_generation=", lease.interfaceGeneration, " tree=", tree,
+				" tree_nodes=", nodes, " tree_truncated=", truncated)
+		}
+		lateLocalRetirement := stream == nil && err != nil && s.waitForEarlyLocalRetirement(ctx, lease, logicalDialID, err)
 		s.access.Lock()
 		delete(s.pendingDialLeases, lease)
 		s.notifyDialStateLocked()
@@ -165,13 +266,54 @@ func (s *Service) DialStream(ctx context.Context, routeClass string, target stri
 		current := s.carrier == lease.carrier && s.carrierGeneration == lease.generation && s.interfaceGeneration == lease.interfaceGeneration && !s.interfaceUnavailable
 		retired := lease.retired
 		retry := terminal == nil && retired != nil && retired.carrier == lease.carrier && retired.generation == lease.generation &&
-			context.Cause(lease.ctx) == retired && (err == nil || errors.Is(err, retired) || errors.Is(err, context.Canceled))
+			context.Cause(lease.ctx) == retired && (lateLocalRetirement || err == nil || errors.Is(err, retired) || errors.Is(err, context.Canceled))
+		if retired != nil {
+			observedRetirement = true
+		}
 		if terminal == nil && err == nil && current && retired == nil && lease.ctx.Err() == nil {
 			s.access.Unlock()
+			s.logger.Info("wlt dial causal event=settled logical_dial_id=", logicalDialID,
+				" dial_attempt_id=", lease.attemptID, " outcome=published cause=none")
 			lease.cancel(nil)
 			return stream, nil
 		}
 		s.access.Unlock()
+		cause := "unknown"
+		switch {
+		// Service return precedence is terminal, then trusted retry, then the
+		// carrier result. A simultaneous carrier error must not relabel the
+		// DeadlineExceeded or cancellation that this function returns.
+		case errors.Is(terminal, errDialServiceStopped):
+			cause = "service_stop"
+		case errors.Is(terminal, context.DeadlineExceeded):
+			cause = "deadline"
+		case errors.Is(terminal, context.Canceled):
+			cause = "caller_canceled"
+		case retry && lateLocalRetirement:
+			cause = "carrier_failure_then_local_retirement"
+		case retry:
+			cause = "local_retirement"
+		case err == nil:
+			cause = "carrier_replaced"
+		case errors.Is(err, context.DeadlineExceeded):
+			cause = "deadline"
+		case errors.Is(err, context.Canceled) && retired != nil && context.Cause(lease.ctx) == retired:
+			cause = "local_retirement"
+		case errors.Is(err, context.Canceled):
+			cause = "unknown"
+		default:
+			cause = "carrier_failure"
+		}
+		outcome := "failed"
+		if retry {
+			outcome = "retired_retry"
+		}
+		s.logger.Info("wlt dial causal event=settled logical_dial_id=", logicalDialID,
+			" dial_attempt_id=", lease.attemptID, " outcome=", outcome, " cause=", cause,
+			" observed_carrier_error=", err != nil)
+		if retired != nil {
+			s.logger.Info("wlt dial correlation event=retired logical_dial_id=", logicalDialID, " dial_attempt_id=", lease.attemptID, " carrier_generation=", lease.generation, " interface_generation=", lease.interfaceGeneration, " retry=", retry)
+		}
 		// Release a late successful attempt before admitting anything on B. Abort
 		// does not flush/replay application payload or wait for an obsolete underlay.
 		if stream != nil {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,15 +27,16 @@ import (
 )
 
 const (
-	wltStatsHeartbeatInterval    = 30 * time.Second
-	wltIncidentPollInterval      = 5 * time.Second
-	wltReconnectRecoveryAfter    = 90 * time.Second
-	wltInterfaceRecoveryGrace    = 15 * time.Second
-	wltAndroidInterfaceFallback  = 5 * time.Second
-	wltCarrierRestartRetryDelay  = 15 * time.Second
-	wltCarrierRestartRetryMax    = 15 * time.Minute
-	wltCarrierRateLimitRetry     = 30 * time.Minute
-	wltCarrierRestartRetryMaxLog = 4
+	wltStatsHeartbeatInterval     = 30 * time.Second
+	wltIncidentPollInterval       = 5 * time.Second
+	wltReconnectRecoveryAfter     = 90 * time.Second
+	wltInterfaceRecoveryGrace     = 15 * time.Second
+	wltConfirmedLossRecoveryDelay = time.Second
+	wltAndroidInterfaceFallback   = 5 * time.Second
+	wltCarrierRestartRetryDelay   = 15 * time.Second
+	wltCarrierRestartRetryMax     = 15 * time.Minute
+	wltCarrierRateLimitRetry      = 30 * time.Minute
+	wltCarrierRestartRetryMaxLog  = 4
 )
 
 func RegisterService(registry *boxService.Registry) {
@@ -42,33 +44,35 @@ func RegisterService(registry *boxService.Registry) {
 }
 
 type Service struct {
+	publishedHandoverDrain *publishedHandoverDrainLease
 	boxService.Adapter
-	ctx                  context.Context
-	logger               log.ContextLogger
-	options              option.WLTServiceOptions
-	network              adapter.NetworkManager
-	access               sync.RWMutex
-	restart              sync.Mutex
-	statsAccess          sync.Mutex
-	carrier              *wltpkg.Carrier
-	carrierGeneration    uint64
-	pendingDialLeases    map[*dialLease]struct{}
-	dialStateChanged     chan struct{}
-	dialStreamHook       func(context.Context, *wltpkg.Carrier, string, string) (io.ReadWriteCloser, error)
-	carrierReady         chan struct{}
-	interfaceReady       chan struct{}
-	interfaceGeneration  uint64
-	interfaceUnavailable bool
-	initialized          bool
-	stopped              bool
-	quiescing            bool
-	statsCancel          context.CancelFunc
-	interfaceKey         string
-	restartAttempt       *carrierStartAttempt
-	carrierStartCancel   context.CancelFunc
-	startCarrierHook     func(context.Context, bool) (*wltpkg.Carrier, error)
-	markCarrierReadyHook func(*wltpkg.Carrier)
-	abortCarrierHook     func(*wltpkg.Carrier) error
+	ctx                    context.Context
+	logger                 log.ContextLogger
+	options                option.WLTServiceOptions
+	network                adapter.NetworkManager
+	access                 sync.RWMutex
+	restart                sync.Mutex
+	statsAccess            sync.Mutex
+	carrier                *wltpkg.Carrier
+	carrierGeneration      uint64
+	pendingDialLeases      map[*dialLease]struct{}
+	dialStateChanged       chan struct{}
+	dialStreamHook         func(context.Context, *wltpkg.Carrier, string, string) (io.ReadWriteCloser, error)
+	carrierReady           chan struct{}
+	interfaceReady         chan struct{}
+	interfaceGeneration    uint64
+	interfaceUnavailable   bool
+	initialized            bool
+	stopped                bool
+	quiescing              bool
+	statsCancel            context.CancelFunc
+	interfaceKey           string
+	restartAttempt         *carrierStartAttempt
+	carrierStartCancel     context.CancelFunc
+	startCarrierHook       func(context.Context, bool) (*wltpkg.Carrier, error)
+	markCarrierReadyHook   func(*wltpkg.Carrier)
+	abortCarrierHook       func(*wltpkg.Carrier) error
+	closeSnapshotStatsHook func(*wltpkg.Carrier) wltpkg.CarrierStats
 }
 
 type carrierStartAttempt struct {
@@ -84,6 +88,9 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	}
 	if transport != "wlt" && transport != "carrier" && transport != "turnable" {
 		return nil, E.New("unsupported wlt service transport: ", options.Transport)
+	}
+	if options.PhysicalHandoverDrainGrace < 0 || (options.PhysicalHandoverDrainGrace > 0 && time.Duration(options.PhysicalHandoverDrainGrace) < time.Second) || time.Duration(options.PhysicalHandoverDrainGrace) > 5*time.Second {
+		return nil, E.New("physical_handover_drain_grace must be zero (disabled) or between one and five seconds")
 	}
 	s := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeWLT, tag),
@@ -107,6 +114,16 @@ func (s *Service) WaitWltTrafficReady(ctx context.Context, timeoutMillis int64) 
 		}
 		if s.carrier == nil {
 			return nil, s.stopped, s.carrierReady
+		}
+		// The retained carrier belongs to the retired physical interface until
+		// the recovery gate opens. Match WaitCarrier admission: neither its old
+		// traffic-ready signal nor its terminal error describes the replacement.
+		if s.interfaceReady != nil {
+			select {
+			case <-s.interfaceReady:
+			default:
+				return nil, s.stopped, s.interfaceReady
+			}
 		}
 		return s.carrier, s.stopped, s.carrierReady
 	})
@@ -258,6 +275,13 @@ func (s *Service) markCarrierReady(carrier *wltpkg.Carrier) {
 	carrier.MarkSingBoxReady()
 }
 
+func (s *Service) abortCarrierAfterNetworkLoss(carrier *wltpkg.Carrier) error {
+	if s.abortCarrierHook != nil {
+		return s.abortCarrierHook(carrier)
+	}
+	return carrier.AbortAfterNetworkLoss()
+}
+
 func (s *Service) abortCarrier(carrier *wltpkg.Carrier) error {
 	if s.abortCarrierHook != nil {
 		return s.abortCarrierHook(carrier)
@@ -312,6 +336,7 @@ func (s *Service) startCarrier(ctx context.Context, preferPersistedAuth bool) (*
 		TinyMuxPingTimeout:           time.Duration(s.options.TinyMuxPingTimeout),
 		PeerIncomingBuffer:           s.options.PeerIncomingBuffer,
 		PeerWriteBuffer:              s.options.PeerWriteBuffer,
+		DataHalfClose:                s.options.DataHalfClose,
 		RedundantControl:             s.options.RedundantControl,
 		AdaptivePeerData:             s.options.AdaptivePeerData,
 		AdaptivePeerThresholdBytes:   s.options.AdaptivePeerThresholdBytes,
@@ -324,6 +349,7 @@ func (s *Service) startCarrier(ctx context.Context, preferPersistedAuth bool) (*
 		Logger: func(format string, args ...any) {
 			s.logger.InfoContext(s.ctx, fmt.Sprintf(format, args...))
 		},
+		CloseLifecycleDiagnostics: runtime.GOOS == "ios", // bounded source-only 0311 diagnostic proposal
 	})
 }
 
@@ -358,6 +384,7 @@ func (s *Service) Close() error {
 	}
 	s.access.Lock()
 	carrier := s.carrier
+	carrierGeneration := s.carrierGeneration
 	restartAttempt := s.restartAttempt
 	carrierStartCancel := s.carrierStartCancel
 	unavailable := s.interfaceUnavailable
@@ -385,7 +412,11 @@ func (s *Service) Close() error {
 		}
 		return nil
 	}
-	stats := carrier.Stats()
+	closeMode := "graceful"
+	if unavailable {
+		closeMode = "abort"
+	}
+	s.logger.Info(formatWLTServiceCloseSnapshot("pre_close", closeMode, "not_called", carrierGeneration, s.closeSnapshotStats(carrier)))
 	var err error
 	if unavailable {
 		// A concurrent loss callback has already declared this carrier obsolete.
@@ -397,7 +428,11 @@ func (s *Service) Close() error {
 	if carrierStartCancel != nil {
 		carrierStartCancel()
 	}
-	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
+	closeResult := "returned_nil"
+	if err != nil {
+		closeResult = "returned_error"
+	}
+	s.logger.Info(formatWLTServiceCloseSnapshot("post_close", closeMode, closeResult, carrierGeneration, s.closeSnapshotStats(carrier)))
 	return err
 }
 
@@ -459,10 +494,32 @@ func (s *Service) InterfaceUpdated() {
 }
 
 func (s *Service) interfaceUpdated(currentInterfaceKey string, goos string, recoveryDelay time.Duration) {
-	carrier, previousInterfaceKey, generation, ignored := s.beginInterfaceUpdate(currentInterfaceKey, goos)
+	carrier, previousInterfaceKey, generation, wasUnavailable, ignored := s.beginInterfaceUpdate(currentInterfaceKey, goos)
 	if ignored {
 		s.logger.Info("wlt service ignoring duplicate default interface update")
 		return
+	}
+	// The generation gate and unpublished leases are retired under access in
+	// beginInterfaceUpdate. On a confirmed Apple physical handover, seal the
+	// captured old underlay now; the settle below is for its successor, not a
+	// window in which obsolete sockets may continue writing. A late callback
+	// can only address its captured carrier and may not abort a replacement.
+	drainGrace := time.Duration(s.options.PhysicalHandoverDrainGrace)
+	drainDeadline, drainPublished, abortRetained := s.publishedHandoverDrainDeadline(carrier, generation, goos, previousInterfaceKey, currentInterfaceKey, wasUnavailable, drainGrace)
+	if !drainPublished && carrier != nil && (abortRetained ||
+		(!wasUnavailable && (goos == "ios" || goos == "darwin") && physicalInterfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey))) {
+		s.abortRetiredPhysicalCarrier(carrier)
+	}
+	recoveryDelay = interfaceRecoveryDelayFor(goos, wasUnavailable, recoveryDelay)
+	recoveryDelay = physicalHandoverDelayFor(goos, previousInterfaceKey, currentInterfaceKey, recoveryDelay)
+	if drainPublished {
+		remaining := time.Until(drainDeadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if recoveryDelay > remaining {
+			recoveryDelay = remaining
+		}
 	}
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
 		s.logger.Info("wlt service default interface identity changed; scheduling carrier replacement after settle delay=", recoveryDelay.String())
@@ -474,8 +531,8 @@ func (s *Service) interfaceUpdated(currentInterfaceKey string, goos string, reco
 	// proxy and URL-test state move together with the WLT carrier. Keep a longer
 	// core-side fallback for clients which do not complete that reload; the old
 	// service context is canceled before this timer fires during a healthy reload,
-	// preventing two carrier replacements from racing each other. Apple retains
-	// its allocation-preserving grace.
+	// preventing two carrier replacements from racing each other. Apple keeps grace for same-link address updates but settles a confirmed
+	// physical handover for one second before the existing abort/restart path.
 	go func(expected *wltpkg.Carrier, expectedGeneration uint64) {
 		timer := time.NewTimer(recoveryDelay)
 		defer timer.Stop()
@@ -495,9 +552,27 @@ func (s *Service) interfaceUpdated(currentInterfaceKey string, goos string, reco
 			stats := expected.Stats()
 			s.logger.Warn("wlt service replacing carrier after interface recovery delay=", recoveryDelay.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
 		}
+		if drainPublished && !s.waitPublishedHandoverDrain(expected, expectedGeneration, drainDeadline) {
+			return
+		}
 		s.restartCarrier(expected, "default interface changed after recovery delay", expectedGeneration)
 		s.finishInterfaceRecovery(expectedGeneration)
 	}(carrier, generation)
+}
+
+// A later address callback can advance interfaceGeneration while this same old
+// carrier is still published. Keep retiring that exact pointer in that case;
+// once a replacement pointer is published, a delayed callback cannot touch it.
+func (s *Service) abortRetiredPhysicalCarrier(retired *wltpkg.Carrier) {
+	s.access.RLock()
+	current := s.carrier == retired && !s.stopped
+	s.access.RUnlock()
+	if !current {
+		return
+	}
+	if err := s.abortCarrierAfterNetworkLoss(retired); err != nil {
+		s.logger.Warn("wlt service carrier abort after confirmed physical handover: ", err)
+	}
 }
 
 // NetworkUnavailable closes admission for the current interface generation and
@@ -512,6 +587,7 @@ func (s *Service) NetworkUnavailable() {
 	}
 	s.retireDialLeasesLocked(true)
 	s.interfaceUnavailable = true
+	s.publishedHandoverDrain = nil
 	s.notifyDialStateLocked()
 	closeSignal(s.interfaceReady)
 	s.interfaceReady = make(chan struct{})
@@ -528,7 +604,7 @@ func (s *Service) NetworkUnavailable() {
 	if carrier != nil {
 		// Abort must win Carrier.closeOnce before canceling the parent start
 		// context; its runCtx watcher otherwise begins a graceful drain.
-		if err := s.abortCarrier(carrier); err != nil {
+		if err := s.abortCarrierAfterNetworkLoss(carrier); err != nil {
 			s.logger.Warn("wlt service carrier abort after network loss: ", err)
 		}
 	}
@@ -544,11 +620,54 @@ func interfaceRecoveryGraceFor(goos string) time.Duration {
 	return wltInterfaceRecoveryGrace
 }
 
+// A nil default-interface callback has already closed admission and aborted
+// the old carrier. Its return needs only a short underlay settle, while an
+// ordinary Apple handover keeps the allocation-preserving grace.
+func interfaceRecoveryDelayFor(goos string, wasUnavailable bool, grace time.Duration) time.Duration {
+	if wasUnavailable && (goos == "ios" || goos == "darwin") {
+		return wltConfirmedLossRecoveryDelay
+	}
+	return grace
+}
+
+// Only a positive change of physical link shortens Apple's settle. Address
+// updates on the same interface retain grace, as do unbound/unknown identities.
+func physicalHandoverDelayFor(goos, previous, current string, grace time.Duration) time.Duration {
+	if (goos == "ios" || goos == "darwin") && physicalInterfaceIdentityChanged(previous, current) {
+		return time.Second
+	}
+	return grace
+}
+
+func physicalInterfaceIdentityChanged(previous, current string) bool {
+	old := strings.SplitN(previous, "|", 4)
+	next := strings.SplitN(current, "|", 4)
+	if len(old) != 4 || len(next) != 4 || old[1] == "" || next[1] == "" ||
+		!knownPhysicalInterfaceType(old[2]) || !knownPhysicalInterfaceType(next[2]) {
+		return false
+	}
+	oldIndex, oldErr := strconv.Atoi(old[0])
+	nextIndex, nextErr := strconv.Atoi(next[0])
+	if oldErr != nil || nextErr != nil || oldIndex <= 0 || nextIndex <= 0 {
+		return false
+	}
+	return oldIndex != nextIndex || old[1] != next[1] || old[2] != next[2]
+}
+
+func knownPhysicalInterfaceType(interfaceType string) bool {
+	switch interfaceType {
+	case C.InterfaceTypeWIFI.String(), C.InterfaceTypeCellular.String(), C.InterfaceTypeEthernet.String():
+		return true
+	default:
+		return false
+	}
+}
+
 func ignoreDuplicateInterfaceUpdate(goos string, previous string, current string) bool {
 	return (goos == "android" || goos == "ios" || goos == "darwin") && previous != "" && previous == current
 }
 
-func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) (*wltpkg.Carrier, string, uint64, bool) {
+func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) (*wltpkg.Carrier, string, uint64, bool, bool) {
 	s.access.Lock()
 	var cancelAttempt context.CancelFunc
 	defer func() {
@@ -561,7 +680,7 @@ func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) 
 	previousInterfaceKey := s.interfaceKey
 	wasUnavailable := s.interfaceUnavailable
 	if s.stopped {
-		return carrier, previousInterfaceKey, s.interfaceGeneration, true
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
 	}
 	if !s.initialized {
 		if wasUnavailable && currentInterfaceKey != "" {
@@ -570,14 +689,14 @@ func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) 
 			closeSignal(s.interfaceReady)
 			s.interfaceGeneration++
 		}
-		return carrier, previousInterfaceKey, s.interfaceGeneration, true
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
 	}
 	if currentInterfaceKey == "" {
-		return carrier, previousInterfaceKey, s.interfaceGeneration, true
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
 	}
 	if !wasUnavailable && (ignoreDuplicateInterfaceUpdate(goos, previousInterfaceKey, currentInterfaceKey) ||
 		(carrier == nil && previousInterfaceKey != "" && previousInterfaceKey == currentInterfaceKey)) {
-		return carrier, previousInterfaceKey, s.interfaceGeneration, true
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
 	}
 	if s.restartAttempt != nil {
 		cancelAttempt = s.restartAttempt.cancel
@@ -589,7 +708,7 @@ func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) 
 	closeSignal(s.interfaceReady)
 	s.interfaceReady = make(chan struct{})
 	s.interfaceGeneration++
-	return carrier, previousInterfaceKey, s.interfaceGeneration, false
+	return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, false
 }
 
 func closedSignal() chan struct{} {
@@ -736,7 +855,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 				elapsed := now.Sub(lastStatsAt)
 				lastMux := lastStats.Runtime.Mux
 				lastPeer := lastStats.Runtime.Peer
-				s.logger.Info(formatWLTStatsHeartbeat("wlt service stats carrier_generation=", carrierGeneration, " interface_generation=", interfaceGeneration, " active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " last_incident=", formatWLTStatsIncident(lastIncident), " last_incident_age_ms=", incidentAgeMillis(now, lastIncidentAt), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_last_open_control_write_ms=", mux.LastOpenControlWriteMillis, " mux_max_open_control_write_ms=", mux.MaxOpenControlWriteMillis, " mux_last_open_reply_wait_ms=", mux.LastOpenReplyWaitMillis, " mux_max_open_reply_wait_ms=", mux.MaxOpenReplyWaitMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes, " peer_in_bytes_by_index=", peer.PerPeerIncomingBytes, " peer_out_bytes_by_index=", peer.PerPeerOutgoingBytes, " peer_write_ns_by_index=", peer.PerPeerWriteNanos, " peer_max_write_ns_by_index=", peer.PerPeerMaxWriteNanos, " peer_send_queue_by_index=", peer.PerPeerSendQueueDepth, " peer_priority_queue_by_index=", peer.PerPeerPriorityQueueDepth))
+				s.logger.Info(formatWLTStatsHeartbeat("wlt service stats carrier_generation=", carrierGeneration, " interface_generation=", interfaceGeneration, " active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " draining=", stats.DrainingStreams, " peak_draining=", stats.PeakDrainingStreams, " drain_capacity=", stats.DrainCapacity, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " last_incident=", formatWLTStatsIncident(lastIncident), " last_incident_age_ms=", incidentAgeMillis(now, lastIncidentAt), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_last_open_control_write_ms=", mux.LastOpenControlWriteMillis, " mux_max_open_control_write_ms=", mux.MaxOpenControlWriteMillis, " mux_last_open_reply_wait_ms=", mux.LastOpenReplyWaitMillis, " mux_max_open_reply_wait_ms=", mux.MaxOpenReplyWaitMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes, " peer_in_bytes_by_index=", peer.PerPeerIncomingBytes, " peer_out_bytes_by_index=", peer.PerPeerOutgoingBytes, " peer_write_ns_by_index=", peer.PerPeerWriteNanos, " peer_max_write_ns_by_index=", peer.PerPeerMaxWriteNanos, " peer_send_queue_by_index=", peer.PerPeerSendQueueDepth, " peer_priority_queue_by_index=", peer.PerPeerPriorityQueueDepth))
 				lastStats = stats
 				lastStatsAt = now
 			}
@@ -816,7 +935,7 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, expect
 		// provider's per-user allocation quota. Abort the obsolete carrier first,
 		// which releases sockets and allocations without waiting for that drain.
 		startedAt := time.Now()
-		s.logger.Info("wlt service old carrier abort started active=", stats.ActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " failed=", stats.FailedStreams, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
+		s.logger.Info("wlt service old carrier abort started active=", stats.ActiveStreams, " draining=", stats.DrainingStreams, " peak_draining=", stats.PeakDrainingStreams, " drain_capacity=", stats.DrainCapacity, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " failed=", stats.FailedStreams, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
 		if err := s.abortCarrier(expected); err != nil {
 			s.logger.Warn("wlt service old carrier abort error: ", err)
 		}
