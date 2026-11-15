@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,15 +26,16 @@ import (
 )
 
 const (
-	wltStatsHeartbeatInterval    = 30 * time.Second
-	wltIncidentPollInterval      = 5 * time.Second
-	wltReconnectRecoveryAfter    = 90 * time.Second
-	wltInterfaceRecoveryGrace    = 15 * time.Second
-	wltAndroidInterfaceFallback  = 5 * time.Second
-	wltCarrierRestartRetryDelay  = 15 * time.Second
-	wltCarrierRestartRetryMax    = 15 * time.Minute
-	wltCarrierRateLimitRetry     = 30 * time.Minute
-	wltCarrierRestartRetryMaxLog = 4
+	wltStatsHeartbeatInterval     = 30 * time.Second
+	wltIncidentPollInterval       = 5 * time.Second
+	wltReconnectRecoveryAfter     = 90 * time.Second
+	wltInterfaceRecoveryGrace     = 15 * time.Second
+	wltConfirmedLossRecoveryDelay = time.Second
+	wltAndroidInterfaceFallback   = 5 * time.Second
+	wltCarrierRestartRetryDelay   = 15 * time.Second
+	wltCarrierRestartRetryMax     = 15 * time.Minute
+	wltCarrierRateLimitRetry      = 30 * time.Minute
+	wltCarrierRestartRetryMaxLog  = 4
 )
 
 func RegisterService(registry *boxService.Registry) {
@@ -42,19 +44,39 @@ func RegisterService(registry *boxService.Registry) {
 
 type Service struct {
 	boxService.Adapter
-	ctx                 context.Context
-	logger              log.ContextLogger
-	options             option.WLTServiceOptions
-	network             adapter.NetworkManager
-	access              sync.RWMutex
-	restart             sync.Mutex
-	carrier             *wltpkg.Carrier
-	carrierReady        chan struct{}
-	interfaceReady      chan struct{}
-	interfaceGeneration uint64
-	stopped             bool
-	statsCancel         context.CancelFunc
-	interfaceKey        string
+	ctx                       context.Context
+	logger                    log.ContextLogger
+	options                   option.WLTServiceOptions
+	network                   adapter.NetworkManager
+	access                    sync.RWMutex
+	restart                   sync.Mutex
+	statsAccess               sync.Mutex
+	carrier                   *wltpkg.Carrier
+	carrierGeneration         uint64
+	pendingDialLeases         map[*dialLease]struct{}
+	dialStateChanged          chan struct{}
+	dialStreamHook            func(context.Context, *wltpkg.Carrier, string, string) (io.ReadWriteCloser, error)
+	carrierReady              chan struct{}
+	interfaceReady            chan struct{}
+	interfaceGeneration       uint64
+	interfaceUnavailable      bool
+	initialized               bool
+	stopped                   bool
+	quiescing                 bool
+	statsCancel               context.CancelFunc
+	interfaceKey              string
+	carrierInterfaceKey       string
+	carrierRetiredForShutdown bool
+	restartAttempt            *carrierStartAttempt
+	carrierStartCancel        context.CancelFunc
+	startCarrierHook          func(context.Context, bool) (*wltpkg.Carrier, error)
+	markCarrierReadyHook      func(*wltpkg.Carrier)
+	abortCarrierHook          func(*wltpkg.Carrier) error
+}
+
+type carrierStartAttempt struct {
+	cancel     context.CancelFunc
+	generation uint64
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.WLTServiceOptions) (adapter.Service, error) {
@@ -66,7 +88,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	if transport != "wlt" && transport != "carrier" && transport != "turnable" {
 		return nil, E.New("unsupported wlt service transport: ", options.Transport)
 	}
-	return &Service{
+	s := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeWLT, tag),
 		ctx:            ctx,
 		logger:         logger,
@@ -74,7 +96,65 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		network:        service.FromContext[adapter.NetworkManager](ctx),
 		carrierReady:   make(chan struct{}),
 		interfaceReady: closedSignal(),
-	}, nil
+	}
+	service.MustRegister[wltpkg.TrafficReadyProvider](ctx, s)
+	return s, nil
+}
+
+func (s *Service) WaitWltTrafficReady(ctx context.Context, timeoutMillis int64) error {
+	return waitWltTrafficReady(ctx, s.ctx, timeoutMillis, func() (trafficReadyWaiter, bool, <-chan struct{}) {
+		s.access.RLock()
+		defer s.access.RUnlock()
+		if s.interfaceUnavailable {
+			return nil, s.stopped, s.interfaceReady
+		}
+		if s.carrier == nil {
+			return nil, s.stopped, s.carrierReady
+		}
+		return s.carrier, s.stopped, s.carrierReady
+	})
+}
+
+type trafficReadyWaiter interface {
+	WaitTrafficReady(context.Context) error
+}
+
+func waitWltTrafficReady(ctx context.Context, serviceCtx context.Context, timeoutMillis int64, snapshot func() (trafficReadyWaiter, bool, <-chan struct{})) error {
+	if timeoutMillis <= 0 {
+		return context.DeadlineExceeded
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMillis)*time.Millisecond)
+	defer cancel()
+	for {
+		carrier, stopped, ready := snapshot()
+		if stopped {
+			return errors.New("wlt service is stopped")
+		}
+		if carrier != nil {
+			err := carrier.WaitTrafficReady(waitCtx)
+			// The signal belongs to this exact carrier instance. A handover may
+			// replace it while the wait is blocked; never accept readiness from
+			// the obsolete generation.
+			currentCarrier, currentStopped, _ := snapshot()
+			if currentStopped {
+				return errors.New("wlt service is stopped")
+			}
+			if currentCarrier != carrier {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			return waitCtx.Err()
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-serviceCtx.Done():
+			return serviceCtx.Err()
+		case <-ready:
+		}
+	}
 }
 
 func (s *Service) Start(stage adapter.StartStage) error {
@@ -83,16 +163,44 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	}
 	s.restart.Lock()
 	defer s.restart.Unlock()
+	currentInterfaceKey := s.currentInterfaceKey()
 	s.access.Lock()
 	if s.carrier != nil {
 		s.access.Unlock()
 		return nil
 	}
-	if s.stopped {
-		s.stopped = false
-		s.carrierReady = make(chan struct{})
+	if s.stopped || s.quiescing {
+		s.access.Unlock()
+		return E.New("wlt service is stopped")
 	}
+	s.initialized = true
+	if s.network != nil && currentInterfaceKey == "" && !s.interfaceUnavailable {
+		s.interfaceUnavailable = true
+		closeSignal(s.interfaceReady)
+		s.interfaceReady = make(chan struct{})
+		s.interfaceGeneration++
+	}
+	if s.interfaceUnavailable {
+		s.access.Unlock()
+		return nil
+	}
+	s.interfaceKey = currentInterfaceKey
+	generation := s.interfaceGeneration
+	startCtx, cancelStart := context.WithCancel(s.ctx)
+	startAttempt := &carrierStartAttempt{cancel: cancelStart, generation: generation}
+	s.restartAttempt = startAttempt
 	s.access.Unlock()
+	published := false
+	defer func() {
+		if !published {
+			cancelStart()
+		}
+		s.access.Lock()
+		if s.restartAttempt == startAttempt {
+			s.restartAttempt = nil
+		}
+		s.access.Unlock()
+	}()
 
 	startedAt := time.Now()
 	s.logger.Info("wlt service starting transport=", s.options.Transport)
@@ -100,33 +208,71 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	// restarts. Prefer it even on the first service start; otherwise an expired
 	// inline profile snapshot sends the client into anonymous authorization
 	// before the core can perform the identity-only refresh.
-	carrier, err := s.startCarrier(persistentAuthSnapshotAvailable(s.options))
+	carrier, err := s.startCarrier(startCtx, persistentAuthSnapshotAvailable(s.options))
 	if err != nil {
 		// Keep the sing-box instance available while the WLT provider identity or
 		// underlay recovers. WLT outbounds wait on carrierReady with their own dial
 		// context, while unrelated/direct outbounds remain usable. Recovery is
 		// unattended and serialized by the same restart lock used for handovers.
 		s.access.Lock()
-		s.stopped = false
-		s.interfaceKey = s.currentInterfaceKey()
+		current := s.restartAttempt == startAttempt && !s.stopped && !s.quiescing && !s.interfaceUnavailable && s.interfaceGeneration == generation && s.carrier == nil && startCtx.Err() == nil
+		if current {
+			s.stopped = false
+			s.interfaceKey = s.currentInterfaceKey()
+			s.restartAttempt = nil
+		}
 		s.access.Unlock()
+		cancelStart()
+		if !current {
+			return nil
+		}
 		s.logger.Error("wlt service start degraded elapsed=", time.Since(startedAt).String(), " error=", err)
-		go s.restartCarrier(nil, "initial startup degraded")
+		go s.restartCarrier(nil, "initial startup degraded", generation)
 		return nil
 	}
 	s.access.Lock()
+	current := s.restartAttempt == startAttempt && !s.stopped && !s.quiescing && !s.interfaceUnavailable && s.interfaceGeneration == generation && s.carrier == nil && startCtx.Err() == nil
+	if !current {
+		s.access.Unlock()
+		_ = s.abortCarrier(carrier)
+		return nil
+	}
 	s.carrier = carrier
+	s.carrierInterfaceKey = currentInterfaceKey
+	s.carrierGeneration++
+	s.notifyDialStateLocked()
 	s.stopped = false
 	s.interfaceKey = s.currentInterfaceKey()
+	s.carrierStartCancel = cancelStart
+	s.restartAttempt = nil
 	close(s.carrierReady)
 	s.access.Unlock()
-	carrier.MarkSingBoxReady()
+	published = true
+	s.markCarrierReady(carrier)
 	s.startStatsHeartbeat(carrier)
 	s.logger.Info("wlt service started elapsed=", time.Since(startedAt).String())
 	return nil
 }
 
-func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error) {
+func (s *Service) markCarrierReady(carrier *wltpkg.Carrier) {
+	if s.markCarrierReadyHook != nil {
+		s.markCarrierReadyHook(carrier)
+		return
+	}
+	carrier.MarkSingBoxReady()
+}
+
+func (s *Service) abortCarrier(carrier *wltpkg.Carrier) error {
+	if s.abortCarrierHook != nil {
+		return s.abortCarrierHook(carrier)
+	}
+	return carrier.Abort()
+}
+
+func (s *Service) startCarrier(ctx context.Context, preferPersistedAuth bool) (*wltpkg.Carrier, error) {
+	if s.startCarrierHook != nil {
+		return s.startCarrierHook(ctx, preferPersistedAuth)
+	}
 	if cacheFile := persistentDNSCacheFile(s.options); cacheFile != "" {
 		if err := carriercommon.SetDNSCacheFile(cacheFile); err != nil {
 			s.logger.Warn("wlt carrier persistent DNS cache unavailable path=", cacheFile, " error=", err)
@@ -143,7 +289,7 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 	// The carrier must establish traffic without the profile control plane.
 	// auth_snapshot_url remains a compatibility field, but pre-tunnel recovery
 	// is limited to the profile bootstrap and client-persisted auth state.
-	return wltpkg.StartCarrier(s.ctx, wltpkg.CarrierOptions{
+	return wltpkg.StartCarrier(ctx, wltpkg.CarrierOptions{
 		Config:                       s.options.CarrierConfig,
 		ConfigFile:                   s.options.CarrierConfigFile,
 		AuthSnapshot:                 s.options.AuthSnapshot,
@@ -170,6 +316,7 @@ func (s *Service) startCarrier(preferPersistedAuth bool) (*wltpkg.Carrier, error
 		TinyMuxPingTimeout:           time.Duration(s.options.TinyMuxPingTimeout),
 		PeerIncomingBuffer:           s.options.PeerIncomingBuffer,
 		PeerWriteBuffer:              s.options.PeerWriteBuffer,
+		RedundantControl:             s.options.RedundantControl,
 		AdaptivePeerData:             s.options.AdaptivePeerData,
 		AdaptivePeerThresholdBytes:   s.options.AdaptivePeerThresholdBytes,
 		AdaptivePeerIdleTimeout:      time.Duration(s.options.AdaptivePeerIdleTimeout),
@@ -208,14 +355,24 @@ func persistentAuthSnapshotAvailable(options option.WLTServiceOptions) bool {
 }
 
 func (s *Service) Close() error {
+	s.statsAccess.Lock()
 	if s.statsCancel != nil {
 		s.statsCancel()
 		s.statsCancel = nil
 	}
 	s.access.Lock()
 	carrier := s.carrier
+	restartAttempt := s.restartAttempt
+	carrierStartCancel := s.carrierStartCancel
+	unavailable := s.interfaceUnavailable || s.carrierRetiredForShutdown ||
+		interfaceIdentityChanged(s.carrierInterfaceKey, s.interfaceKey)
+	s.retireDialLeasesLocked(false)
 	s.carrier = nil
+	s.carrierStartCancel = nil
 	s.stopped = true
+	s.notifyDialStateLocked()
+	s.interfaceUnavailable = false
+	s.initialized = false
 	closeSignal(s.interfaceReady)
 	select {
 	case <-s.carrierReady:
@@ -223,11 +380,28 @@ func (s *Service) Close() error {
 		close(s.carrierReady)
 	}
 	s.access.Unlock()
+	s.statsAccess.Unlock()
+	if restartAttempt != nil {
+		restartAttempt.cancel()
+	}
 	if carrier == nil {
+		if carrierStartCancel != nil {
+			carrierStartCancel()
+		}
 		return nil
 	}
 	stats := carrier.Stats()
-	err := carrier.Close()
+	var err error
+	if unavailable {
+		// A concurrent loss callback has already declared this carrier obsolete.
+		// Do not let graceful Close win closeOnce before that callback's Abort.
+		err = s.abortCarrier(carrier)
+	} else {
+		err = carrier.Close()
+	}
+	if carrierStartCancel != nil {
+		carrierStartCancel()
+	}
 	s.logger.Info("wlt service stopped active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
 	return err
 }
@@ -247,22 +421,30 @@ func (s *Service) WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error) {
 		stopped := s.stopped
 		s.access.RUnlock()
 		if carrier != nil {
-			if interfaceReady == nil {
+			if interfaceReady != nil {
+				select {
+				case <-interfaceReady:
+				default:
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-s.ctx.Done():
+						return nil, s.ctx.Err()
+					case <-interfaceReady:
+						continue
+					}
+				}
+			}
+			// The loss edge closes the previous generation's gate before installing
+			// the new closed gate. Revalidate the complete snapshot so a waiter that
+			// observed the old closed signal cannot return its stale carrier.
+			s.access.RLock()
+			current := s.carrier == carrier && s.interfaceReady == interfaceReady && !s.interfaceUnavailable && !s.stopped
+			s.access.RUnlock()
+			if current {
 				return carrier, nil
 			}
-			select {
-			case <-interfaceReady:
-				return carrier, nil
-			default:
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-s.ctx.Done():
-				return nil, s.ctx.Err()
-			case <-interfaceReady:
-				continue
-			}
+			continue
 		}
 		if stopped {
 			return nil, E.New("wlt service is stopped")
@@ -278,28 +460,21 @@ func (s *Service) WaitCarrier(ctx context.Context) (*wltpkg.Carrier, error) {
 }
 
 func (s *Service) InterfaceUpdated() {
-	carrier := s.Carrier()
-	if carrier == nil {
+	s.interfaceUpdated(s.currentInterfaceKey(), runtime.GOOS, interfaceRecoveryGraceFor(runtime.GOOS))
+}
+
+func (s *Service) interfaceUpdated(currentInterfaceKey string, goos string, recoveryDelay time.Duration) {
+	carrier, previousInterfaceKey, generation, wasUnavailable, ignored := s.beginInterfaceUpdate(currentInterfaceKey, goos)
+	if ignored {
+		s.logger.Info("wlt service ignoring duplicate default interface update")
 		return
 	}
-	currentInterfaceKey := s.currentInterfaceKey()
-	s.access.Lock()
-	previousInterfaceKey := s.interfaceKey
-	if currentInterfaceKey != "" {
-		s.interfaceKey = currentInterfaceKey
-	}
-	s.access.Unlock()
-	if ignoreDuplicateInterfaceUpdate(runtime.GOOS, previousInterfaceKey, currentInterfaceKey) {
-		s.logger.Info("wlt service ignoring duplicate Android default interface update")
-		return
-	}
-	recoveryDelay := interfaceRecoveryGraceFor(runtime.GOOS)
+	recoveryDelay = interfaceRecoveryDelayFor(goos, wasUnavailable, recoveryDelay)
 	if interfaceIdentityChanged(previousInterfaceKey, currentInterfaceKey) {
 		s.logger.Info("wlt service default interface identity changed; scheduling carrier replacement after settle delay=", recoveryDelay.String())
 	} else {
 		s.logger.Info("wlt service default interface changed; preserving active carrier during recovery delay=", recoveryDelay.String())
 	}
-	generation := s.beginInterfaceRecovery()
 	// Close the WLT dial gate immediately. The Android client reloads the complete
 	// merged runtime after its one-second physical-network debounce so ordinary
 	// proxy and URL-test state move together with the WLT carrier. Keep a longer
@@ -320,11 +495,52 @@ func (s *Service) InterfaceUpdated() {
 			s.finishInterfaceRecovery(expectedGeneration)
 			return
 		}
-		stats := expected.Stats()
-		s.logger.Warn("wlt service replacing carrier after interface recovery delay=", recoveryDelay.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+		if expected == nil {
+			s.logger.Warn("wlt service starting carrier after interface recovery delay=", recoveryDelay.String())
+		} else {
+			stats := expected.Stats()
+			s.logger.Warn("wlt service replacing carrier after interface recovery delay=", recoveryDelay.String(), " peer_online=", stats.Runtime.Peer.OnlinePeers, " peer_active_data=", stats.Runtime.Peer.ActiveDataPeers, " reconnecting=", stats.Runtime.Reconnecting)
+		}
 		s.restartCarrier(expected, "default interface changed after recovery delay", expectedGeneration)
 		s.finishInterfaceRecovery(expectedGeneration)
 	}(carrier, generation)
+}
+
+// NetworkUnavailable closes admission for the current interface generation and
+// aborts its exact carrier. The carrier pointer remains published behind the
+// closed gate so its final raw runtime counters remain observable until a
+// replacement generation is committed.
+func (s *Service) NetworkUnavailable() {
+	s.access.Lock()
+	if s.stopped || s.interfaceUnavailable {
+		s.access.Unlock()
+		return
+	}
+	s.retireDialLeasesLocked(true)
+	s.interfaceUnavailable = true
+	s.notifyDialStateLocked()
+	closeSignal(s.interfaceReady)
+	s.interfaceReady = make(chan struct{})
+	s.interfaceGeneration++
+	carrier := s.carrier
+	restartAttempt := s.restartAttempt
+	carrierStartCancel := s.carrierStartCancel
+	s.carrierStartCancel = nil
+	s.access.Unlock()
+
+	if restartAttempt != nil {
+		restartAttempt.cancel()
+	}
+	if carrier != nil {
+		// Abort must win Carrier.closeOnce before canceling the parent start
+		// context; its runCtx watcher otherwise begins a graceful drain.
+		if err := s.abortCarrier(carrier); err != nil {
+			s.logger.Warn("wlt service carrier abort after network loss: ", err)
+		}
+	}
+	if carrierStartCancel != nil {
+		carrierStartCancel()
+	}
 }
 
 func interfaceRecoveryGraceFor(goos string) time.Duration {
@@ -334,8 +550,62 @@ func interfaceRecoveryGraceFor(goos string) time.Duration {
 	return wltInterfaceRecoveryGrace
 }
 
+// A nil default-interface callback has already closed admission and aborted
+// the old carrier. Its return needs only a short underlay settle, while an
+// ordinary Apple handover keeps the allocation-preserving grace.
+func interfaceRecoveryDelayFor(goos string, wasUnavailable bool, grace time.Duration) time.Duration {
+	if wasUnavailable && (goos == "ios" || goos == "darwin") {
+		return wltConfirmedLossRecoveryDelay
+	}
+	return grace
+}
+
 func ignoreDuplicateInterfaceUpdate(goos string, previous string, current string) bool {
-	return goos == "android" && previous != "" && previous == current
+	return (goos == "android" || goos == "ios" || goos == "darwin") && previous != "" && previous == current
+}
+
+func (s *Service) beginInterfaceUpdate(currentInterfaceKey string, goos string) (*wltpkg.Carrier, string, uint64, bool, bool) {
+	s.access.Lock()
+	var cancelAttempt context.CancelFunc
+	defer func() {
+		s.access.Unlock()
+		if cancelAttempt != nil {
+			cancelAttempt()
+		}
+	}()
+	carrier := s.carrier
+	previousInterfaceKey := s.interfaceKey
+	wasUnavailable := s.interfaceUnavailable
+	if s.stopped {
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
+	}
+	if !s.initialized {
+		if wasUnavailable && currentInterfaceKey != "" {
+			s.interfaceKey = currentInterfaceKey
+			s.interfaceUnavailable = false
+			closeSignal(s.interfaceReady)
+			s.interfaceGeneration++
+		}
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
+	}
+	if currentInterfaceKey == "" {
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
+	}
+	if !wasUnavailable && (ignoreDuplicateInterfaceUpdate(goos, previousInterfaceKey, currentInterfaceKey) ||
+		(carrier == nil && previousInterfaceKey != "" && previousInterfaceKey == currentInterfaceKey)) {
+		return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, true
+	}
+	if s.restartAttempt != nil {
+		cancelAttempt = s.restartAttempt.cancel
+	}
+	s.retireDialLeasesLocked(true)
+	s.interfaceKey = currentInterfaceKey
+	s.interfaceUnavailable = false
+	s.notifyDialStateLocked()
+	closeSignal(s.interfaceReady)
+	s.interfaceReady = make(chan struct{})
+	s.interfaceGeneration++
+	return carrier, previousInterfaceKey, s.interfaceGeneration, wasUnavailable, false
 }
 
 func closedSignal() chan struct{} {
@@ -371,6 +641,7 @@ func (s *Service) finishInterfaceRecovery(generation uint64) {
 		return
 	}
 	closeSignal(s.interfaceReady)
+	s.notifyDialStateLocked()
 }
 
 func (s *Service) interfaceRecoveryCurrent(generation uint64) bool {
@@ -407,12 +678,27 @@ func formatWLTStatsHeartbeat(messages ...any) string {
 	return fmt.Sprint(messages...)
 }
 
+// Incident text remains one log token so its embedded gauges cannot override
+// the current heartbeat fields in whitespace-based diagnostic consumers.
+func formatWLTStatsIncident(incident string) string {
+	return strings.NewReplacer(" ", "%20", "\t", "%09", "\r", "%0D", "\n", "%0A").Replace(incident)
+}
+
 func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
+	s.statsAccess.Lock()
+	s.access.RLock()
+	current := s.carrier == carrier && !s.stopped
+	s.access.RUnlock()
+	if !current {
+		s.statsAccess.Unlock()
+		return
+	}
 	if s.statsCancel != nil {
 		s.statsCancel()
 	}
 	statsCtx, cancel := context.WithCancel(s.ctx)
 	s.statsCancel = cancel
+	s.statsAccess.Unlock()
 	go func() {
 		heartbeatTicker := time.NewTicker(wltStatsHeartbeatInterval)
 		defer heartbeatTicker.Stop()
@@ -446,7 +732,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 					}
 					if now.Sub(reconnectingSince) >= wltReconnectRecoveryAfter {
 						s.logger.Warn("wlt service reconnect outage exceeded threshold elapsed=", now.Sub(reconnectingSince).String(), " threshold=", wltReconnectRecoveryAfter.String(), " reason=", rt.LastReconnectReason)
-						go s.restartCarrier(carrier, "reconnect outage: "+rt.LastReconnectReason)
+						go s.restartCarrierCurrent(carrier, "reconnect outage: "+rt.LastReconnectReason)
 						return
 					}
 				} else if !reconnectingSince.IsZero() {
@@ -455,6 +741,10 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 				}
 			case <-heartbeatTicker.C:
 				now := time.Now()
+				s.access.RLock()
+				carrierGeneration := s.carrierGeneration
+				interfaceGeneration := s.interfaceGeneration
+				s.access.RUnlock()
 				stats := carrier.Stats()
 				rt := stats.Runtime
 				mux := rt.Mux
@@ -462,7 +752,7 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 				elapsed := now.Sub(lastStatsAt)
 				lastMux := lastStats.Runtime.Mux
 				lastPeer := lastStats.Runtime.Peer
-				s.logger.Info(formatWLTStatsHeartbeat("wlt service stats active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " last_incident=", lastIncident, " last_incident_age_ms=", incidentAgeMillis(now, lastIncidentAt), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes, " peer_in_bytes_by_index=", peer.PerPeerIncomingBytes, " peer_out_bytes_by_index=", peer.PerPeerOutgoingBytes, " peer_write_ns_by_index=", peer.PerPeerWriteNanos, " peer_max_write_ns_by_index=", peer.PerPeerMaxWriteNanos, " peer_send_queue_by_index=", peer.PerPeerSendQueueDepth, " peer_priority_queue_by_index=", peer.PerPeerPriorityQueueDepth))
+				s.logger.Info(formatWLTStatsHeartbeat("wlt service stats carrier_generation=", carrierGeneration, " interface_generation=", interfaceGeneration, " active=", stats.ActiveStreams, " peak_active=", stats.PeakActiveStreams, " pending=", stats.PendingDials, " peak_pending=", stats.PeakPendingDials, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " queued=", stats.QueuedDials, " dns_open_requests=", stats.DNSOpenRequests, " dns_open_queued=", stats.DNSOpenQueued, " dns_open_rejected=", stats.DNSOpenRejected, " rejected=", stats.RejectedStreams, " rejected_queue=", stats.RejectedQueue, " rejected_active=", stats.RejectedActive, " rejected_open=", stats.RejectedOpen, " pressure_reclaims=", stats.PressureIdleReclaims, " failed=", stats.FailedStreams, " interval_ms=", elapsed.Milliseconds(), " opened_delta=", counterDelta(stats.OpenedStreams, lastStats.OpenedStreams), " closed_delta=", counterDelta(stats.ClosedStreams, lastStats.ClosedStreams), " queued_delta=", counterDelta(stats.QueuedDials, lastStats.QueuedDials), " rejected_delta=", counterDelta(stats.RejectedStreams, lastStats.RejectedStreams), " failed_delta=", counterDelta(stats.FailedStreams, lastStats.FailedStreams), " last_incident=", formatWLTStatsIncident(lastIncident), " last_incident_age_ms=", incidentAgeMillis(now, lastIncidentAt), " open_attempts=", stats.OpenAttempts, " last_active_wait_ms=", stats.LastActiveWaitMillis, " max_active_wait_ms=", stats.MaxActiveWaitMillis, " last_open_wait_ms=", stats.LastOpenWaitMillis, " max_open_wait_ms=", stats.MaxOpenWaitMillis, " last_dial_ms=", stats.LastDialMillis, " max_dial_ms=", stats.MaxDialMillis, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnecting=", rt.Reconnecting, " reconnects=", rt.FullReconnects, " last_reconnect=", rt.LastReconnectReason, " mux_open_pending=", mux.OpenPending, " mux_peak_open_pending=", mux.PeakOpenPending, " mux_open_requests=", mux.OpenRequests, " mux_open_replies=", mux.OpenReplies, " mux_open_canceled=", mux.OpenCanceled, " mux_open_errors=", mux.OpenErrors, " mux_open_delta=", counterDelta(mux.OpenRequests, lastMux.OpenRequests), " mux_open_errors_delta=", counterDelta(mux.OpenErrors, lastMux.OpenErrors), " mux_last_open_ms=", mux.LastOpenLatencyMillis, " mux_max_open_ms=", mux.MaxOpenLatencyMillis, " mux_last_open_control_write_ms=", mux.LastOpenControlWriteMillis, " mux_max_open_control_write_ms=", mux.MaxOpenControlWriteMillis, " mux_last_open_reply_wait_ms=", mux.LastOpenReplyWaitMillis, " mux_max_open_reply_wait_ms=", mux.MaxOpenReplyWaitMillis, " mux_ping_sent=", mux.PingSent, " mux_pong=", mux.PongReceived, " mux_ping_timeouts=", mux.PingTimeouts, " mux_ping_timeouts_delta=", counterDelta(mux.PingTimeouts, lastMux.PingTimeouts), " mux_last_ping_rtt_ms=", mux.LastPingRTTMillis, " mux_max_ping_rtt_ms=", mux.MaxPingRTTMillis, " mux_disconnects=", mux.Disconnects, " mux_control_errors=", mux.ControlReadErrors, " mux_flow_drops=", mux.FlowDrops, " mux_flow_drops_delta=", counterDelta(mux.FlowDrops, lastMux.FlowDrops), " mux_flow_in_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesIn, lastMux.FlowBytesIn), elapsed), " mux_flow_out_kib_s=", kibPerSecond(counterDelta(mux.FlowBytesOut, lastMux.FlowBytesOut), elapsed), " mux_rate_waits=", mux.RateWaits, " mux_rate_waits_delta=", counterDelta(mux.RateWaits, lastMux.RateWaits), " mux_rate_wait_ms=", mux.RateWaitNanos/int64(time.Millisecond), " mux_burst=", mux.RateBurstBytes, " peer_online=", peer.OnlinePeers, " peer_slots=", peer.TotalPeerSlots, " peer_active_data=", peer.ActiveDataPeers, " peer_adaptive_activations=", peer.AdaptiveActivations, " peer_adaptive_delta=", counterDelta(peer.AdaptiveActivations, lastPeer.AdaptiveActivations), " peer_adaptive_fallbacks=", peer.AdaptiveFallbacks, " peer_in_queue_full=", peer.IncomingQueueFull, " peer_in_queue_full_delta=", counterDelta(peer.IncomingQueueFull, lastPeer.IncomingQueueFull), " peer_out_queue_full=", peer.OutgoingQueueFull, " peer_out_queue_full_delta=", counterDelta(peer.OutgoingQueueFull, lastPeer.OutgoingQueueFull), " peer_reconnect_attempts=", peer.ReconnectAttempts, " peer_reconnect_failures=", peer.ReconnectFailures, " peer_in_kib_s=", kibPerSecond(counterDelta(peer.IncomingBytes, lastPeer.IncomingBytes), elapsed), " peer_out_kib_s=", kibPerSecond(counterDelta(peer.OutgoingBytes, lastPeer.OutgoingBytes), elapsed), " peer_bytes_in=", peer.IncomingBytes, " peer_bytes_out=", peer.OutgoingBytes, " peer_in_bytes_by_index=", peer.PerPeerIncomingBytes, " peer_out_bytes_by_index=", peer.PerPeerOutgoingBytes, " peer_write_ns_by_index=", peer.PerPeerWriteNanos, " peer_max_write_ns_by_index=", peer.PerPeerMaxWriteNanos, " peer_send_queue_by_index=", peer.PerPeerSendQueueDepth, " peer_priority_queue_by_index=", peer.PerPeerPriorityQueueDepth))
 				lastStats = stats
 				lastStatsAt = now
 			}
@@ -470,12 +760,36 @@ func (s *Service) startStatsHeartbeat(carrier *wltpkg.Carrier) {
 	}()
 }
 
-func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, interfaceGeneration ...uint64) {
+func (s *Service) stopStatsHeartbeat() {
+	s.statsAccess.Lock()
+	if s.statsCancel != nil {
+		s.statsCancel()
+		s.statsCancel = nil
+	}
+	s.statsAccess.Unlock()
+}
+
+func (s *Service) restartCarrierCurrent(expected *wltpkg.Carrier, reason string) {
+	s.access.RLock()
+	generation := s.interfaceGeneration
+	current := s.carrier == expected && !s.stopped && !s.quiescing && !s.interfaceUnavailable
+	s.access.RUnlock()
+	if current {
+		s.restartCarrier(expected, reason, generation)
+	}
+}
+
+func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, expectedGeneration uint64) {
 	s.restart.Lock()
 	defer s.restart.Unlock()
+	restartInterfaceKey := s.currentInterfaceKey()
 
 	s.access.Lock()
-	if len(interfaceGeneration) > 0 && s.interfaceGeneration != interfaceGeneration[0] {
+	if s.interfaceGeneration != expectedGeneration {
+		s.access.Unlock()
+		return
+	}
+	if s.stopped || s.quiescing || s.interfaceUnavailable {
 		s.access.Unlock()
 		return
 	}
@@ -484,17 +798,30 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, interf
 		return
 	}
 	if expected != nil {
+		s.retireDialLeasesLocked(false)
 		s.carrier = nil
 		s.carrierReady = make(chan struct{})
 	} else if s.carrierReady == nil {
 		s.carrierReady = make(chan struct{})
 	}
+	previousCarrierStartCancel := s.carrierStartCancel
+	s.carrierStartCancel = nil
+	attemptCtx, cancelAttempt := context.WithCancel(s.ctx)
+	restartAttempt := &carrierStartAttempt{cancel: cancelAttempt, generation: expectedGeneration}
+	s.restartAttempt = restartAttempt
 	s.access.Unlock()
-
-	if s.statsCancel != nil {
-		s.statsCancel()
-		s.statsCancel = nil
-	}
+	published := false
+	defer func() {
+		if !published {
+			cancelAttempt()
+		}
+		s.access.Lock()
+		if s.restartAttempt == restartAttempt {
+			s.restartAttempt = nil
+		}
+		s.access.Unlock()
+	}()
+	s.stopStatsHeartbeat()
 
 	s.logger.Warn("wlt service restarting carrier reason=", reason)
 
@@ -507,43 +834,57 @@ func (s *Service) restartCarrier(expected *wltpkg.Carrier, reason string, interf
 		// which releases sockets and allocations without waiting for that drain.
 		startedAt := time.Now()
 		s.logger.Info("wlt service old carrier abort started active=", stats.ActiveStreams, " opened=", stats.OpenedStreams, " closed=", stats.ClosedStreams, " failed=", stats.FailedStreams, " reconnect_retries=", stats.ReconnectRetries, " reconnect_wait_ms=", stats.ReconnectWaitMillis, " reconnects=", stats.Runtime.FullReconnects, " last_reconnect=", stats.Runtime.LastReconnectReason)
-		if err := expected.Abort(); err != nil {
+		if err := s.abortCarrier(expected); err != nil {
 			s.logger.Warn("wlt service old carrier abort error: ", err)
 		}
 		s.logger.Info("wlt service old carrier aborted elapsed=", time.Since(startedAt).String())
 	}
+	if previousCarrierStartCancel != nil {
+		previousCarrierStartCancel()
+	}
 
-	for attempt := 1; ; attempt++ {
+	for attemptNumber := 1; ; attemptNumber++ {
 		s.access.RLock()
 		stopped := s.stopped
+		unavailable := s.interfaceUnavailable
+		currentAttempt := s.restartAttempt
+		generationCurrent := s.interfaceGeneration == restartAttempt.generation
 		s.access.RUnlock()
-		if stopped || s.ctx.Err() != nil {
+		if stopped || unavailable || currentAttempt != restartAttempt || !generationCurrent || attemptCtx.Err() != nil {
 			return
 		}
 		startedAt := time.Now()
-		s.logger.Info("wlt service carrier restart attempt=", attempt, " reason=", reason)
-		carrier, err := s.startCarrier(true)
+		s.logger.Info("wlt service carrier restart attempt=", attemptNumber, " reason=", reason)
+		carrier, err := s.startCarrier(attemptCtx, true)
 		if err == nil {
 			s.access.Lock()
-			if s.stopped {
+			current := s.restartAttempt == currentAttempt && !s.stopped && !s.quiescing && !s.interfaceUnavailable && s.interfaceGeneration == restartAttempt.generation && attemptCtx.Err() == nil
+			if !current {
 				s.access.Unlock()
-				_ = carrier.Close()
+				_ = s.abortCarrier(carrier)
 				return
 			}
 			s.carrier = carrier
+			s.carrierInterfaceKey = restartInterfaceKey
+			s.carrierGeneration++
+			s.notifyDialStateLocked()
 			s.interfaceKey = s.currentInterfaceKey()
+			s.carrierStartCancel = cancelAttempt
 			close(s.carrierReady)
+			s.restartAttempt = nil
 			s.access.Unlock()
+			published = true
+			s.markCarrierReady(carrier)
 			s.startStatsHeartbeat(carrier)
-			s.logger.Info("wlt service carrier restarted elapsed=", time.Since(startedAt).String(), " attempts=", attempt)
+			s.logger.Info("wlt service carrier restarted elapsed=", time.Since(startedAt).String(), " attempts=", attemptNumber)
 			return
 		}
-		if attempt <= wltCarrierRestartRetryMaxLog || attempt%10 == 0 {
-			s.logger.Error("wlt service carrier restart failed attempt=", attempt, " error=", err)
+		if attemptNumber <= wltCarrierRestartRetryMaxLog || attemptNumber%10 == 0 {
+			s.logger.Error("wlt service carrier restart failed attempt=", attemptNumber, " error=", err)
 		}
-		timer := time.NewTimer(carrierRestartRetryDelay(attempt, err))
+		timer := time.NewTimer(carrierRestartRetryDelay(attemptNumber, err))
 		select {
-		case <-s.ctx.Done():
+		case <-attemptCtx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
