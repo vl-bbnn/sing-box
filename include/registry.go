@@ -34,10 +34,8 @@ import (
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing-box/protocol/vmess"
-	protocolwlt "github.com/sagernet/sing-box/protocol/wlt"
 	"github.com/sagernet/sing-box/service/resolved"
 	"github.com/sagernet/sing-box/service/ssmapi"
-	servicewlt "github.com/sagernet/sing-box/service/wlt"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -92,7 +90,9 @@ func OutboundRegistry() *outbound.Registry {
 	shadowtls.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
-	protocolwlt.RegisterOutbound(registry)
+	// 2b2n:begin wlt
+	registerWLTOutbound(registry)
+	// 2b2n:end wlt
 
 	registerQUICOutbounds(registry)
 	registerStubForRemovedOutbounds(registry)
@@ -133,7 +133,9 @@ func ServiceRegistry() *service.Registry {
 
 	resolved.RegisterService(registry)
 	ssmapi.RegisterService(registry)
-	servicewlt.RegisterService(registry)
+	// 2b2n:begin wlt
+	registerWLTService(registry)
+	// 2b2n:end wlt
 
 	registerDERPService(registry)
 	registerCCMService(registry)
